@@ -133,6 +133,23 @@ impl App {
         });
     }
 
+    /// Bind a node's inline style property `prop` to a closure — the style counterpart
+    /// of [`bind_text`](App::bind_text). `f` runs now (subscribing the signals it reads)
+    /// and again after any of those change, each run emitting one `SetInlineStyle`.
+    ///
+    /// This is what lets an *animated* value drive a style on the same fine-grained op
+    /// path as text: feed it a `Signal<f32>` from `canopy-anim` (or any signal) and
+    /// format the value into the style string — e.g. a size, a position, or a color.
+    /// A bound property overrides any class-resolved value for that property, because
+    /// the binding's op is the last `SetInlineStyle` written for it.
+    pub fn bind_style<F: Fn() -> String + 'static>(&self, node: NodeId, prop: PropId, f: F) {
+        let emitter = self.emitter.clone();
+        self.rt.create_effect(move || {
+            let value = f();
+            emitter.borrow_mut().set_inline_style(node, prop, &value);
+        });
+    }
+
     /// Subscribe `node` to `event`, registering `handler`. Returns the handler id
     /// the host echoes back when the event fires. The `AddListener` op is emitted so
     /// the host knows to route the event.

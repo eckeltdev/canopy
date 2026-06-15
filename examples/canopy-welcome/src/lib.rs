@@ -14,6 +14,8 @@
 //! Nothing here references `winit`; windowing lives in `src/bin/window.rs`, and the
 //! headless renderer (`src/bin/render.rs`) drives the same [`build`] to write a PPM.
 
+use canopy_anim::{Easing, Timeline};
+use canopy_paint::{HEIGHT, WIDTH};
 use canopy_ui::prelude::*;
 
 /// Logical viewport width — wide enough to frame the centered content column (the
@@ -43,6 +45,21 @@ pub struct Welcome {
     pub ui: Ui,
     /// The counter value, bound to the button label.
     pub count: Signal<i32>,
+    /// The animation timeline driving the logo's "sprout" entrance. The windowed host
+    /// `tick`s it each frame until it goes idle; a headless render [`settle`](Welcome::settle)s
+    /// it to completion before drawing the static frame.
+    pub timeline: Timeline,
+}
+
+impl Welcome {
+    /// Advance the entrance animation to completion and flush, so a static (headless)
+    /// render shows the settled screen (full-size logo) rather than mid-sprout.
+    pub fn settle(&mut self) {
+        // A single large tick finishes every one-shot tween; flush re-runs the bound
+        // effects (the leaves' size) so the op-stream reflects the settled state.
+        self.timeline.tick(1_000.0);
+        self.ui.runtime().flush();
+    }
 }
 
 /// Assemble the welcome screen. The entire tree is one `rsx!` expression; the logo is a
@@ -51,11 +68,13 @@ pub struct Welcome {
 pub fn build() -> Welcome {
     let ui = Ui::with_css(&load_styles());
     let count = ui.signal(0i32);
+    // The host-ticked clock for the logo entrance. `logo` registers a tween on it.
+    let mut timeline = Timeline::default();
 
     let root = rsx!(ui =>
         <div class="canvas">
             <div class="content">
-                { logo(&ui) }
+                { logo(&ui, &mut timeline) }
                 <span class="title">"Canopy"</span>
                 <span class="tagline">"web-like native UI — no JavaScript runtime"</span>
                 <div class="card">
@@ -74,31 +93,82 @@ pub fn build() -> Welcome {
     );
     ui.mount_root(root);
 
-    Welcome { ui, count }
+    Welcome {
+        ui,
+        count,
+        timeline,
+    }
 }
 
 /// The Canopy logo: two rows of rounded "leaves" (the canopy) over a short trunk, each
-/// piece a pure rounded-rect element background (no text, no image files). A component
-/// is just a function that builds a subtree on the shared [`Ui`] and returns its root.
-/// (A `<div>` is a flex container whose row/column direction is set by its CSS class —
-/// `.leafrow`/`.trunkrow` carry `direction: row` — exactly like real flexbox.)
-fn logo(ui: &Ui) -> NodeId {
-    rsx!(ui =>
-        <div class="logo">
-            <div class="leafrow">
-                <div class="leaf leaf-green"/>
-                <div class="leaf leaf-teal"/>
-                <div class="leaf leaf-green"/>
-            </div>
-            <div class="leafrow">
-                <div class="leaf leaf-teal"/>
-                <div class="leaf leaf-blue"/>
-            </div>
-            <div class="trunkrow">
-                <div class="trunk"/>
-            </div>
-        </div>
-    )
+/// piece a pure rounded-rect element background (no text, no image files) — and it
+/// **animates in**. A `scale` tween (0 → 1 over 0.6s, decelerating) registered on
+/// `timeline` drives every tile's width/height via [`Ui::bind_style`], so the canopy
+/// "sprouts" to full size when the window opens, then idles.
+///
+/// This component is built imperatively (not with `rsx!`) precisely because it needs a
+/// handle to each tile to bind its size — the natural escape hatch when a node is
+/// animated. The rest of the screen stays JSX and splices this in with `{ logo(..) }`.
+fn logo(ui: &Ui, timeline: &mut Timeline) -> NodeId {
+    let scale = timeline.animate(&ui.runtime(), 0.0, 1.0, 0.6, Easing::EaseOutCubic);
+
+    let root = ui.column();
+    ui.class(root, &["logo"]);
+
+    // Top row: green, teal, green.
+    let r1 = ui.column();
+    ui.class(r1, &["leafrow"]);
+    ui.mount(root, r1);
+    ui.mount(r1, leaf(ui, &["leaf", "leaf-green"], &scale));
+    ui.mount(r1, leaf(ui, &["leaf", "leaf-teal"], &scale));
+    ui.mount(r1, leaf(ui, &["leaf", "leaf-green"], &scale));
+
+    // Second row: teal, blue.
+    let r2 = ui.column();
+    ui.class(r2, &["leafrow"]);
+    ui.mount(root, r2);
+    ui.mount(r2, leaf(ui, &["leaf", "leaf-teal"], &scale));
+    ui.mount(r2, leaf(ui, &["leaf", "leaf-blue"], &scale));
+
+    // The trunk.
+    let tr = ui.column();
+    ui.class(tr, &["trunkrow"]);
+    ui.mount(root, tr);
+    ui.mount(tr, tile(ui, &["trunk"], &scale, 14.0, 18.0));
+
+    root
+}
+
+/// A leaf tile (full size 36×24 from `.leaf`), sized by the entrance `scale`.
+fn leaf(ui: &Ui, classes: &'static [&'static str], scale: &Signal<f32>) -> NodeId {
+    tile(ui, classes, scale, 36.0, 24.0)
+}
+
+/// A rounded tile: its class paints the color + radius, while [`Ui::bind_style`] binds
+/// its width/height to `scale * (full_w, full_h)` so it grows from nothing to its full
+/// class size as the entrance plays (settling exactly on the class dimensions at scale 1).
+fn tile(
+    ui: &Ui,
+    classes: &'static [&'static str],
+    scale: &Signal<f32>,
+    full_w: f32,
+    full_h: f32,
+) -> NodeId {
+    let t = ui.column();
+    ui.class(t, classes);
+    {
+        let scale = scale.clone();
+        ui.bind_style(t, WIDTH, move || {
+            ((full_w * scale.get()) as i32).to_string()
+        });
+    }
+    {
+        let scale = scale.clone();
+        ui.bind_style(t, HEIGHT, move || {
+            ((full_h * scale.get()) as i32).to_string()
+        });
+    }
+    t
 }
 
 #[cfg(test)]

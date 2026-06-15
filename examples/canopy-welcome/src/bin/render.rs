@@ -21,7 +21,10 @@ fn main() {
     // Default to 3 so the flagship screenshot shows a non-trivial counter value.
     let start: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3);
 
-    let welcome = build();
+    let mut welcome = build();
+    // Settle the logo's entrance animation to its full-size end state — a static shot
+    // should show the grown canopy, not a mid-sprout frame.
+    welcome.settle();
     // Seed the counter and flush so the bound label emits its "count is N" SetText
     // before we drain the mount batch.
     welcome.count.set(start);

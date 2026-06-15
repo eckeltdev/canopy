@@ -71,6 +71,8 @@ struct WelcomeApp {
     /// The hoverable currently under the cursor, so we only restyle when it changes (and
     /// so a reload can keep a live hover lit).
     hovered: Option<NodeId>,
+    /// Timestamp of the last animation tick (to measure `dt`); `None` while idle.
+    last_frame: Option<std::time::Instant>,
     /// Reused across redraws so the bundled font is loaded/rasterized once.
     text: TextEngine,
     /// One [`ReloadEvent`] per debounced `styles.css` save from the watcher thread.
@@ -104,6 +106,7 @@ impl WelcomeApp {
             seq: 1,
             cursor: PhysicalPosition::new(0.0, 0.0),
             hovered: None,
+            last_frame: None,
             text: TextEngine::new(),
             reloads,
             _watcher: watcher,
@@ -247,6 +250,30 @@ impl ApplicationHandler<ReloadPending> for WelcomeApp {
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
         self.window = Some(window);
         self.surface = Some(surface);
+        // The logo entrance is queued on the timeline; poll so `about_to_wait` drives it
+        // to completion, then it switches back to waiting on input.
+        event_loop.set_control_flow(ControlFlow::Poll);
+    }
+
+    /// Drive the entrance animation: while the timeline has active tweens, measure the
+    /// real `dt`, advance them, flush the bound size effects, and redraw — then drop back
+    /// to `Wait` (event-driven, no CPU spin) the moment it goes idle.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.welcome.timeline.is_idle() {
+            self.last_frame = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_frame
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+        self.last_frame = Some(now);
+
+        self.welcome.timeline.tick(dt);
+        self.welcome.ui.runtime().flush();
+        self.apply_and_redraw();
+        event_loop.set_control_flow(ControlFlow::Poll);
     }
 
     /// The watcher woke us: a `styles.css` save is pending. Drain + restyle.

@@ -20,11 +20,12 @@
 //! let ui = Ui::with_css(".root { background: #1e1e2e; padding: 16px } .btn { background: #313244 }");
 //! let count = ui.signal(0i32);
 //! let root = rsx!(ui =>
-//!     Column class="root" {
-//!         Button class="btn"
-//!             on_click({ let c = count.clone(); move |_| c.update(|n| *n += 1) })
-//!             bind_text({ let c = count.clone(); move || format!("count is {}", c.get()) })
-//!     }
+//!     <div class="root">
+//!         <button class="btn"
+//!             on:click={ let c = count.clone(); move |_| c.update(|n| *n += 1) }>
+//!             { let c = count.clone(); move || format!("count is {}", c.get()) }
+//!         </button>
+//!     </div>
 //! );
 //! ui.mount_root(root);
 //! let batch = ui.take_batch(0); // hand to a host/renderer
@@ -55,7 +56,7 @@ use core::cell::RefCell;
 
 use canopy_dom::{Dom, ROOT};
 use canopy_layout_taffy::{hit_test, layout};
-use canopy_protocol::{ElementTag, EventPayload, HandlerId, NodeId};
+use canopy_protocol::{ElementTag, EventPayload, HandlerId, NodeId, PropId};
 use canopy_signals::{Memo, Runtime, Signal};
 use canopy_style_css::Stylesheet;
 use canopy_traits::{Point, Size};
@@ -209,6 +210,15 @@ impl Ui {
         self.app.bind_text(node, f);
     }
 
+    /// Bind a node's inline style property `prop` to a closure — the style counterpart
+    /// of [`bind_text`](Ui::bind_text), re-emitting one `SetInlineStyle` per change. An
+    /// animated `Signal<f32>` (from `canopy-anim`) formatted into the value is how a
+    /// size/position/color animates on the fine-grained op path. The bound property
+    /// overrides any class-resolved value for that property.
+    pub fn bind_style<F: Fn() -> String + 'static>(&self, node: NodeId, prop: PropId, f: F) {
+        self.app.bind_style(node, prop, f);
+    }
+
     // ---- Host driving surface ---------------------------------------------------
 
     /// Drain everything emitted since the last call into a `seq` op-batch (hand it to a
@@ -318,7 +328,7 @@ impl Default for Ui {
 pub mod prelude {
     pub use crate::{Classes, Ui};
     pub use canopy_dom::{Dom, ROOT};
-    pub use canopy_protocol::{EventPayload, HandlerId, NodeId};
+    pub use canopy_protocol::{EventPayload, HandlerId, NodeId, PropId};
     pub use canopy_rsx::rsx;
     pub use canopy_signals::{Memo, Runtime, Signal};
     pub use canopy_traits::{Point, Size};
@@ -429,6 +439,35 @@ mod tests {
         ui.runtime().flush();
         dom.apply(&ui.take_batch(1)).unwrap();
         assert_eq!(dom.text_of(label), Some("count is 5"));
+    }
+
+    #[test]
+    fn bind_style_tracks_a_signal() {
+        let ui = Ui::new();
+        let node = ui.column();
+        let w = ui.signal(0i32);
+        {
+            let w = w.clone();
+            ui.bind_style(node, BG, move || {
+                // A signal-driven style value (here just a number formatted as text).
+                let mut s = String::from("#0000");
+                s.push((b'0' + (w.get() as u8 % 10)) as char);
+                s.push('0');
+                s
+            });
+        }
+        ui.mount_root(node);
+        let mut dom = mount(&ui);
+        assert_eq!(dom.style(node, BG), Some("#000000"));
+
+        w.set(5);
+        ui.runtime().flush();
+        dom.apply(&ui.take_batch(1)).unwrap();
+        assert_eq!(
+            dom.style(node, BG),
+            Some("#000050"),
+            "style re-emitted on change"
+        );
     }
 
     #[test]

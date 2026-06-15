@@ -30,13 +30,14 @@ canopy-text-parley = { path = "../../crates/canopy-text-parley" }
 # The signature feature: a debounced filesystem Watcher that fires when styles.css is
 # saved, so the window restyles live (the re-apply itself is `Ui::reload_css`).
 canopy-hotreload = { path = "../../crates/canopy-hotreload" }
+# The tween/clock engine driving the logo's "sprout" entrance animation; its animated
+# `Signal<f32>` plugs into `Ui::bind_style`.
+canopy-anim = { path = "../../crates/canopy-anim" }
+# The `PropId` consts (WIDTH, HEIGHT, …) the entrance animation binds the leaves' size to.
+canopy-paint = { path = "../../crates/canopy-paint" }
 
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
-
-[dev-dependencies]
-# The `PropId` consts (BG, RADIUS, …) the tests read styles back by.
-canopy-paint = { path = "../../crates/canopy-paint" }
 
 [features]
 default = ["window"]
