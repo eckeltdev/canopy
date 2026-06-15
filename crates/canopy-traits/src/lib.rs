@@ -1,0 +1,299 @@
+//! Canopy's platform-abstraction layer (PAL): the backend traits and the
+//! Canopy-owned types that cross them.
+//!
+//! This crate is the seam that makes Canopy portable. **The one rule:** the types
+//! that cross these traits ([`ComputedStyle`], [`LayoutResult`], [`ShapedGlyphs`],
+//! [`DisplayList`], …) are Canopy-owned and `no_std`. A backend may use Stylo,
+//! Taffy, Parley, Vello, winit, or a bare-metal framebuffer internally, but a
+//! vendor type must **never** appear in a trait signature — leaking one would weld
+//! the runtime to the desktop stack and break the bare-metal promise.
+//!
+//! Desktop impls of these traits are `std` leaf crates; bare-metal impls are
+//! `no_std`. The core never knows which is linked.
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use canopy_protocol::NodeId;
+
+// ---------------------------------------------------------------------------
+// Geometry and resolved-style types (Canopy-owned; no vendor types).
+// ---------------------------------------------------------------------------
+
+/// A size in logical pixels.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Size {
+    /// Width.
+    pub w: f32,
+    /// Height.
+    pub h: f32,
+}
+
+/// A point in logical pixels.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Point {
+    /// X.
+    pub x: f32,
+    /// Y.
+    pub y: f32,
+}
+
+/// An axis-aligned rectangle.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Rect {
+    /// Top-left origin.
+    pub origin: Point,
+    /// Size.
+    pub size: Size,
+}
+
+/// Straight-alpha RGBA color.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Color {
+    /// Red.
+    pub r: u8,
+    /// Green.
+    pub g: u8,
+    /// Blue.
+    pub b: u8,
+    /// Alpha.
+    pub a: u8,
+}
+
+/// How a node lays its children out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Display {
+    /// Block flow.
+    #[default]
+    Block,
+    /// Flexbox.
+    Flex,
+    /// Hidden / not generated.
+    None,
+}
+
+/// A flat, fully-resolved style for one node.
+///
+/// This is the output of a [`StyleEngine`] — Stylo on the desktop, a const/
+/// build-time resolver on a constrained target. The retained tree only ever sees
+/// this; there is no "cascade" type in the core.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct ComputedStyle {
+    /// Layout mode.
+    pub display: Display,
+    /// Text/foreground color.
+    pub color: Color,
+    /// Background color.
+    pub background: Color,
+    /// Font size in logical pixels.
+    pub font_size: f32,
+    /// Uniform padding in logical pixels.
+    pub padding: f32,
+}
+
+/// Per-node computed layout boxes for a frame.
+#[derive(Clone, Debug, Default)]
+pub struct LayoutResult {
+    /// Resolved rectangle per node.
+    pub rects: Vec<(NodeId, Rect)>,
+}
+
+/// One positioned glyph.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Glyph {
+    /// Glyph id within the font.
+    pub id: u32,
+    /// Pen X.
+    pub x: f32,
+    /// Pen Y.
+    pub y: f32,
+}
+
+/// Output of a [`TextEngine`] shaping pass.
+#[derive(Clone, Debug, Default)]
+pub struct ShapedGlyphs {
+    /// Positioned glyphs.
+    pub glyphs: Vec<Glyph>,
+}
+
+/// One drawable primitive in a resolved display list.
+#[derive(Clone, Debug)]
+pub enum DisplayItem {
+    /// A filled rectangle.
+    Rect {
+        /// Bounds.
+        rect: Rect,
+        /// Fill color.
+        color: Color,
+    },
+    /// A run of shaped glyphs.
+    Glyphs {
+        /// Shaped glyphs.
+        glyphs: ShapedGlyphs,
+        /// Fill color.
+        color: Color,
+    },
+}
+
+/// A flat, back-to-front list of primitives handed to a [`Renderer`].
+#[derive(Clone, Debug, Default)]
+pub struct DisplayList {
+    /// Items, painted in order.
+    pub items: Vec<DisplayItem>,
+}
+
+// ---------------------------------------------------------------------------
+// Errors (core-only; no `std::error::Error`).
+// ---------------------------------------------------------------------------
+
+/// A host-side failure applying ops or running a backend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostError {
+    /// A handle referenced a node that does not exist or was not owned by the guest.
+    BadHandle,
+    /// The op-stream could not be decoded.
+    Decode,
+    /// The operation is not supported by this backend/tier.
+    Unsupported,
+}
+
+/// A transport-layer failure moving ops or events.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportError {
+    /// The peer is gone.
+    Closed,
+    /// The batch exceeded a configured limit.
+    TooLarge,
+    /// Backend-specific failure (e.g. a trap in the WASM guest).
+    Backend,
+}
+
+impl core::fmt::Display for HostError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            HostError::BadHandle => "bad node handle",
+            HostError::Decode => "op-stream decode error",
+            HostError::Unsupported => "unsupported operation for this tier",
+        })
+    }
+}
+
+impl core::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            TransportError::Closed => "transport closed",
+            TransportError::TooLarge => "op batch too large",
+            TransportError::Backend => "transport backend error",
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The backend traits (the PAL).
+// ---------------------------------------------------------------------------
+
+/// Applies a batch of `canopy-protocol` op bytes atomically to the host's
+/// retained tree. Implemented by the host; this is the consuming end of the
+/// op-stream.
+pub trait OpSink {
+    /// Decode and apply one batch.
+    fn apply(&mut self, ops: &[u8]) -> Result<(), HostError>;
+}
+
+/// Moves op bytes guest→host and event bytes host→guest. The two impls
+/// (compiled-in native and WASM-sandboxed) carry the **same** op bytes; only the
+/// delivery mechanism and the trust model differ.
+pub trait Transport {
+    /// Send one encoded op batch to the host.
+    fn send(&mut self, batch: &[u8]) -> Result<(), TransportError>;
+    /// Drain any pending host→guest event bytes into `out`.
+    fn poll_events(&mut self, out: &mut Vec<u8>) -> Result<(), TransportError>;
+}
+
+/// Resolves a node's flat [`ComputedStyle`] (Stylo on desktop; a reduced resolver
+/// on constrained tiers).
+pub trait StyleEngine {
+    /// Compute the style for `node` given its parent's computed style, if any.
+    fn resolve(
+        &mut self,
+        node: NodeId,
+        parent: Option<&ComputedStyle>,
+    ) -> Result<ComputedStyle, HostError>;
+}
+
+/// Computes layout boxes for the tree (Taffy on every tier).
+pub trait LayoutEngine {
+    /// Lay the tree rooted at `root` out within `available`, writing boxes to `out`.
+    fn layout(
+        &mut self,
+        root: NodeId,
+        available: Size,
+        out: &mut LayoutResult,
+    ) -> Result<(), HostError>;
+}
+
+/// Measures and shapes text (Parley/cosmic-text on capable tiers; a baked glyph
+/// atlas on constrained tiers).
+pub trait TextEngine {
+    /// Measure a run without shaping it (used by layout to size flex children).
+    fn measure(&mut self, text: &str, style: &ComputedStyle) -> Size;
+    /// Shape a run into positioned glyphs.
+    fn shape(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        out: &mut ShapedGlyphs,
+    ) -> Result<(), HostError>;
+}
+
+/// Rasterizes a [`DisplayList`] to a surface (Vello+wgpu on capable tiers;
+/// `vello_cpu`/software on constrained tiers).
+pub trait Renderer {
+    /// React to a surface resize.
+    fn resize(&mut self, size: Size);
+    /// Paint one frame.
+    fn render(&mut self, scene: &DisplayList) -> Result<(), HostError>;
+    /// Present the painted frame.
+    fn present(&mut self) -> Result<(), HostError>;
+}
+
+/// What the event loop should do after a pump.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ControlFlow {
+    /// Keep running.
+    Continue,
+    /// Tear down.
+    Exit,
+}
+
+/// Owns the window/surface, input, and the monotonic clock (winit on desktop; a
+/// HAL on bare metal).
+pub trait Platform {
+    /// Current surface size.
+    fn surface_size(&self) -> Size;
+    /// Monotonic milliseconds. Bare-metal supplies its own timer.
+    fn now_millis(&self) -> u64;
+    /// Pump the platform, appending any input as `canopy-protocol` event bytes.
+    fn pump(&mut self, events: &mut Vec<u8>) -> ControlFlow;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_sane() {
+        let s = ComputedStyle::default();
+        assert_eq!(s.display, Display::Block);
+        assert_eq!(s.color, Color::default());
+        assert!(DisplayList::default().items.is_empty());
+    }
+
+    #[test]
+    fn errors_display() {
+        use alloc::format;
+        assert_eq!(format!("{}", HostError::BadHandle), "bad node handle");
+        assert_eq!(format!("{}", TransportError::Closed), "transport closed");
+    }
+}

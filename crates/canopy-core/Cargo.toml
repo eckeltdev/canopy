@@ -1,0 +1,14 @@
+[package]
+name = "canopy-core"
+description = "Canopy guest-side core: vnode tree, string interning, and the reconciler that emits the batched op-stream (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+
+[lints]
+workspace = true

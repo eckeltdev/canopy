@@ -1,0 +1,14 @@
+[package]
+name = "canopy-traits"
+description = "Canopy's platform-abstraction layer: backend traits + Canopy-owned types that cross them (no_std)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+
+[lints]
+workspace = true

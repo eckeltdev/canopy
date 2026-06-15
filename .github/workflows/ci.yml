@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  no-std-seam:
+    name: core builds without std (bare-metal target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-none
+      # If any of the four core crates ever pulls in `std`, this build fails.
+      # That single check is what keeps the bare-metal door open at zero cost.
+      - name: Build std-free core for aarch64-unknown-none
+        run: >
+          cargo build --target aarch64-unknown-none
+          -p canopy-protocol -p canopy-traits -p canopy-core -p canopy-signals
+
+  deny:
+    name: cargo-deny (bans getrandom, license/advisory gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

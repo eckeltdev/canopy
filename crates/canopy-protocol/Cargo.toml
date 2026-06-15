@@ -1,0 +1,11 @@
+[package]
+name = "canopy-protocol"
+description = "Canopy wire protocol: opaque handles, opcodes, and the batched op-stream codec (no_std + alloc, zero deps)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+# The bare-metal target used by the no_std seam guard (see .github/workflows/ci.yml)
+# is added in CI via the toolchain action rather than pinned here, so day-to-day
+# desktop builds never pull a cross-target they don't need.

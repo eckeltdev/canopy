@@ -1,0 +1,11 @@
+[package]
+name = "canopy-signals"
+description = "Canopy's fine-grained reactive runtime (signals + effects + batched flush), shared across all language wrappers (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

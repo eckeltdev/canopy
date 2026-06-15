@@ -1,0 +1,37 @@
+# cargo-deny configuration.
+#
+# The load-bearing rule for Canopy is the `getrandom` ban below: the guest-side
+# core must never pull a dependency that needs an OS entropy source, because no
+# such source exists on a bare-metal target. `std::collections::HashMap` (via
+# `RandomState`) is the usual way `getrandom` sneaks in, which is why the core
+# crates use `alloc::collections::BTreeMap` instead. The `no-std-seam` CI job is
+# the other half of this guard (it proves the core builds without `std` at all).
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+deny = [
+    { name = "getrandom" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
