@@ -36,6 +36,7 @@ jobs:
         run: >
           cargo build --target aarch64-unknown-none
           -p canopy-protocol -p canopy-traits -p canopy-core -p canopy-signals
+          -p canopy-view -p canopy-dom
 
   deny:
     name: cargo-deny (bans getrandom, license/advisory gate)

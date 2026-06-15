@@ -1,0 +1,18 @@
+[package]
+name = "canopy-dom"
+description = "Canopy host-side retained tree + OpSink: decodes the op-stream into a node arena and enforces handle ownership (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-traits = { path = "../canopy-traits" }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+
+[lints]
+workspace = true

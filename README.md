@@ -35,8 +35,10 @@ canopy-core host side → backends behind canopy-traits:
 |---|---|---|
 | `canopy-protocol` | yes | Opaque handles, opcodes, and the batched op-stream codec. Zero deps. The contract. |
 | `canopy-traits` | yes | The platform-abstraction layer: backend traits + Canopy-owned types that cross them. |
-| `canopy-core` | yes | Guest-side vnode tree, string interning, and the reconciler that emits the op-stream. |
+| `canopy-core` | yes | Guest-side op-stream `Emitter`, vnode tree, interning, and a reconciler for static/keyed subtrees. |
 | `canopy-signals` | yes | The fine-grained reactive runtime (signals + effects + batched flush). |
+| `canopy-view` | yes | Signal-based reactivity: an `App` that ties signals to the emitter so a changed value emits one targeted op. |
+| `canopy-dom` | yes | Host-side retained tree + `OpSink`: decodes the op-stream and enforces handle ownership. |
 
 Host-side backends (`canopy-render-vello`, `canopy-style-stylo`, `canopy-text-parley`,
 `canopy-plat-winit`), the transports (`canopy-transport-native`, `-wasmtime`), the

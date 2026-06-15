@@ -1,15 +1,17 @@
-//! Canopy guest-side core: the virtual-node tree, string interning, and the
-//! reconciler that turns a re-render into a minimal, batched op-stream.
+//! Canopy guest-side core: the op-stream [`Emitter`], a virtual-node tree, string
+//! interning, and a [`Reconciler`] for static / keyed subtrees.
 //!
 //! This is the part of Canopy that *is* a guest program. It is `no_std` + `alloc`
-//! and depends only on [`canopy_protocol`], so the exact same reconciler runs
-//! compiled-in on a constrained target or inside a WASM sandbox — it only ever
-//! produces op bytes, never touches a renderer.
+//! and depends only on [`canopy_protocol`], so the exact same code runs compiled-in
+//! on a constrained target or inside a WASM sandbox — it only ever produces op
+//! bytes, never touches a renderer.
 //!
-//! The [`Reconciler`] in this M0 scaffold mounts a tree and diffs structurally
-//! identical trees (the counter case: only text changes emit ops). Keyed-list
-//! reconciliation and attribute/style diffing reuse the same op vocabulary and
-//! land next; the encoder and protocol already support them.
+//! With Canopy's **signal-based** reactivity, the steady-state update path is an
+//! [`Emitter`] driven by fine-grained effects (see the `canopy-signals` and
+//! `canopy-view` crates): a changed signal emits one targeted op (e.g. a single
+//! `SetText`), not a whole-tree diff. The [`Reconciler`] here is the complementary
+//! piece for *initial mount* and for *keyed lists*, where structure — not a single
+//! value — changes.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -18,9 +20,140 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use canopy_protocol::{ElementTag, NodeId, Op, OpEncoder, StrId};
+use canopy_protocol::{ElementTag, EventKind, HandlerId, NodeId, Op, OpEncoder, PropId, StrId};
 
-/// A lightweight virtual node the guest produces each render.
+/// Builds a batched op-stream: allocates node handles, interns strings, and
+/// accumulates ops until [`Emitter::take_batch`] wraps and drains them.
+///
+/// This is the single op-building primitive. The [`Reconciler`] uses it, and the
+/// signal-reactive layer writes targeted ops into it from inside effects, so both
+/// reactivity paths produce the *same* wire format.
+pub struct Emitter {
+    next_node: u64,
+    next_str: u32,
+    interned: BTreeMap<String, StrId>,
+    pending: Vec<Op>,
+}
+
+impl Emitter {
+    /// New emitter. Node handles start at 1 so `0` can serve as a host root.
+    pub fn new() -> Self {
+        Self {
+            next_node: 1,
+            next_str: 0,
+            interned: BTreeMap::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Allocate a fresh node handle.
+    pub fn alloc_node(&mut self) -> NodeId {
+        let id = NodeId::new(self.next_node);
+        self.next_node += 1;
+        id
+    }
+
+    /// Intern a string, emitting `InternString` the first time it is seen.
+    pub fn intern(&mut self, s: &str) -> StrId {
+        if let Some(id) = self.interned.get(s) {
+            return *id;
+        }
+        let id = StrId::new(self.next_str);
+        self.next_str += 1;
+        self.interned.insert(s.to_string(), id);
+        self.pending.push(Op::InternString {
+            id,
+            bytes: s.as_bytes().to_vec(),
+        });
+        id
+    }
+
+    /// Create a detached element and return its handle.
+    pub fn create_element(&mut self, tag: ElementTag) -> NodeId {
+        let id = self.alloc_node();
+        self.pending.push(Op::CreateElement { node: id, tag });
+        id
+    }
+
+    /// Create a detached text node with initial content and return its handle.
+    pub fn create_text(&mut self, initial: &str) -> NodeId {
+        let id = self.alloc_node();
+        let text = self.intern(initial);
+        self.pending.push(Op::CreateText { node: id, text });
+        id
+    }
+
+    /// Insert `child` under `parent` before `anchor` ([`NodeId::NULL`] = append).
+    pub fn insert(&mut self, parent: NodeId, child: NodeId, anchor: NodeId) {
+        self.pending.push(Op::InsertBefore {
+            parent,
+            child,
+            anchor,
+        });
+    }
+
+    /// Append `child` to the end of `parent`'s children.
+    pub fn append(&mut self, parent: NodeId, child: NodeId) {
+        self.insert(parent, child, NodeId::NULL);
+    }
+
+    /// Replace a text node's content (the signal-reactive hot path).
+    pub fn set_text(&mut self, node: NodeId, value: &str) {
+        let text = self.intern(value);
+        self.pending.push(Op::SetText { node, text });
+    }
+
+    /// Set one inline style property.
+    pub fn set_inline_style(&mut self, node: NodeId, prop: PropId, value: &str) {
+        let value = self.intern(value);
+        self.pending.push(Op::SetInlineStyle { node, prop, value });
+    }
+
+    /// Add a class.
+    pub fn set_class(&mut self, node: NodeId, class: &str) {
+        let class = self.intern(class);
+        self.pending.push(Op::SetClass { node, class });
+    }
+
+    /// Subscribe `node` to `event`, routing matches to `handler`.
+    pub fn add_listener(&mut self, node: NodeId, event: EventKind, handler: HandlerId) {
+        self.pending.push(Op::AddListener {
+            node,
+            event,
+            handler,
+        });
+    }
+
+    /// Remove a node (and, by host contract, its subtree).
+    pub fn remove(&mut self, node: NodeId) {
+        self.pending.push(Op::RemoveNode { node });
+    }
+
+    /// Whether any ops are pending.
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Wrap all pending ops in a `seq` batch, returning the bytes and clearing the
+    /// pending list. The string table and node counter persist across batches.
+    pub fn take_batch(&mut self, seq: u32) -> Vec<u8> {
+        let mut enc = OpEncoder::new();
+        enc.begin_batch(seq);
+        for op in self.pending.drain(..) {
+            enc.push(&op);
+        }
+        enc.end_batch();
+        enc.into_bytes()
+    }
+}
+
+impl Default for Emitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A lightweight virtual node the guest produces for a static subtree.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VNode {
     /// An element with a kind and children.
@@ -79,36 +212,30 @@ impl Rendered {
     }
 }
 
-/// Allocates node handles and interns strings, then emits a batched op-stream for
-/// each frame. Persistent across frames so handles and the string table are stable.
+/// Mounts a static vnode tree and diffs structurally-identical trees, emitting a
+/// batched op-stream via an internal [`Emitter`]. The signal layer is preferred for
+/// single-value updates; this is for initial structure and (next) keyed lists.
 pub struct Reconciler {
-    next_node: u64,
-    next_str: u32,
-    interned: BTreeMap<String, StrId>,
+    emitter: Emitter,
 }
 
 impl Reconciler {
-    /// New reconciler. Node handles start at 1 so `0` can serve as a host root.
+    /// New reconciler.
     pub fn new() -> Self {
         Self {
-            next_node: 1,
-            next_str: 0,
-            interned: BTreeMap::new(),
+            emitter: Emitter::new(),
         }
     }
 
     /// Mount `node` under `root_parent`, returning the realized tree and the op
-    /// bytes that build it (wrapped in a `seq = 0` batch).
+    /// bytes that build it (a `seq = 0` batch).
     pub fn mount(&mut self, root_parent: NodeId, node: &VNode) -> (Rendered, Vec<u8>) {
-        let mut enc = OpEncoder::new();
-        enc.begin_batch(0);
-        let rendered = self.mount_node(node, root_parent, NodeId::NULL, &mut enc);
-        enc.end_batch();
-        (rendered, enc.into_bytes())
+        let rendered = self.mount_node(node, root_parent, NodeId::NULL);
+        (rendered, self.emitter.take_batch(0))
     }
 
     /// Diff `prev` against `next` (both under `root_parent`), returning the new
-    /// realized tree and the op bytes for the change (wrapped in a `seq` batch).
+    /// realized tree and the op bytes for the change (a `seq` batch).
     pub fn diff(
         &mut self,
         prev: Rendered,
@@ -116,56 +243,19 @@ impl Reconciler {
         root_parent: NodeId,
         seq: u32,
     ) -> (Rendered, Vec<u8>) {
-        let mut enc = OpEncoder::new();
-        enc.begin_batch(seq);
-        let rendered = self.diff_node(prev, next, root_parent, &mut enc);
-        enc.end_batch();
-        (rendered, enc.into_bytes())
+        let rendered = self.diff_node(prev, next, root_parent);
+        (rendered, self.emitter.take_batch(seq))
     }
 
-    fn alloc_node(&mut self) -> NodeId {
-        let id = NodeId::new(self.next_node);
-        self.next_node += 1;
-        id
-    }
-
-    fn intern(&mut self, s: &str, enc: &mut OpEncoder) -> StrId {
-        if let Some(id) = self.interned.get(s) {
-            return *id;
-        }
-        let id = StrId::new(self.next_str);
-        self.next_str += 1;
-        self.interned.insert(s.to_string(), id);
-        enc.push(&Op::InternString {
-            id,
-            bytes: s.as_bytes().to_vec(),
-        });
-        id
-    }
-
-    fn mount_node(
-        &mut self,
-        node: &VNode,
-        parent: NodeId,
-        anchor: NodeId,
-        enc: &mut OpEncoder,
-    ) -> Rendered {
+    fn mount_node(&mut self, node: &VNode, parent: NodeId, anchor: NodeId) -> Rendered {
         match node {
             VNode::Element(ve) => {
-                let id = self.alloc_node();
-                enc.push(&Op::CreateElement {
-                    node: id,
-                    tag: ve.tag,
-                });
-                enc.push(&Op::InsertBefore {
-                    parent,
-                    child: id,
-                    anchor,
-                });
+                let id = self.emitter.create_element(ve.tag);
+                self.emitter.insert(parent, id, anchor);
                 let children = ve
                     .children
                     .iter()
-                    .map(|c| self.mount_node(c, id, NodeId::NULL, enc))
+                    .map(|c| self.mount_node(c, id, NodeId::NULL))
                     .collect();
                 Rendered::Element {
                     id,
@@ -174,17 +264,8 @@ impl Reconciler {
                 }
             }
             VNode::Text(s) => {
-                let id = self.alloc_node();
-                let sid = self.intern(s, enc);
-                enc.push(&Op::CreateText {
-                    node: id,
-                    text: sid,
-                });
-                enc.push(&Op::InsertBefore {
-                    parent,
-                    child: id,
-                    anchor,
-                });
+                let id = self.emitter.create_text(s);
+                self.emitter.insert(parent, id, anchor);
                 Rendered::Text {
                     id,
                     value: s.clone(),
@@ -193,13 +274,7 @@ impl Reconciler {
         }
     }
 
-    fn diff_node(
-        &mut self,
-        prev: Rendered,
-        next: &VNode,
-        parent: NodeId,
-        enc: &mut OpEncoder,
-    ) -> Rendered {
+    fn diff_node(&mut self, prev: Rendered, next: &VNode, parent: NodeId) -> Rendered {
         match (prev, next) {
             // Same element kind and child count: recurse in place.
             (Rendered::Element { id, tag, children }, VNode::Element(ve))
@@ -208,7 +283,7 @@ impl Reconciler {
                 let new_children = children
                     .into_iter()
                     .zip(ve.children.iter())
-                    .map(|(child, next_child)| self.diff_node(child, next_child, id, enc))
+                    .map(|(child, next_child)| self.diff_node(child, next_child, id))
                     .collect();
                 Rendered::Element {
                     id,
@@ -219,11 +294,7 @@ impl Reconciler {
             // Text in place: emit a SetText only when the content actually changed.
             (Rendered::Text { id, value }, VNode::Text(s)) => {
                 if value != *s {
-                    let sid = self.intern(s, enc);
-                    enc.push(&Op::SetText {
-                        node: id,
-                        text: sid,
-                    });
+                    self.emitter.set_text(id, s);
                 }
                 Rendered::Text {
                     id,
@@ -233,8 +304,8 @@ impl Reconciler {
             // Anything else: replace the old subtree with a freshly mounted one.
             // (Keyed reconciliation for reorders/insertions lands next.)
             (prev, next) => {
-                enc.push(&Op::RemoveNode { node: prev.id() });
-                self.mount_node(next, parent, NodeId::NULL, enc)
+                self.emitter.remove(prev.id());
+                self.mount_node(next, parent, NodeId::NULL)
             }
         }
     }
@@ -321,5 +392,19 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0], Op::BeginBatch { .. }));
         assert!(matches!(ops[1], Op::EndBatch));
+    }
+
+    #[test]
+    fn emitter_interns_each_string_once() {
+        let mut e = Emitter::new();
+        let n = e.create_text("hi");
+        e.set_text(n, "hi"); // same string -> no second InternString
+        e.set_text(n, "bye"); // new string -> one InternString
+        let ops = decode_all(&e.take_batch(0)).unwrap();
+        let interns = ops
+            .iter()
+            .filter(|o| matches!(o, Op::InternString { .. }))
+            .count();
+        assert_eq!(interns, 2);
     }
 }

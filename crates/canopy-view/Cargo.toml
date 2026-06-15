@@ -1,0 +1,20 @@
+[package]
+name = "canopy-view"
+description = "Canopy signal-based reactivity: an App that ties signals to the op-stream emitter so a changed value emits one targeted op (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-core = { path = "../canopy-core" }
+canopy-signals = { path = "../canopy-signals" }
+
+[dev-dependencies]
+canopy-dom = { path = "../canopy-dom" }
+canopy-traits = { path = "../canopy-traits" }
+
+[lints]
+workspace = true

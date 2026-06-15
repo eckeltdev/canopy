@@ -10,6 +10,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-dom"
+version = "0.0.0"
+dependencies = [
+ "canopy-core",
+ "canopy-protocol",
+ "canopy-traits",
+]
+
+[[package]]
 name = "canopy-protocol"
 version = "0.0.0"
 
@@ -22,4 +31,15 @@ name = "canopy-traits"
 version = "0.0.0"
 dependencies = [
  "canopy-protocol",
+]
+
+[[package]]
+name = "canopy-view"
+version = "0.0.0"
+dependencies = [
+ "canopy-core",
+ "canopy-dom",
+ "canopy-protocol",
+ "canopy-signals",
+ "canopy-traits",
 ]
