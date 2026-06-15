@@ -156,6 +156,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-anim"
+version = "0.0.0"
+dependencies = [
+ "canopy-signals",
+]
+
+[[package]]
 name = "canopy-cli"
 version = "0.0.0"
 

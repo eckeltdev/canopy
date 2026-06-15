@@ -16,9 +16,12 @@
 //! The welcome app is authored exactly like the in-repo `canopy-welcome` example: one
 //! JSX [`rsx!`] tree over the batteries-included [`canopy_ui::Ui`] context, plus a thin
 //! winit + softbuffer host (gated behind a default-on `window` feature) whose
-//! click/hover logic is one-liners on `Ui`. The UI logic depends on no windowing crate,
-//! so the scaffold-then-`cargo check --no-default-features` test stays fast while
-//! `cargo run` still opens a real window. See [`main_rs`] for the structure.
+//! click/hover logic is one-liners on `Ui` and which **hot-reloads** `styles.css` — a
+//! `canopy-hotreload` watcher restyles the live window on save, no restart. The UI logic
+//! depends on no windowing or hot-reload crate, so the scaffold-then-`cargo check
+//! --no-default-features` test stays fast (and `canopy-hotreload` is dropped) while
+//! `cargo run` still opens a real, live-reloading window. See [`main_rs`] for the
+//! structure.
 //!
 //! [`Ui`]: https://docs.rs/canopy-ui
 //! [`rsx!`]: https://docs.rs/canopy-ui
@@ -34,14 +37,19 @@ use std::path::{Path, PathBuf};
 /// honest about needing the dependency wired up.
 const CRATES_ROOT_ENV: &str = "CANOPY_CRATES_PATH";
 
-/// The Canopy crates the welcome starter depends on, in dependency-graph-ish order.
+/// The always-on Canopy crates the welcome starter depends on, in
+/// dependency-graph-ish order.
 ///
-/// This is the single source of truth for the dependency list: [`cargo_toml`] turns it
-/// into either path deps (rooted at a checkout) or version placeholders, so the
-/// path-vs-version split stays in lockstep for every crate. `canopy-ui` is the one
-/// authoring crate the UI code touches (it re-exports the view/signals/style/dom/layout
-/// core); the rest are the render-side crates the windowed binary paints with.
-/// `winit`/`softbuffer` are emitted separately as optional `window`-feature deps.
+/// This is the single source of truth for the *unconditional* dependency list:
+/// [`cargo_toml`] turns it into either path deps (rooted at a checkout) or version
+/// placeholders, so the path-vs-version split stays in lockstep for every crate.
+/// `canopy-ui` is the one authoring crate the UI code touches (it re-exports the
+/// view/signals/style/dom/layout core); the rest are the render-side crates the
+/// windowed binary paints with. These all compile under `--no-default-features`, so
+/// they are never feature-gated.
+///
+/// `winit`/`softbuffer` and the dev-only [`CANOPY_HOTRELOAD_DEP`] are emitted separately
+/// as **optional** `window`-feature deps.
 const CANOPY_DEPS: &[&str] = &[
     // The batteries-included authoring layer: the `Ui` context + the `rsx!` macro.
     "canopy-ui",
@@ -51,6 +59,17 @@ const CANOPY_DEPS: &[&str] = &[
     "canopy-render-text",
     "canopy-text-parley",
 ];
+
+/// The dev-time hot-reload crate, emitted as an **optional** dependency the `window`
+/// feature activates.
+///
+/// It is a `std`/`notify` crate that only the windowed `main` uses to watch
+/// `styles.css` and restyle the live window. Keeping it optional (and out of
+/// [`CANOPY_DEPS`]) is what lets `cargo check --no-default-features` skip it entirely —
+/// the reactive `welcome` module never touches it. It still honours the
+/// path-vs-version split: under a checkout it is a path dep, otherwise a version
+/// placeholder, in both cases tagged `optional = true`.
+const CANOPY_HOTRELOAD_DEP: &str = "canopy-hotreload";
 
 /// Parse the `new` subcommand args, resolve `<name>` against the cwd, and scaffold.
 ///
@@ -152,23 +171,51 @@ fn ensure_empty_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Render one Canopy dependency line, honoring the path-vs-version split and an
+/// `optional` flag.
+///
+/// Under a checkout this is a path dep rooted at `crates_root`; otherwise a `0.0.0`
+/// version placeholder. When `optional` is set, the line is emitted in inline-table
+/// form with `optional = true` so a `window`-feature `dep:` activation can gate it
+/// (Cargo requires the *table* form for that). Centralizing this keeps the path-dep
+/// behavior identical for the always-on crates and the optional `canopy-hotreload`.
+fn dep_line(krate: &str, crates_root: Option<&Path>, optional: bool) -> String {
+    match crates_root {
+        Some(root) => {
+            let path = format!("{}/crates/{krate}", root.display());
+            if optional {
+                format!("{krate} = {{ path = \"{path}\", optional = true }}\n")
+            } else {
+                format!("{krate} = {{ path = \"{path}\" }}\n")
+            }
+        }
+        None => {
+            if optional {
+                format!("{krate} = {{ version = \"0.0.0\", optional = true }}\n")
+            } else {
+                format!("{krate} = \"0.0.0\"\n")
+            }
+        }
+    }
+}
+
 /// Render the project `Cargo.toml`.
 ///
-/// The Canopy dependency block is generated from [`CANOPY_DEPS`] so the path-vs-version
-/// split is identical for every crate. `winit`/`softbuffer` are appended as **optional**
-/// registry deps activated by the default-on `window` feature: that lets
-/// `cargo check --no-default-features` skip the whole windowing stack (keeping the
-/// scaffold test fast) while `cargo run` still opens a window by default.
+/// The always-on Canopy dependency block is generated from [`CANOPY_DEPS`] so the
+/// path-vs-version split is identical for every crate. `winit`/`softbuffer` and the
+/// dev-only [`CANOPY_HOTRELOAD_DEP`] are appended as **optional** deps activated by the
+/// default-on `window` feature: that lets `cargo check --no-default-features` skip the
+/// whole windowing + hot-reload stack (keeping the scaffold test fast and the reactive
+/// UI display-free) while `cargo run` still opens a live, hot-reloading window by
+/// default.
 fn cargo_toml(name: &str, crates_root: Option<&Path>) -> String {
-    // The Canopy crates: path deps under a checkout, else version placeholders.
+    // The always-on Canopy crates: path deps under a checkout, else version
+    // placeholders. The optional `canopy-hotreload` line is rendered separately below.
     let canopy_deps: String = match crates_root {
-        Some(root) => {
-            let root = root.display();
-            CANOPY_DEPS
-                .iter()
-                .map(|krate| format!("{krate} = {{ path = \"{root}/crates/{krate}\" }}\n"))
-                .collect()
-        }
+        Some(_) => CANOPY_DEPS
+            .iter()
+            .map(|krate| dep_line(krate, crates_root, false))
+            .collect(),
         None => {
             // Version placeholders. Canopy is pre-release (0.0.0) and unpublished, so
             // these are placeholders the developer points at a real source — a path to a
@@ -180,11 +227,15 @@ fn cargo_toml(name: &str, crates_root: Option<&Path>) -> String {
                  # environment variable set to a checkout root to generate path deps for you.\n",
             );
             for krate in CANOPY_DEPS {
-                s.push_str(&format!("{krate} = \"0.0.0\"\n"));
+                s.push_str(&dep_line(krate, crates_root, false));
             }
             s
         }
     };
+
+    // `canopy-hotreload`, optional and gated behind `window` (it is std/notify and only
+    // the windowed `main` watches `styles.css`). Same path-vs-version split as above.
+    let hotreload_dep = dep_line(CANOPY_HOTRELOAD_DEP, crates_root, true);
 
     format!(
         "[package]\n\
@@ -192,22 +243,25 @@ fn cargo_toml(name: &str, crates_root: Option<&Path>) -> String {
          version = \"0.1.0\"\n\
          edition = \"2021\"\n\
          # `cargo run` opens the windowed welcome screen (the `window` feature is on by\n\
-         # default). Build the UI logic alone — no winit/softbuffer — with\n\
-         # `cargo check --no-default-features`.\n\
+         # default) and live-reloads `styles.css` on save. Build the UI logic alone — no\n\
+         # winit/softbuffer/hot-reload — with `cargo check --no-default-features`.\n\
          default-run = \"{name}\"\n\
          \n\
          [dependencies]\n\
          {canopy_deps}\
          \n\
-         # The windowing backend. Optional so the reactive UI (the `welcome` module)\n\
-         # type-checks without a display: `--no-default-features` drops these entirely.\n\
+         # The windowing backend plus dev-time hot reload. All optional so the reactive UI\n\
+         # (the `welcome` module) type-checks without a display: `--no-default-features`\n\
+         # drops them entirely. `canopy-hotreload` watches `styles.css` and restyles the\n\
+         # live window on save; only the windowed `main` uses it.\n\
          winit = {{ version = \"0.30\", optional = true }}\n\
          softbuffer = {{ version = \"0.4\", optional = true }}\n\
+         {hotreload_dep}\
          \n\
          [features]\n\
          default = [\"window\"]\n\
-         # Pull in winit + softbuffer and compile the windowed `main`.\n\
-         window = [\"dep:winit\", \"dep:softbuffer\"]\n\
+         # Pull in winit + softbuffer + hot reload and compile the windowed `main`.\n\
+         window = [\"dep:winit\", \"dep:softbuffer\", \"dep:canopy-hotreload\"]\n\
          \n\
          # Pin the workspace boundary here. A scaffolded app is standalone, but if it is\n\
          # created *inside* another Cargo workspace's tree, this empty table stops Cargo\n\
@@ -226,7 +280,9 @@ fn cargo_toml(name: &str, crates_root: Option<&Path>) -> String {
 ///   [`canopy_ui::Ui`] context and depends on no windowing crate, so it (and the whole
 ///   crate) type-checks under `--no-default-features`.
 /// - a `#[cfg(feature = "window")]` `main` opens a winit window, presents frames via
-///   softbuffer, and drives clicks + the `:hover` cascade through `Ui` one-liners.
+///   softbuffer, drives clicks + the `:hover` cascade through `Ui` one-liners, and
+///   hot-reloads `styles.css` via a `canopy-hotreload` watcher (waking the loop through
+///   an `EventLoopProxy` + channel and restyling with `Ui::reload_css`).
 /// - a fallback `#[cfg(not(feature = "window"))]` `main` builds the same tree headless
 ///   and prints the op-batch size, so the crate still *runs* without a display.
 fn main_rs(name: &str) -> String {
@@ -241,12 +297,14 @@ fn main_rs(name: &str) -> String {
          //! antialiased glyphs — the `Ui` context bundles it all.\n\
          //!\n\
          //! `cargo run` opens a window (winit + softbuffer) and drives clicks and the\n\
-         //! `:hover` cascade — both one-liners on `Ui`. The UI itself lives in the\n\
-         //! `welcome` module's `build()`, which depends on no windowing crate, so\n\
-         //! `cargo check --no-default-features` type-checks the reactive UI without a\n\
-         //! display backend, and a headless fallback `main` still runs (printing the\n\
-         //! op-batch size) when the `window` feature is off. Edit `styles.css` and re-run\n\
-         //! to restyle.\n\n"
+         //! `:hover` cascade — both one-liners on `Ui`. It also **hot-reloads**\n\
+         //! `styles.css`: edit the stylesheet, save, and the live window restyles without\n\
+         //! a restart (a `canopy-hotreload` watcher feeds reloads back into the loop). The\n\
+         //! UI itself lives in the `welcome` module's `build()`, which depends on no\n\
+         //! windowing or hot-reload crate, so `cargo check --no-default-features`\n\
+         //! type-checks the reactive UI without a display backend, and a headless fallback\n\
+         //! `main` still runs (printing the op-batch size) when the `window` feature is\n\
+         //! off.\n\n"
     );
 
     // The body. The `welcome` module is always compiled; the two `main`s are cfg-selected
@@ -270,9 +328,10 @@ mod welcome {
     /// it is found regardless of the working directory `cargo run` was invoked from.
     pub const STYLES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/styles.css");
 
-    /// Read `styles.css` from disk at startup (empty string if it cannot be read, so the
-    /// app still runs). Edit the file and re-run to restyle; watching it for live
-    /// hot-reload with `canopy-hotreload` is a natural next step.
+    /// Read `styles.css` from disk (empty string if it cannot be read, so the app still
+    /// runs). Called once at startup, then again on every hot reload: the windowed
+    /// `main` watches `styles.css` with `canopy-hotreload` and re-reads it here to
+    /// restyle the live window on save — no restart.
     pub fn load_styles() -> String {
         std::fs::read_to_string(STYLES_PATH).unwrap_or_default()
     }
@@ -303,7 +362,7 @@ mod welcome {
                         on:click={ let c = count.clone(); move |_| c.update(|n| *n += 1) }>
                         { let c = count.clone(); move || format!("count is {}", c.get()) }
                     </button>
-                    <span class="hint">"Edit styles.css and re-run to restyle"</span>
+                    <span class="hint">"Edit styles.css \u{2014} the live window restyles on save"</span>
                 </div>
                 <div class="footer">
                     <div class="pill"><span class="pilltext">"docs"</span></div>
@@ -337,13 +396,17 @@ mod welcome {
 }
 "##;
 
-/// The windowed `main` (winit + softbuffer). Compiled only with the default `window`
-/// feature. Almost all of its app logic is a one-liner on `Ui`.
+/// The windowed `main` (winit + softbuffer + hot reload). Compiled only with the
+/// default `window` feature. Almost all of its app logic is a one-liner on `Ui`, and it
+/// **hot-reloads** `styles.css`: a `canopy-hotreload` watcher wakes the loop on save and
+/// restyles the live tree without a restart.
 const WINDOW_MAIN: &str = r##"#[cfg(feature = "window")]
 mod windowed {
     use std::num::NonZeroU32;
     use std::rc::Rc;
+    use std::sync::mpsc::{self, Receiver};
 
+    use canopy_hotreload::{reapply, ReloadEvent, Watcher};
     use canopy_text_parley::TextEngine;
     // `OpSink` brings `Dom::apply` into scope (it is the trait that defines it).
     use canopy_traits::{Color, OpSink, Point, Size};
@@ -352,10 +415,10 @@ mod windowed {
     use winit::application::ApplicationHandler;
     use winit::dpi::{LogicalSize, PhysicalPosition};
     use winit::event::{ElementState, MouseButton, WindowEvent};
-    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
     use winit::window::{Window, WindowId};
 
-    use crate::welcome::{self, Welcome, VIEW_H, VIEW_W};
+    use crate::welcome::{self, Welcome, STYLES_PATH, VIEW_H, VIEW_W};
 
     /// The canvas clear color (`#1e1e2e`), matching the `.screen` background so the
     /// window has no seam around the laid-out tree.
@@ -366,23 +429,40 @@ mod windowed {
         a: 255,
     };
 
-    /// The platform glue: a winit `ApplicationHandler` that presents the welcome tree and
-    /// routes pointer input back into the reactive app via `Ui`.
+    /// The custom winit user-event: "a `styles.css` reload is pending; drain the
+    /// channel." The watcher thread cannot touch the `Dom`, so it sends the
+    /// `ReloadEvent` down a channel we own and wakes the loop with this `'static`
+    /// marker (an `EventLoopProxy` payload must be `'static`); the marker just says
+    /// "go look".
+    #[derive(Debug)]
+    struct ReloadPending;
+
+    /// The platform glue: a winit `ApplicationHandler` that presents the welcome tree,
+    /// routes pointer input back into the reactive app via `Ui`, and restyles the live
+    /// tree when `styles.css` is saved.
     struct WelcomeApp {
         welcome: Welcome,
         dom: Dom,
         seq: u32,
         cursor: PhysicalPosition<f64>,
-        /// The hoverable node under the cursor, so we only restyle when it changes.
+        /// The hoverable node under the cursor, so we only restyle when it changes (and
+        /// so a reload can keep a live hover lit).
         hovered: Option<NodeId>,
         /// Held across redraws so the bundled font is loaded/rasterized once.
         text: TextEngine,
+        /// One `ReloadEvent` per debounced `styles.css` save from the watcher thread.
+        reloads: Receiver<ReloadEvent>,
+        /// Kept alive so the OS watch stays armed; dropping it stops hot reload.
+        _watcher: Watcher,
         window: Option<Rc<Window>>,
         surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     }
 
     impl WelcomeApp {
-        fn new() -> Self {
+        /// Build the app and arm the `styles.css` watcher. The watcher callback runs on
+        /// its own debounce thread, so it cannot touch the `Dom`; it forwards the event
+        /// through a channel and wakes the loop via the `EventLoopProxy`.
+        fn new(proxy: EventLoopProxy<ReloadPending>) -> Self {
             let welcome = welcome::build();
             // `welcome.count` is the live counter handle (the on:click closure holds its
             // own clone); the screen opens at zero. A host could seed it for a lively
@@ -390,6 +470,17 @@ mod windowed {
             debug_assert_eq!(welcome.count.get(), 0, "counter starts at zero");
             let mut dom = Dom::new();
             dom.apply(&welcome.ui.take_batch(0)).expect("initial batch");
+
+            let (reload_tx, reloads) = mpsc::channel::<ReloadEvent>();
+            let watcher = Watcher::new(STYLES_PATH, move |event| {
+                // Off the main thread: forward the event and wake the loop. A failed
+                // send means the app is shutting down, so dropping the reload is correct.
+                if reload_tx.send(event).is_ok() {
+                    let _ = proxy.send_event(ReloadPending);
+                }
+            })
+            .expect("watch styles.css");
+
             Self {
                 welcome,
                 dom,
@@ -397,6 +488,8 @@ mod windowed {
                 cursor: PhysicalPosition::new(0.0, 0.0),
                 hovered: None,
                 text: TextEngine::new(),
+                reloads,
+                _watcher: watcher,
                 window: None,
                 surface: None,
             }
@@ -487,9 +580,42 @@ mod windowed {
             self.hovered = target;
             self.apply_and_redraw();
         }
+
+        /// Drain every pending `styles.css` reload and restyle the live tree. Runs on the
+        /// main thread when the loop is woken by `ReloadPending`, so the `Dom` stays
+        /// single-owner and lock-free. Re-reads the edited sheet, re-resolves every
+        /// styled node with `Ui::reload_css` (keeping a live hover lit so it doesn't
+        /// flicker back to base), and pushes the restyle batch on with `reapply` — a
+        /// malformed reload is rejected at the capability boundary and the old tree kept.
+        fn drain_reloads(&mut self) {
+            let mut changed = false;
+            while let Ok(event) = self.reloads.try_recv() {
+                let n = self
+                    .welcome
+                    .ui
+                    .reload_css(&welcome::load_styles(), self.hovered);
+                let batch = self.welcome.ui.take_batch(self.seq);
+                self.seq += 1;
+                match reapply(&mut self.dom, &batch) {
+                    Ok(()) => {
+                        println!(
+                            "hot reload: restyled {n} nodes from {STYLES_PATH} (changed: {:?})",
+                            event.path()
+                        );
+                        changed = true;
+                    }
+                    Err(e) => eprintln!("hot reload: batch rejected, keeping old styles: {e}"),
+                }
+            }
+            if changed {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
     }
 
-    impl ApplicationHandler for WelcomeApp {
+    impl ApplicationHandler<ReloadPending> for WelcomeApp {
         fn resumed(&mut self, event_loop: &ActiveEventLoop) {
             let attrs = Window::default_attributes()
                 .with_title("Canopy")
@@ -500,6 +626,11 @@ mod windowed {
                 softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
             self.window = Some(window);
             self.surface = Some(surface);
+        }
+
+        /// The watcher woke us: a `styles.css` save is pending. Drain + restyle.
+        fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ReloadPending) {
+            self.drain_reloads();
         }
 
         fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -518,10 +649,16 @@ mod windowed {
     }
 
     /// Open the window and run the event loop until the user closes it.
+    ///
+    /// Built `with_user_event` so the `styles.css` watcher thread can wake us via an
+    /// `EventLoopProxy` (the only thread-safe handle into winit) when the sheet is saved.
     pub fn run() {
-        let event_loop = EventLoop::new().expect("event loop");
+        let event_loop = EventLoop::<ReloadPending>::with_user_event()
+            .build()
+            .expect("event loop");
         event_loop.set_control_flow(ControlFlow::Wait);
-        let mut app = WelcomeApp::new();
+        let proxy = event_loop.create_proxy();
+        let mut app = WelcomeApp::new(proxy);
         event_loop.run_app(&mut app).expect("run app");
     }
 }
@@ -563,9 +700,9 @@ fn main() {
 /// Render the editable `styles.css` — the stylesheet the app reads at startup.
 fn styles_css() -> String {
     "/* Canopy welcome screen — Catppuccin-ish palette, rounded corners everywhere.\n\
-     The app reads this file at startup, so edit it and re-run (`cargo run`) to restyle.\n\
-     A `<div>`'s row/column direction is the `direction` property here, like real\n\
-     flexbox. */\n\
+     The windowed app watches this file: edit it and save, and the live window restyles\n\
+     with no restart (hot reload). A `<div>`'s row/column direction is the `direction`\n\
+     property here, like real flexbox. */\n\
      \n\
      /* Dark canvas, everything centered. */\n\
      .screen   { background: #1e1e2e; direction: column; padding: 40px; gap: 20px }\n\
@@ -620,11 +757,16 @@ fn readme(name: &str) -> String {
          and watch it increment; hover the button and footer pills to see them lighten\n\
          (the `:hover` cascade).\n\
          \n\
+         **Hot reload:** while the window is open, edit `styles.css` and save — the live\n\
+         window restyles instantly, no restart. A `canopy-hotreload` watcher feeds each\n\
+         save back into the event loop, which re-reads the sheet and re-resolves every\n\
+         styled node.\n\
+         \n\
          The reactive UI is independent of the window, so you can type-check it without a\n\
-         display backend:\n\
+         display backend (this drops winit/softbuffer **and** `canopy-hotreload`):\n\
          \n\
          ```sh\n\
-         cargo check --no-default-features   # UI logic only, no winit/softbuffer\n\
+         cargo check --no-default-features   # UI logic only, no window/hot-reload\n\
          ```\n\
          \n\
          ## Edit the UI\n\
@@ -635,9 +777,10 @@ fn readme(name: &str) -> String {
            `class=\"..\"`, make text reactive with a `{{ move || .. }}` child, and wire\n\
            clicks with `on:click={{ .. }}`. A component is a function returning a `NodeId`,\n\
            spliced in with `{{ my_component(&ui) }}`.\n\
-         - **`styles.css`** is the stylesheet the app reads at startup (palette, spacing,\n\
-           `border-radius`, `:hover`, and each `<div>`'s `direction`). Tweak it and re-run.\n\
-           Watching it for live hot-reload with `canopy-hotreload` is a natural next step.\n\
+         - **`styles.css`** is the stylesheet the app reads (palette, spacing,\n\
+           `border-radius`, `:hover`, and each `<div>`'s `direction`). The windowed app\n\
+           watches it with `canopy-hotreload`, so saving an edit restyles the **live**\n\
+           window with no restart.\n\
          \n\
          ## Dependencies\n\
          \n\
@@ -713,6 +856,22 @@ mod tests {
             cargo_txt.contains("default = [\"window\"]"),
             "window feature on by default"
         );
+        // Hot reload is wired, but **only** behind the `window` feature: the dep is
+        // optional and the `window` feature activates it (so `--no-default-features`
+        // drops it). Both halves must be present.
+        assert!(
+            cargo_txt.contains("canopy-hotreload"),
+            "wires the hot-reload dep"
+        );
+        assert!(
+            cargo_txt.contains("optional = true"),
+            "canopy-hotreload is optional so --no-default-features drops it"
+        );
+        assert!(
+            cargo_txt
+                .contains("window = [\"dep:winit\", \"dep:softbuffer\", \"dep:canopy-hotreload\"]"),
+            "the window feature activates winit + softbuffer + hot reload, got:\n{cargo_txt}"
+        );
 
         // main.rs is the JSX welcome app: a counter signal, a "count is" reactive label,
         // a click handler, JSX tags, and the tree mounted under the root.
@@ -741,6 +900,25 @@ mod tests {
             "main.rs has the tagline"
         );
 
+        // The windowed main does live hot reload: it arms a `canopy-hotreload` Watcher
+        // and restyles the live tree with `Ui::reload_css` + `reapply`.
+        assert!(
+            main_txt.contains("Watcher"),
+            "windowed main arms a hot-reload Watcher"
+        );
+        assert!(
+            main_txt.contains("reload_css"),
+            "windowed main restyles via Ui::reload_css"
+        );
+        assert!(
+            main_txt.contains("reapply"),
+            "windowed main pushes the restyle batch with reapply"
+        );
+        assert!(
+            main_txt.contains("EventLoopProxy"),
+            "windowed main wakes the loop from the watcher thread via an EventLoopProxy"
+        );
+
         // styles.css carries the design language: rounded corners + the palette + hover.
         let styles_txt = fs::read_to_string(&styles).unwrap();
         assert!(
@@ -767,7 +945,8 @@ mod tests {
         scaffold(&project, "pathy", Some(root)).unwrap();
 
         let cargo_txt = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-        // Every Canopy dep is wired as a path dep rooted at the provided checkout.
+        // Every always-on Canopy dep is wired as a path dep rooted at the provided
+        // checkout.
         for krate in CANOPY_DEPS {
             let expected = format!("path = \"/tmp/canopy-checkout/crates/{krate}\"");
             assert!(
@@ -775,6 +954,14 @@ mod tests {
                 "expected path dep for `{krate}`, got:\n{cargo_txt}"
             );
         }
+        // The optional `canopy-hotreload` is also a path dep under the checkout — and,
+        // because it is `window`-gated, carries `optional = true`.
+        assert!(
+            cargo_txt.contains(&format!(
+                "{CANOPY_HOTRELOAD_DEP} = {{ path = \"/tmp/canopy-checkout/crates/{CANOPY_HOTRELOAD_DEP}\", optional = true }}"
+            )),
+            "expected optional path dep for `{CANOPY_HOTRELOAD_DEP}`, got:\n{cargo_txt}"
+        );
     }
 
     #[test]
@@ -791,6 +978,15 @@ mod tests {
                 "expected version placeholder for `{krate}`, got:\n{cargo_txt}"
             );
         }
+        // The optional `canopy-hotreload` gets a placeholder too, but in inline-table
+        // form so it can carry `optional = true` (Cargo requires the table form for a
+        // `dep:`-activated optional dependency).
+        assert!(
+            cargo_txt.contains(&format!(
+                "{CANOPY_HOTRELOAD_DEP} = {{ version = \"0.0.0\", optional = true }}"
+            )),
+            "expected optional version placeholder for `{CANOPY_HOTRELOAD_DEP}`, got:\n{cargo_txt}"
+        );
         // And it explains how to wire real deps.
         assert!(cargo_txt.contains("CANOPY_CRATES_PATH"));
     }
@@ -838,9 +1034,9 @@ mod tests {
     /// Scaffolds into a temp dir with `crates_root` pointed at this checkout (so the
     /// generated `Cargo.toml` uses path deps) and runs `cargo +nightly check` on the
     /// generated project. We check `--no-default-features` (UI logic only) so the test
-    /// does not pull in the winit/softbuffer windowing stack — keeping it fast while
-    /// still proving the welcome UI type-checks against the crates' real APIs. The full
-    /// windowed build is verified manually.
+    /// does not pull in the winit/softbuffer/`canopy-hotreload` windowing + hot-reload
+    /// stack — keeping it fast while still proving the welcome UI type-checks against the
+    /// crates' real APIs. The full windowed build is verified manually.
     ///
     /// `#[ignore]` by default because it shells out to `cargo` and compiles a real
     /// dependency graph (minutes of build time). Run it explicitly with:

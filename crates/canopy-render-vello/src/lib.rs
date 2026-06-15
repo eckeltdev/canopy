@@ -13,7 +13,11 @@
 //! Two alpha-blended pipelines share one render pass, drawn in display-list
 //! order so back-to-front compositing is correct:
 //! - [`DisplayItem::Rect`] becomes a single **colored-quad** instance
-//!   (`quad.wgsl`).
+//!   (`quad.wgsl`). A positive `radius` rounds the corners on the GPU via a
+//!   rounded-rectangle signed-distance function evaluated per fragment, with a
+//!   ~1px antialiased edge — matching (and slightly improving on, since the CPU
+//!   tiers have hard edges) the software `fill_round_rect`. `radius == 0` keeps
+//!   the exact square fill.
 //! - [`DisplayItem::Text`] is rasterized to a **real antialiased coverage mask**
 //!   by [`canopy_text_parley::TextEngine`], uploaded as an `R8Unorm` texture, and
 //!   drawn as one **textured glyph quad** (`glyph.wgsl`) tinted with the ink
@@ -46,9 +50,13 @@ use canopy_text_parley::{Glyphs, TextEngine};
 use canopy_traits::{Color, DisplayItem, DisplayList, HostError, Point, Rect, Renderer, Size};
 use wgpu::util::DeviceExt;
 
-/// One instanced quad: a pixel-space rectangle with a straight-alpha RGBA color.
+/// One instanced quad: a pixel-space rectangle with a straight-alpha RGBA color
+/// and an optional corner radius.
 ///
 /// `#[repr(C)]` + `Pod` so it can be uploaded straight into a vertex buffer.
+/// `radius` (plus the already-present `size`) is everything the fragment shader's
+/// rounded-rect SDF needs; a trailing pad keeps the struct's size a multiple of
+/// its 8-byte alignment (`vec2` fields), which `bytemuck` requires of a `Pod`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QuadInstance {
@@ -58,6 +66,12 @@ struct QuadInstance {
     size: [f32; 2],
     /// Straight-alpha RGBA in `[0, 1]`.
     color: [f32; 4],
+    /// Corner radius in pixels, **already clamped** to half the shorter side
+    /// (see [`QuadInstance::rect`]). `0` draws a square.
+    radius: f32,
+    /// Padding so the struct stays a multiple of its 8-byte alignment. Unread by
+    /// the shader (the vertex layout stops at `radius`).
+    _pad: f32,
 }
 
 /// The viewport uniform: surface size in pixels, padded to 16 bytes.
@@ -85,13 +99,25 @@ struct GlyphRunUniform {
 }
 
 impl QuadInstance {
-    /// A solid rectangle. Negative origins / sizes are tolerated — the GPU clips
-    /// to the viewport, mirroring the software renderer's saturating clip.
-    fn rect(rect: Rect, color: Color) -> Self {
+    /// A solid rectangle with corner `radius` (in pixels; `0` = square). Negative
+    /// origins / sizes are tolerated — the GPU clips to the viewport, mirroring
+    /// the software renderer's saturating clip.
+    ///
+    /// `radius` is clamped to half the shorter side here, exactly as the CPU
+    /// [`fill_round_rect`](https://docs.rs/canopy-render-soft) does, so an
+    /// oversized radius produces a pill/stadium (or a circle for a square rect)
+    /// instead of letting opposite corners' arcs overlap. We clamp on the CPU so
+    /// the shader can trust the value and stay branch-light. A negative radius
+    /// (shouldn't happen — the paint layer emits `>= 0`) clamps to `0`.
+    fn rect(rect: Rect, color: Color, radius: f32) -> Self {
+        let max_r = 0.5 * rect.size.w.min(rect.size.h);
+        let r = radius.clamp(0.0, max_r.max(0.0));
         Self {
             origin: [rect.origin.x, rect.origin.y],
             size: [rect.size.w, rect.size.h],
             color: color_to_linear_rgba(color),
+            radius: r,
+            _pad: 0.0,
         }
     }
 }
@@ -158,12 +184,16 @@ fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
     let mut cmds = Vec::new();
     for item in &scene.items {
         match item {
-            // NOTE: `radius` is ignored here for now — the GPU path draws square
-            // quads. Rounded corners on the GPU (an SDF/rounded-quad fragment
-            // shader) are deferred to a later batch; the CPU renderers already
-            // round, so cards/pills look correct on the software tier today.
-            DisplayItem::Rect { rect, color, .. } => {
-                cmds.push(DrawCmd::Rect(QuadInstance::rect(*rect, *color)));
+            // The `radius` rides into the quad instance and the fragment shader's
+            // rounded-rect SDF rounds the corners on the GPU (clamped to half the
+            // shorter side, antialiased ~1px edge) — closing the gap with the CPU
+            // tiers' `fill_round_rect`. `radius == 0` draws a square as before.
+            DisplayItem::Rect {
+                rect,
+                color,
+                radius,
+            } => {
+                cmds.push(DrawCmd::Rect(QuadInstance::rect(*rect, *color, *radius)));
             }
             DisplayItem::Text {
                 origin,
@@ -355,8 +385,9 @@ fn build_rect_pipeline(
         immediate_size: 0,
     });
 
-    // One instance buffer; each QuadInstance is origin(vec2) + size(vec2) +
-    // color(vec4), stepped per-instance.
+    // One instance buffer; each QuadInstance is origin(vec2 @0) + size(vec2 @8) +
+    // color(vec4 @16) + radius(f32 @32), stepped per-instance. The trailing `_pad`
+    // (@36) is not surfaced as an attribute — the shader never reads it.
     let instance_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<QuadInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
@@ -375,6 +406,11 @@ fn build_rect_pipeline(
                 offset: 16,
                 shader_location: 2,
                 format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32,
             },
         ],
     };
@@ -1245,6 +1281,197 @@ mod tests {
             }
         }
         assert!(found_ink, "expected green glyph ink over the card");
+    }
+
+    /// THE ROUNDED-RECT GPU TEST: render a filled rounded rect (radius > 0) on a
+    /// contrasting background on the real Metal adapter and prove the corners are
+    /// rounded *away* on the GPU — the same property the CPU test
+    /// `round_rect_clears_corners_keeps_center` checks, now on the GPU.
+    ///
+    /// The four extreme corner pixels lie well outside the corner arcs, so the
+    /// SDF's coverage there is 0 and the background shows through *exactly* (no AA
+    /// blend reaches that far). The center and the straight mid-edges are fully
+    /// inside, so they are the exact fill color. This is the GPU/CPU parity proof
+    /// for rounded corners. Skips cleanly if no adapter exists.
+    #[test]
+    fn round_rect_clears_corners_keeps_center_on_gpu() {
+        // Mirror the CPU test's geometry: a 40x40 rect, radius 12, fill on bg.
+        let bg = Color {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+            a: 255,
+        };
+        let fill = Color {
+            r: 0xf3,
+            g: 0x8b,
+            b: 0xa8,
+            a: 255,
+        };
+        let size = Size { w: 40.0, h: 40.0 };
+        let scene = DisplayList {
+            items: vec![DisplayItem::Rect {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size,
+                },
+                color: fill,
+                radius: 12.0,
+            }],
+        };
+        let Some(px) = try_render_to_rgba(&scene, size, bg) else {
+            eprintln!("no GPU adapter; skipping GPU assertion");
+            return;
+        };
+        let w = size.w as usize;
+        let h = size.h as usize;
+        assert_eq!(px.len(), w * h * 4);
+        let at = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+
+        // The four extreme corners are carved away: each sits ~4px outside the
+        // r=12 arc, far beyond the ~1px AA band, so coverage is 0 -> exact bg.
+        let bg_px = [bg.r, bg.g, bg.b, bg.a];
+        assert_eq!(at(0, 0), bg_px, "top-left corner rounded away");
+        assert_eq!(at(w - 1, 0), bg_px, "top-right corner rounded away");
+        assert_eq!(at(0, h - 1), bg_px, "bottom-left corner rounded away");
+        assert_eq!(at(w - 1, h - 1), bg_px, "bottom-right corner rounded away");
+
+        // The center is solidly inside the rounded region -> exact fill.
+        let fill_px = [fill.r, fill.g, fill.b, fill.a];
+        assert_eq!(at(w / 2, h / 2), fill_px, "center is the fill color");
+
+        // The straight mid-edges (a few px in from the edge, clear of both the
+        // corner arcs and the AA band) are also exact fill — the rounding only
+        // touches the corners, never the flat sides.
+        assert_eq!(at(w / 2, 2), fill_px, "top mid-edge is straight (fill)");
+        assert_eq!(at(2, h / 2), fill_px, "left mid-edge is straight (fill)");
+        assert_eq!(
+            at(w / 2, h - 3),
+            fill_px,
+            "bottom mid-edge is straight (fill)"
+        );
+        assert_eq!(
+            at(w - 3, h / 2),
+            fill_px,
+            "right mid-edge is straight (fill)"
+        );
+    }
+
+    /// An oversized radius clamps to half the shorter side and the square rect
+    /// becomes a **circle** on the GPU — the GPU analog of the CPU
+    /// `oversized_radius_clamps_to_a_circle` guarantee.
+    ///
+    /// With a 40x40 rect and a radius far larger than the box, the clamp pins it
+    /// to 20 (half of 40), so the filled region is a disc of radius 20 centered in
+    /// the square. We probe: the four corners are bg (well outside the disc); the
+    /// center is fill; and a point just inside the disc along an axis is fill
+    /// while the matching corner-diagonal point is bg. Skips without an adapter.
+    #[test]
+    fn oversized_radius_is_a_circle_on_gpu() {
+        let bg = Color {
+            r: 0x18,
+            g: 0x18,
+            b: 0x24,
+            a: 255,
+        };
+        let fill = Color {
+            r: 0x89,
+            g: 0xb4,
+            b: 0xfa,
+            a: 255,
+        };
+        let size = Size { w: 40.0, h: 40.0 };
+        let scene = DisplayList {
+            items: vec![DisplayItem::Rect {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size,
+                },
+                color: fill,
+                // Absurd radius: clamped to 20 -> a full circle inscribed in the
+                // 40x40 square. (The CPU `fill_round_rect` clamps identically.)
+                radius: 1000.0,
+            }],
+        };
+        let Some(px) = try_render_to_rgba(&scene, size, bg) else {
+            eprintln!("no GPU adapter; skipping GPU assertion");
+            return;
+        };
+        let w = size.w as usize;
+        let h = size.h as usize;
+        let at = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let bg_px = [bg.r, bg.g, bg.b, bg.a];
+        let fill_px = [fill.r, fill.g, fill.b, fill.a];
+
+        // Corners are outside the inscribed disc -> bg.
+        assert_eq!(at(0, 0), bg_px, "corner outside the circle is bg");
+        assert_eq!(at(w - 1, h - 1), bg_px, "opposite corner is bg");
+        // Center is inside -> fill.
+        assert_eq!(at(w / 2, h / 2), fill_px, "circle center is fill");
+        // A point a couple px inside the disc along the top axis is fill (the
+        // circle reaches the mid-edges), where the square's corner is empty —
+        // proving it is a disc, not a square.
+        assert_eq!(at(w / 2, 2), fill_px, "top of the circle is fill");
+        assert_eq!(at(2, h / 2), fill_px, "left of the circle is fill");
+    }
+
+    /// A `radius == 0` rect must still draw a crisp **square** on the GPU: the SDF
+    /// path collapses to a flat coverage of 1, so a corner pixel of a full-surface
+    /// rect is the exact fill (no rounding, no AA fade). This guards the "keep the
+    /// existing square behavior when radius == 0" requirement against regressions
+    /// in the new shader.
+    #[test]
+    fn zero_radius_stays_square_on_gpu() {
+        let bg = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let fill = Color {
+            r: 0,
+            g: 200,
+            b: 80,
+            a: 255,
+        };
+        let size = Size { w: 32.0, h: 24.0 };
+        let scene = DisplayList {
+            items: vec![DisplayItem::Rect {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size,
+                },
+                color: fill,
+                radius: 0.0,
+            }],
+        };
+        let Some(px) = try_render_to_rgba(&scene, size, bg) else {
+            eprintln!("no GPU adapter; skipping GPU assertion");
+            return;
+        };
+        let w = size.w as usize;
+        let h = size.h as usize;
+        let at = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let fill_px = [fill.r, fill.g, fill.b, fill.a];
+        // Every corner of a full-surface square rect is the exact fill — the new
+        // SDF must not nibble corners when radius is 0.
+        assert_eq!(at(0, 0), fill_px, "square keeps its top-left corner");
+        assert_eq!(at(w - 1, 0), fill_px, "square keeps its top-right corner");
+        assert_eq!(at(0, h - 1), fill_px, "square keeps its bottom-left corner");
+        assert_eq!(
+            at(w - 1, h - 1),
+            fill_px,
+            "square keeps its bottom-right corner"
+        );
     }
 
     /// `GpuRenderer` used through the trait stashes the frame for readback.
