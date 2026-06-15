@@ -146,6 +146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-abi"
+version = "0.0.0"
+dependencies = [
+ "canopy-core",
+ "canopy-dom",
+ "canopy-protocol",
+ "canopy-traits",
+]
+
+[[package]]
 name = "canopy-cli"
 version = "0.0.0"
 
@@ -257,6 +267,20 @@ dependencies = [
  "canopy-traits",
  "pollster",
  "wgpu",
+]
+
+[[package]]
+name = "canopy-rsx"
+version = "0.0.0"
+dependencies = [
+ "canopy-dom",
+ "canopy-protocol",
+ "canopy-signals",
+ "canopy-traits",
+ "canopy-view",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

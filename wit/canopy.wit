@@ -1,0 +1,117 @@
+// Canopy's WebAssembly Component Model contract.
+//
+// This `.wit` is the language-neutral description of how an untrusted Canopy guest
+// talks to a host — the typed, capability-based protocol expressed in the Component
+// Model's type system. It is the interface artifact that a future `wit-bindgen` step
+// would consume to generate guest stubs (in Rust, C, JS, Python, Go, …) and a host
+// `Linker`. Today it is a spec only; no codegen is wired into the build (see
+// wit/README.md).
+//
+// It mirrors, one-for-one, the runtime contract that `canopy-transport-wasmtime`
+// enforces over *core* wasm modules today:
+//
+//   * The guest's ONLY capability is handing the host a batch of op bytes to apply.
+//     In the core-wasm transport that is the single granted import
+//     `env::canopy_apply(ptr, len)`; here it is the import `apply: func(ops: list<u8>)`.
+//     The Component Model carries the list with an owned length, so there is no raw
+//     pointer and no host-side bounds math — the boundary is type-checked.
+//   * The host validates every node handle while decoding (a forged handle is
+//     rejected), so the bytes are untrusted exactly as in the sandboxed transport.
+//   * There is no ambient authority: no WASI, no clock, no filesystem, no network.
+//     The guest world below imports *only* `host`, so a guest structurally cannot
+//     reach anything else.
+//
+// The op bytes themselves are the canopy-protocol wire format (the same bytes the
+// C ABI and the wasmtime transport carry); the Component Model boundary deliberately
+// stays oblivious to their internal structure and ships them as an opaque
+// `list<u8>`. That keeps the wire format free to evolve without a WIT change.
+
+package canopy:ui@0.1.0;
+
+/// Canopy-owned handle types and shared records. Handles are opaque integers minted
+/// and validated by the host — naming one does not grant access, mirroring the
+/// unforgeable-handle guarantee in `canopy-protocol`.
+interface types {
+    /// Opaque, host-minted node handle. The host arena validates ownership on every
+    /// mutating op, so a guest can only ever name a node it was handed. `0` is the
+    /// implicit host root.
+    type node-id = u64;
+
+    /// Interned-string id. Strings are sent once (inside an op batch) and then
+    /// referenced by this id, keeping the hot-path ops tiny.
+    type str-id = u32;
+
+    /// Event-handler id, minted guest-side and echoed back in a delivered event so
+    /// the guest can route a host->guest event to the right closure.
+    type handler-id = u32;
+
+    /// Interned event-kind id (e.g. click / input). Values are assigned by the host
+    /// widget registry, not hard-coded here.
+    type event-kind = u16;
+
+    /// One host->guest input event, the decoded form of the protocol's
+    /// `DispatchEvent` op. The guest receives these through `host.poll-events` and
+    /// dispatches them to the handler it registered.
+    record event {
+        /// The node the event targets (must be one the guest created).
+        node: node-id,
+        /// What kind of event it is (click, input, …).
+        kind: event-kind,
+        /// The handler the guest registered for this (node, kind) pair.
+        handler: handler-id,
+    }
+
+    /// Why an `apply` was rejected. The host never traps the guest for bad ops; it
+    /// returns one of these so the guest can react (mirrors `canopy-traits::HostError`
+    /// plus the transport's size guard).
+    enum apply-error {
+        /// An op named a node the guest never created (the capability boundary).
+        bad-handle,
+        /// The bytes were not a decodable op-stream.
+        decode,
+        /// The op is unsupported on this host/tier.
+        unsupported,
+        /// The batch exceeded the host's size cap; it was rejected untouched.
+        too-large,
+    }
+}
+
+/// The single capability the host grants the guest: apply a batch of op bytes, and
+/// drain any pending host->guest events. This is the *entire* host surface — there is
+/// nothing else to import, which is what makes the guest unable to reach the OS.
+interface host {
+    use types.{event, apply-error};
+
+    /// Hand the host one batch of canopy-protocol op bytes to validate and apply.
+    ///
+    /// This is the guest's only way to change the UI. The host decodes the bytes,
+    /// validates every node handle (a forged handle => `bad-handle`), and applies the
+    /// batch atomically. The `list<u8>` carries its own length, so unlike the raw
+    /// `canopy_apply(ptr, len)` core-wasm import there is no untrusted size to
+    /// bounds-check by hand — the component boundary does it. On any failure the host
+    /// returns the matching `apply-error` instead of trapping the guest.
+    apply: func(ops: list<u8>) -> result<_, apply-error>;
+
+    /// Drain pending host->guest input events (clicks, text input, …) that have
+    /// accumulated since the last call. Returns them in arrival order; an empty list
+    /// means "nothing pending". The guest routes each event to the handler it
+    /// registered via an earlier `apply` batch.
+    poll-events: func() -> list<event>;
+}
+
+/// The world an untrusted Canopy guest plugin targets.
+///
+/// It imports ONLY `host`, so a conforming guest has no ambient authority: no WASI,
+/// no clock, no filesystem, no network — exactly the threat model the wasmtime
+/// transport enforces at runtime, here expressed structurally in the component's
+/// type. The guest exports a single `run` entry point, matching the real guest's
+/// exported `run` function.
+world canopy-guest {
+    /// The one granted capability: apply op batches and poll for events.
+    import host;
+
+    /// The guest entry point the host calls once to build (and start driving) its UI.
+    /// Inside `run` the guest emits op batches through `host.apply`; long-lived guests
+    /// keep calling `host.poll-events` / `host.apply` to react to input.
+    export run: func();
+}

@@ -3,17 +3,23 @@
 //! [`build`] assembles a small click-driven app on the Canopy crates: a reactive
 //! counter, a `Memo`-derived parity line, and a removable list with a live count.
 //! Styling is authored as a real **CSS stylesheet** ([`canopy_style_css`]) with
-//! class rules, and geometry is computed by the real **Taffy** flexbox engine
-//! ([`canopy_layout_taffy`]). Both the windowed binary and the headless renderer
-//! drive this same UI, so the example exercises the whole stack — signals + ops +
-//! retained tree + CSS + Taffy layout + baked-font text — without a GPU.
+//! class rules (including `:hover`), and geometry is computed by the real **Taffy**
+//! flexbox engine ([`canopy_layout_taffy`]). Both the windowed binary and the
+//! headless renderer drive this same UI, so the example exercises the whole stack —
+//! signals + ops + retained tree + CSS + Taffy layout + **real antialiased text**
+//! ([`canopy_render_text`]) — and the windowed binary additionally drives the
+//! `:hover` cascade off the live cursor.
 //!
 //! Nothing here references `winit`; windowing lives entirely in the windowed binary.
+//! The pieces the windowed host needs to drive hover — the parsed [`Stylesheet`] and
+//! the list of hoverable `(NodeId, classes)` — are returned on [`Demo`] so the glue
+//! code can re-resolve a node's style when the cursor enters or leaves it.
 
 use canopy_dom::{Dom, ROOT};
 use canopy_layout_taffy::{hit_test, layout};
 use canopy_protocol::{HandlerId, NodeId};
 use canopy_signals::Signal;
+use canopy_style_css::Stylesheet;
 use canopy_traits::{Point, Size};
 use canopy_transport_wasmtime::PluginHost;
 use canopy_view::{App, CLICK, COLUMN, ROW};
@@ -25,11 +31,19 @@ pub const VIEW_H: f32 = 320.0;
 
 /// The demo's stylesheet — authored as CSS class rules, parsed at build time and
 /// expanded onto nodes via [`canopy_style_css`]. Catppuccin-ish palette.
+///
+/// The `:hover` rules are the interactive layer: the windowed host hit-tests the
+/// cursor each move and re-resolves the hovered node's classes with `hovered = true`
+/// (see [`Demo::hoverables`] and the windowed binary), so the buttons lighten to
+/// `#585b70` (Catppuccin *overlay0*) under the pointer and the field's border-ish
+/// background warms a step. Only the windowed binary drives this; the headless shot
+/// renders the base (un-hovered) state.
 const STYLES: &str = "
 .root   { background: #1e1e2e; padding: 16px; gap: 12px; direction: column; width: 360px }
 .header { color: #cdd6f4; height: 22px }
 .row    { direction: row; gap: 10px }
 .btn    { background: #313244; padding: 5px }
+.btn:hover { background: #585b70 }
 .count  { color: #a6e3a1; height: 20px }
 .parity { color: #f9e2af; height: 18px }
 .list   { direction: column; gap: 6px }
@@ -37,10 +51,16 @@ const STYLES: &str = "
 .item   { color: #cdd6f4; height: 18px }
 .footer { color: #6c7086; height: 16px }
 .field  { background: #313244; padding: 5px }
+.field:hover { background: #45475a }
 .fieldtext { color: #cdd6f4; height: 18px }
 ";
 
-/// The built demo: the reactive [`App`] plus the counter signal.
+/// The class list shared by every clickable button (`-`, `+`, and each `x`). It is a
+/// `'static` slice so the windowed host can retain it in [`Demo::hoverables`] and
+/// replay it through [`Stylesheet::apply_state`] without re-allocating per frame.
+const BTN_CLASSES: &[&str] = &["btn"];
+
+/// The built demo: the reactive [`App`] plus everything a host needs to drive it.
 pub struct Demo {
     /// The reactive app (produces op batches, receives dispatched events).
     pub app: App,
@@ -48,6 +68,15 @@ pub struct Demo {
     pub count: Signal<i32>,
     /// The text-input field node, so the host can route typed keys to it.
     pub input: NodeId,
+    /// The parsed stylesheet, retained so the windowed host can re-resolve a node's
+    /// classes (with `:hover`) when the cursor enters or leaves it via
+    /// [`Stylesheet::apply_state`]. The headless renderer ignores it.
+    pub css: Stylesheet,
+    /// Every node that reacts to `:hover`, paired with the classes to re-resolve it
+    /// with. The windowed host hit-tests the cursor, finds the matching entry, and
+    /// flips that node's hover state (see the windowed binary). Empty entries here
+    /// would simply never light up; today it holds the three buttons.
+    pub hoverables: Vec<(NodeId, &'static [&'static str])>,
 }
 
 /// Assemble the demo UI and return the live [`App`].
@@ -55,6 +84,9 @@ pub fn build() -> Demo {
     let app = App::new();
     let rt = app.runtime();
     let css = canopy_style_css::parse(STYLES);
+    // Collect the nodes that should react to `:hover` (the buttons) as we build them,
+    // so the windowed host can re-resolve their style when the cursor crosses them.
+    let mut hoverables: Vec<(NodeId, &'static [&'static str])> = Vec::new();
 
     let root = app.el(COLUMN);
     css.apply(&app, root, &["root"]);
@@ -81,7 +113,8 @@ pub fn build() -> Demo {
     app.mount(root, crow);
 
     let dec = app.button("-");
-    css.apply(&app, dec, &["btn"]);
+    css.apply(&app, dec, BTN_CLASSES);
+    hoverables.push((dec, BTN_CLASSES));
     {
         let count = count.clone();
         app.on_click(dec, move |_| count.update(|n| *n -= 1));
@@ -97,7 +130,8 @@ pub fn build() -> Demo {
     app.mount(crow, display);
 
     let inc = app.button("+");
-    css.apply(&app, inc, &["btn"]);
+    css.apply(&app, inc, BTN_CLASSES);
+    hoverables.push((inc, BTN_CLASSES));
     {
         let count = count.clone();
         app.on_click(inc, move |_| count.update(|n| *n += 1));
@@ -137,7 +171,8 @@ pub fn build() -> Demo {
         app.mount(item_row, item_label);
 
         let remove = app.button("x");
-        css.apply(&app, remove, &["btn"]);
+        css.apply(&app, remove, BTN_CLASSES);
+        hoverables.push((remove, BTN_CLASSES));
         {
             let emitter = emitter.clone();
             let remaining = remaining.clone();
@@ -163,6 +198,8 @@ pub fn build() -> Demo {
         app,
         count,
         input: field,
+        css,
+        hoverables,
     }
 }
 
@@ -190,5 +227,31 @@ pub fn click_handler(dom: &Dom, viewport: Size, point: Point) -> Option<HandlerI
             return Some(*handler);
         }
         node = n.parent?;
+    }
+}
+
+/// Resolve `point` to the [`Demo::hoverables`] entry under the cursor, if any.
+///
+/// This mirrors [`click_handler`]: it lays out `dom` at `viewport`, hit-tests the
+/// topmost node, then walks up the parent chain to the nearest ancestor that appears
+/// in `hoverables` (a button's text label is a child of the button element, so the
+/// raw hit is usually one level below the hoverable node). Returns the matching
+/// `(NodeId, classes)` so the host can flip exactly that node's `:hover` state.
+///
+/// Returns `None` when nothing is hit or no ancestor is hoverable — e.g. the cursor
+/// is over the background or inside the untrusted-plugin panel.
+pub fn hover_target(
+    dom: &Dom,
+    viewport: Size,
+    point: Point,
+    hoverables: &[(NodeId, &'static [&'static str])],
+) -> Option<(NodeId, &'static [&'static str])> {
+    let (_scene, lay) = layout(dom, viewport);
+    let mut node = hit_test(&lay, point)?;
+    loop {
+        if let Some(entry) = hoverables.iter().find(|(id, _)| *id == node) {
+            return Some(*entry);
+        }
+        node = dom.node(node)?.parent?;
     }
 }

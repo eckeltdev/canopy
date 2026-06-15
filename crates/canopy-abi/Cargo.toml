@@ -1,0 +1,34 @@
+[package]
+name = "canopy-abi"
+description = "Canopy's stable C ABI over the host op-stream: an opaque host handle plus extern \"C\" functions to create it, feed it validated op-batch bytes, read back facts, and free it. The cross-language embedding seam — the one crate allowed unsafe (it is the FFI boundary)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Build three artifacts from the same source:
+#   * `rlib`      — so Rust tests (and Rust embedders) can link it and exercise the
+#                   extern fns through the safe path.
+#   * `staticlib` — a `.a` a C/C++ host links directly.
+#   * `cdylib`    — a `.so`/`.dylib`/`.dll` a runtime loader (or Python ctypes,
+#                   Node N-API, a Swift/Kotlin bridge, …) can `dlopen`.
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+# The host side. `Dom` is the retained tree + capability-validating OpSink; we wrap
+# it behind the C handle and feed it untrusted op bytes exactly like the wasmtime
+# transport does.
+canopy-dom = { path = "../canopy-dom" }
+canopy-traits = { path = "../canopy-traits" }
+
+[dev-dependencies]
+# The guest-side op-builder, used by the tests to produce real op batches (create an
+# element + a text child, append under ROOT, take_batch) and drive them through the
+# C entry points.
+canopy-core = { path = "../canopy-core" }
+canopy-protocol = { path = "../canopy-protocol" }
+
+[lints]
+workspace = true
