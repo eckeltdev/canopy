@@ -1,6 +1,6 @@
 [package]
 name = "canopy-rsx"
-description = "Canopy's first-party Rust authoring macro: a JSX-like `rsx!` that lowers an HTML-style tree to `canopy-view::App` builder calls (host build tooling, std)."
+description = "Canopy's first-party Rust authoring macro: a JSX-like `rsx!` that lowers an HTML-style tree to `canopy-ui::Ui` builder calls (host build tooling, std)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,8 @@ rust-version.workspace = true
 [lib]
 # A procedural macro: this crate compiles to a compiler plugin, not a library you
 # link against. It runs on the *host* at build time (std, not no_std) and emits
-# tokens that reference `::canopy_view`; the consumer crate is what actually depends
-# on canopy-view at runtime.
+# method calls on a `canopy_ui::Ui` receiver; the consumer crate is what actually
+# depends on canopy-ui at runtime.
 proc-macro = true
 
 [dependencies]
@@ -23,16 +23,17 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
-# The integration tests build real trees with the macro and assert the emitted op
-# batch matches the same tree built by hand. They therefore need the runtime surface
-# the macro lowers to (`App` + the well-known element ids), the signal runtime for the
-# reactive closures, and a host `Dom` to apply and introspect the resulting op-stream.
-canopy-view = { path = "../canopy-view" }
+# The integration tests build real trees with the macro against the same `Ui` a
+# consumer uses, mount them into a host `Dom`, and assert the resulting tree/op-stream.
+# This is a dev-dependency cycle (canopy-ui depends on this proc-macro), which Cargo
+# permits because it only closes when building *this crate's tests*.
+canopy-ui = { path = "../canopy-ui" }
 canopy-signals = { path = "../canopy-signals" }
 canopy-protocol = { path = "../canopy-protocol" }
 canopy-dom = { path = "../canopy-dom" }
-# `Dom::apply` is provided by the `OpSink` trait, which the end-to-end test imports to
-# replay an rsx!-built batch into a real host tree.
+canopy-paint = { path = "../canopy-paint" }
+# `Dom::apply` is provided by the `OpSink` trait, which the tests import to replay an
+# rsx!-built batch into a real host tree.
 canopy-traits = { path = "../canopy-traits" }
 
 [lints]

@@ -3,40 +3,29 @@
 //! Opens a winit window, presents the rendered frame via softbuffer, routes pointer
 //! input into the reactive app, and — the signature feature — **hot-reloads
 //! `styles.css`**: edit the stylesheet, save, and the live window restyles without a
-//! restart. The UI itself is built by [`canopy_welcome::build`]; this file is only the
-//! platform glue, which is exactly the boundary Canopy is designed around.
+//! restart. The UI is built by [`canopy_welcome::build`]; this file is only platform
+//! glue, and almost all of its app logic is a one-liner against the [`Ui`] context:
 //!
-//! ## What this host drives
+//! - **Click** → [`Ui::click_handler`] + [`Ui::dispatch`] (the counter increments and
+//!   its bound "count is N" label re-renders).
+//! - **`:hover`** → [`Ui::hover_target`] + [`Ui::set_hover`] (buttons/pills lighten
+//!   under the pointer).
+//! - **Hot reload** → [`Ui::reload_css`] (re-resolve every styled node against the
+//!   edited sheet).
 //!
-//! - **Sharp text.** The frame is rasterized by [`canopy_render_text`] with real
-//!   antialiased cosmic-text glyphs. A single [`TextEngine`] is held across redraws
-//!   (via [`canopy_render_text::render_dom_with`]) so the font and its glyph caches are
-//!   loaded once, not per frame.
-//! - **Click.** A left click hit-tests the cursor against the live Taffy layout
-//!   ([`canopy_welcome::click_handler`]) and dispatches the counter button's handler, so
-//!   the button increments and its bound "count is N" label re-renders.
-//! - **`:hover`.** Each `CursorMoved` finds the hoverable under the cursor
-//!   ([`canopy_welcome::hover_target`]); when it changes, the old node is re-resolved
-//!   without hover and the new one with hover ([`Stylesheet::apply_state`]), so buttons
-//!   and pills lighten under the pointer.
+//! Text is rasterized by [`canopy_render_text`] with real antialiased cosmic-text
+//! glyphs; a single [`TextEngine`] is held across redraws so the font loads once.
 //!
 //! ## Hot reload — the loop (`canopy-hotreload`)
 //!
 //! A [`canopy_hotreload::Watcher`] watches `styles.css`. Its callback runs on the
-//! watcher's own debounce thread, so it cannot touch the [`Dom`] directly; instead it
-//! sends a [`ReloadEvent`] through a channel and asks winit to wake the event loop via
-//! an [`EventLoopProxy`]. Back on the **main thread**, on each wake we:
-//!
-//! 1. read + re-parse the edited `styles.css` ([`canopy_welcome::load_stylesheet`]),
-//! 2. re-apply **every** styled node's classes against the new sheet
-//!    ([`canopy_welcome::reapply_styles`], preserving any live hover),
-//! 3. take the resulting op batch and push it onto the live tree
-//!    ([`canopy_hotreload::reapply`]) — a malformed reload is rejected at the
-//!    capability boundary and the old tree is kept,
-//! 4. request a redraw.
-//!
-//! Doing the `Dom` mutation on the main thread (not the watcher thread) keeps the tree
-//! single-owner and lock-free; the watcher only ever sends a wake + the event.
+//! watcher's debounce thread, so it cannot touch the [`Dom`] directly; it sends a
+//! [`ReloadEvent`] through a channel and wakes the winit loop via an [`EventLoopProxy`].
+//! Back on the **main thread**, each wake re-reads the file, calls [`Ui::reload_css`]
+//! (which re-resolves every styled node, preserving a live hover), takes the op batch,
+//! and pushes it onto the tree via [`canopy_hotreload::reapply`] — a malformed reload is
+//! rejected at the capability boundary. Doing the `Dom` mutation on the main thread
+//! keeps the tree single-owner and lock-free.
 //!
 //! Run from `examples/canopy-welcome`: `cargo run`.
 
@@ -44,15 +33,11 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 
-use canopy_dom::Dom;
 use canopy_hotreload::{reapply, ReloadEvent, Watcher};
-use canopy_protocol::{EventPayload, NodeId};
 use canopy_text_parley::TextEngine;
 use canopy_traits::{Color, OpSink, Point, Size};
-use canopy_welcome::{
-    build, click_handler, hover_target, load_stylesheet, reapply_styles, Welcome, STYLES_PATH,
-    VIEW_H, VIEW_W,
-};
+use canopy_ui::prelude::{Dom, EventPayload, NodeId};
+use canopy_welcome::{build, load_styles, Welcome, STYLES_PATH, VIEW_H, VIEW_W};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -72,9 +57,8 @@ const CLEAR: Color = Color {
 /// The custom winit user-event: "a `styles.css` reload is pending; drain the channel."
 ///
 /// The watcher thread sends the [`ReloadEvent`] through a [`mpsc`] channel and then
-/// wakes the loop with this marker. We don't ship the event *in* the user-event because
-/// `EventLoopProxy::send_event` needs a `'static` payload and we'd rather keep the
-/// reload data flowing through the channel we already own. The marker just says "go
+/// wakes the loop with this marker (an [`EventLoopProxy`] payload must be `'static`, and
+/// the reload data already flows through the channel we own). The marker just says "go
 /// look".
 #[derive(Debug)]
 struct ReloadPending;
@@ -84,17 +68,14 @@ struct WelcomeApp {
     dom: Dom,
     seq: u32,
     cursor: PhysicalPosition<f64>,
-    /// The hoverable currently under the cursor, so we only re-resolve styles when the
-    /// hovered node actually changes. Also consulted on reload so a live hover survives.
+    /// The hoverable currently under the cursor, so we only restyle when it changes (and
+    /// so a reload can keep a live hover lit).
     hovered: Option<NodeId>,
-    /// Reused across redraws so the bundled font is shaped/rasterized once and its glyph
-    /// caches persist (see [`canopy_render_text::render_dom_with`]).
+    /// Reused across redraws so the bundled font is loaded/rasterized once.
     text: TextEngine,
-    /// Receives one [`ReloadEvent`] per debounced `styles.css` save from the watcher
-    /// thread; drained on the main thread when the loop is woken by [`ReloadPending`].
+    /// One [`ReloadEvent`] per debounced `styles.css` save from the watcher thread.
     reloads: Receiver<ReloadEvent>,
-    /// Kept alive for the life of the app so the OS watch stays armed; dropping it stops
-    /// hot reload. The `_` name documents that it is a guard, not otherwise read.
+    /// Kept alive so the OS watch stays armed; dropping it stops hot reload.
     _watcher: Watcher,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
@@ -102,21 +83,15 @@ struct WelcomeApp {
 
 impl WelcomeApp {
     /// Build the app and arm the `styles.css` watcher.
-    ///
-    /// The watcher callback runs off-thread: it forwards each debounced [`ReloadEvent`]
-    /// down `reload_tx` and wakes the winit loop through `proxy`, so the actual reload
-    /// work happens back on the main thread in [`Self::drain_reloads`].
     fn new(proxy: EventLoopProxy<ReloadPending>) -> Self {
         let welcome = build();
         let mut dom = Dom::new();
-        // Mount the initial tree.
-        dom.apply(&welcome.app.take_batch(0))
-            .expect("initial batch");
+        dom.apply(&welcome.ui.take_batch(0)).expect("initial batch");
 
         let (reload_tx, reloads) = mpsc::channel::<ReloadEvent>();
         let watcher = Watcher::new(STYLES_PATH, move |event| {
-            // Off the main thread: just forward the event and wake the loop. If either
-            // send fails the app is shutting down, so dropping the reload is correct.
+            // Off the main thread: forward the event and wake the loop. A failed send
+            // means the app is shutting down, so dropping the reload is correct.
             if reload_tx.send(event).is_ok() {
                 let _ = proxy.send_event(ReloadPending);
             }
@@ -137,9 +112,10 @@ impl WelcomeApp {
         }
     }
 
-    /// Apply a freshly-taken op batch to the retained [`Dom`] and request a redraw.
+    /// Drain everything the [`Ui`] emitted into the retained [`Dom`] and request a
+    /// redraw.
     fn apply_and_redraw(&mut self) {
-        let batch = self.welcome.app.take_batch(self.seq);
+        let batch = self.welcome.ui.take_batch(self.seq);
         self.seq += 1;
         let _ = self.dom.apply(&batch);
         if let Some(window) = &self.window {
@@ -167,8 +143,7 @@ impl WelcomeApp {
         let viewport = self.viewport();
         let (w, h) = (viewport.w as usize, viewport.h as usize);
 
-        // Lay out + rasterize the tree with real antialiased glyphs, reusing the held
-        // TextEngine so shaping/rasterization caches persist across frames.
+        // Lay out + rasterize with real antialiased glyphs, reusing the held TextEngine.
         let buf = canopy_render_text::render_dom_with(&self.dom, viewport, CLEAR, &mut self.text);
 
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
@@ -195,80 +170,57 @@ impl WelcomeApp {
             x: self.cursor.x as f32,
             y: self.cursor.y as f32,
         };
-        if let Some(handler) = click_handler(&self.dom, self.viewport(), point) {
-            self.welcome.app.dispatch(handler, EventPayload::None);
+        if let Some(handler) = self
+            .welcome
+            .ui
+            .click_handler(&self.dom, self.viewport(), point)
+        {
+            self.welcome.ui.dispatch(handler, EventPayload::None);
             self.apply_and_redraw();
         }
     }
 
-    /// Update `:hover` when the cursor moves: find the hoverable under the cursor and,
-    /// if it changed, re-resolve the old node's style without hover and the new node's
-    /// style with hover, then apply + redraw.
+    /// Update `:hover` when the cursor moves: find the hoverable under the cursor and, if
+    /// it changed, un-hover the old node and hover the new one, then apply + redraw.
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor = position;
         let point = Point {
             x: position.x as f32,
             y: position.y as f32,
         };
-        let target = hover_target(&self.dom, self.viewport(), point, &self.welcome.hoverables);
-        let new_hovered = target.map(|(id, _)| id);
-        if new_hovered == self.hovered {
+        let target = self
+            .welcome
+            .ui
+            .hover_target(&self.dom, self.viewport(), point);
+        if target == self.hovered {
             return; // Same node (or still nothing): no style change needed.
         }
-
-        // Un-hover the node we left (re-resolve its base style)...
         if let Some(old) = self.hovered {
-            if let Some((_, classes)) = self.welcome.hoverables.iter().find(|(id, _)| *id == old) {
-                self.welcome
-                    .css
-                    .apply_state(&self.welcome.app, old, classes, false);
-            }
+            self.welcome.ui.set_hover(old, false);
         }
-        // ...and hover the node we entered.
-        if let Some((id, classes)) = target {
-            self.welcome
-                .css
-                .apply_state(&self.welcome.app, id, classes, true);
+        if let Some(new) = target {
+            self.welcome.ui.set_hover(new, true);
         }
-        self.hovered = new_hovered;
+        self.hovered = target;
         self.apply_and_redraw();
     }
 
-    /// Drain every pending `styles.css` reload and restyle the live tree.
-    ///
-    /// Called on the main thread when the loop is woken by [`ReloadPending`]. For each
-    /// debounced save we re-read + re-parse the file, swap the parsed sheet into
-    /// [`Welcome::css`] (so subsequent `:hover` resolves use the new rules), re-apply
-    /// every styled node against it (preserving the live hover), take the op batch, and
-    /// push it onto the existing tree via [`reapply`]. A rejected batch leaves the old
-    /// tree intact and is logged.
+    /// Drain every pending `styles.css` reload and restyle the live tree. Runs on the
+    /// main thread when the loop is woken by [`ReloadPending`].
     fn drain_reloads(&mut self) {
         let mut changed = false;
         while let Ok(event) = self.reloads.try_recv() {
-            // Re-read + re-parse the edited stylesheet from disk.
-            let fresh = load_stylesheet();
+            // Re-read the edited stylesheet and re-resolve every styled node against it,
+            // keeping a live hover lit so it doesn't flicker back to base on save.
+            let n = self.welcome.ui.reload_css(&load_styles(), self.hovered);
 
-            // Re-apply every styled node against the new sheet, keeping the hovered node
-            // lit so a live hover doesn't flicker back to base on save.
-            reapply_styles(
-                &self.welcome.app,
-                &fresh,
-                &self.welcome.styled,
-                self.hovered,
-            );
-
-            // Swap the parsed sheet in so future hover resolves use the edited rules.
-            self.welcome.css = fresh;
-
-            // Push the restyle batch onto the live tree. Keep the old tree on error.
-            let batch = self.welcome.app.take_batch(self.seq);
+            // Push the restyle batch onto the live tree; keep the old tree on error.
+            let batch = self.welcome.ui.take_batch(self.seq);
             self.seq += 1;
             match reapply(&mut self.dom, &batch) {
                 Ok(()) => {
                     println!(
-                        "hot reload: restyled {} nodes from {} (changed: {:?})",
-                        self.welcome.styled.len(),
-                        STYLES_PATH,
+                        "hot reload: restyled {n} nodes from {STYLES_PATH} (changed: {:?})",
                         event.path()
                     );
                     changed = true;

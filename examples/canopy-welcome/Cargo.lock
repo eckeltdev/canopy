@@ -234,6 +234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-rsx"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "canopy-signals"
 version = "0.0.0"
 
@@ -267,6 +276,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-ui"
+version = "0.0.0"
+dependencies = [
+ "canopy-dom",
+ "canopy-layout-taffy",
+ "canopy-protocol",
+ "canopy-rsx",
+ "canopy-signals",
+ "canopy-style-css",
+ "canopy-traits",
+ "canopy-view",
+]
+
+[[package]]
 name = "canopy-view"
 version = "0.0.0"
 dependencies = [
@@ -280,19 +303,13 @@ dependencies = [
 name = "canopy-welcome"
 version = "0.0.0"
 dependencies = [
- "canopy-dom",
  "canopy-hotreload",
- "canopy-input",
- "canopy-layout-taffy",
  "canopy-paint",
- "canopy-protocol",
  "canopy-render-soft",
  "canopy-render-text",
- "canopy-signals",
- "canopy-style-css",
  "canopy-text-parley",
  "canopy-traits",
- "canopy-view",
+ "canopy-ui",
  "softbuffer",
  "winit",
 ]

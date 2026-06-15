@@ -34,6 +34,7 @@ members = [
     "crates/canopy-abi",
     "crates/canopy-rsx",
     "crates/canopy-hotreload",
+    "crates/canopy-ui",
 ]
 
 # The four crates above are the guest-side core: they MUST stay `no_std` + `alloc`

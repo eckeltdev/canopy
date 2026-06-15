@@ -1,0 +1,24 @@
+[package]
+name = "canopy-ui"
+description = "Canopy's batteries-included authoring DX: the `Ui` context (App + stylesheet + signal helpers + auto-tracked styled/hoverable nodes + hit-testing) that the `rsx!` macro lowers onto, plus a one-line `prelude`. The ergonomic, React-shaped front door to the core bindings — still `no_std` + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-view = { path = "../canopy-view" }
+canopy-signals = { path = "../canopy-signals" }
+canopy-style-css = { path = "../canopy-style-css" }
+canopy-layout-taffy = { path = "../canopy-layout-taffy" }
+canopy-rsx = { path = "../canopy-rsx" }
+
+[dev-dependencies]
+canopy-paint = { path = "../canopy-paint" }
+
+[lints]
+workspace = true

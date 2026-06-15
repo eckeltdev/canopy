@@ -165,6 +165,23 @@ impl Stylesheet {
         resolved
     }
 
+    /// Whether any of `classes` has a `:hover` rule, i.e. the node would restyle when
+    /// the pointer enters or leaves it.
+    ///
+    /// A host uses this to decide which nodes are worth tracking for hover: a node
+    /// whose classes carry no `:hover` rule never changes under the cursor, so there is
+    /// no point re-resolving it on every pointer move. It is the cheap, allocation-free
+    /// predicate behind a "hoverables" registry (compare [`resolve`] with both states,
+    /// which this avoids the cost of).
+    ///
+    /// [`resolve`]: Stylesheet::resolve
+    #[must_use]
+    pub fn reacts_to_hover(&self, classes: &[&str]) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.state == State::Hover && classes.contains(&rule.class.as_str()))
+    }
+
     /// Apply `classes` to `node` on `app`, in order, by replaying each resolved
     /// declaration through [`App::style`]. Later classes override earlier ones
     /// because the later inline-style op simply overwrites the property.

@@ -1,19 +1,18 @@
 //! Headless renderer for the Canopy **welcome** app.
 //!
-//! Builds the welcome screen ([`canopy_welcome::build`] — logo, heading, tagline,
-//! counter card, footer pills authored with CSS classes and laid out by Taffy),
-//! seeds the counter to a lively nonzero value so the static shot looks alive, lays
-//! it out, and rasterizes one frame with **real antialiased glyphs**
-//! ([`canopy_render_text::render_dom`]). The frame is written out as a PPM. No
-//! window, no GPU.
+//! Builds the welcome screen ([`canopy_welcome::build`] — one `rsx!` tree of logo,
+//! heading, tagline, counter card, footer pills), seeds the counter to a lively nonzero
+//! value so the static shot looks alive, and rasterizes one frame with **real
+//! antialiased glyphs** ([`canopy_render_text::render_dom`]). The frame is written out
+//! as a PPM. No window, no GPU.
 //!
 //! Usage: `cargo run --no-default-features --bin render [out.ppm] [count]`
 //!   - `out.ppm` — output path (default `welcome.ppm` in the manifest dir).
 //!   - `count`   — the counter's starting value (default `3`, so the button reads
 //!     "count is 3" in the screenshot).
 
-use canopy_dom::Dom;
 use canopy_traits::{Color, OpSink, Size};
+use canopy_ui::prelude::Dom;
 use canopy_welcome::{build, VIEW_H, VIEW_W};
 
 fn main() {
@@ -26,10 +25,10 @@ fn main() {
     // Seed the counter and flush so the bound label emits its "count is N" SetText
     // before we drain the mount batch.
     welcome.count.set(start);
-    welcome.app.runtime().flush();
+    welcome.ui.runtime().flush();
 
     let mut dom = Dom::new();
-    dom.apply(&welcome.app.take_batch(0)).expect("apply ops");
+    dom.apply(&welcome.ui.take_batch(0)).expect("apply ops");
 
     // The dark canvas clear color (Catppuccin base). The `.canvas` element also paints
     // this, but clearing to it keeps any sub-pixel gaps on-palette.

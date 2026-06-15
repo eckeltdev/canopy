@@ -286,10 +286,11 @@ name = "canopy-rsx"
 version = "0.0.0"
 dependencies = [
  "canopy-dom",
+ "canopy-paint",
  "canopy-protocol",
  "canopy-signals",
  "canopy-traits",
- "canopy-view",
+ "canopy-ui",
  "proc-macro2",
  "quote",
  "syn",
@@ -361,6 +362,21 @@ dependencies = [
  "canopy-traits",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "canopy-ui"
+version = "0.0.0"
+dependencies = [
+ "canopy-dom",
+ "canopy-layout-taffy",
+ "canopy-paint",
+ "canopy-protocol",
+ "canopy-rsx",
+ "canopy-signals",
+ "canopy-style-css",
+ "canopy-traits",
+ "canopy-view",
 ]
 
 [[package]]
