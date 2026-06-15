@@ -1,0 +1,69 @@
+[package]
+name = "canopy-welcome"
+description = "The flagship Canopy welcome app — Canopy's answer to the Vite/React starter. A centered, rounded \"create-canopy-app\" landing with a live counter button and a hot-reloading stylesheet. A windowed binary (winit + softbuffer) plus a headless `render` binary that writes a PPM."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+# `cargo run` launches the welcome window; the headless renderer is `cargo run --bin render`.
+default-run = "canopy-welcome"
+
+# This example is intentionally OUTSIDE the core workspace (see the root Cargo.toml
+# `exclude`) so the no_std core never inherits winit/softbuffer/notify.
+# Build the windowed app:   cargo run                                  (from this directory)
+# Render a frame headless:  cargo run --no-default-features --bin render
+
+[dependencies]
+canopy-protocol = { path = "../../crates/canopy-protocol" }
+canopy-traits = { path = "../../crates/canopy-traits" }
+canopy-dom = { path = "../../crates/canopy-dom" }
+canopy-view = { path = "../../crates/canopy-view" }
+canopy-signals = { path = "../../crates/canopy-signals" }
+canopy-render-soft = { path = "../../crates/canopy-render-soft" }
+# Sharp, antialiased glyphs: the capable-tier renderer that drives both binaries'
+# frames (real cosmic-text glyphs, not the baked 8x8 software font).
+canopy-render-text = { path = "../../crates/canopy-render-text" }
+# The text engine itself, so the windowed loop can hold one `TextEngine` and reuse
+# its shaping/rasterization caches across redraws (via `render_dom_with`).
+canopy-text-parley = { path = "../../crates/canopy-text-parley" }
+canopy-layout-taffy = { path = "../../crates/canopy-layout-taffy" }
+canopy-style-css = { path = "../../crates/canopy-style-css" }
+canopy-input = { path = "../../crates/canopy-input" }
+# The signature feature: a debounced filesystem Watcher + the `reapply` glue that
+# pushes a freshly rebuilt op-batch onto the live Dom, so editing styles.css
+# restyles the running window without a restart.
+canopy-hotreload = { path = "../../crates/canopy-hotreload" }
+
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+[dev-dependencies]
+# The `PropId` consts (BG, RADIUS, …) the tests read styles back by. Pulled only
+# for tests so the binaries don't depend on the paint crate directly.
+canopy-paint = { path = "../../crates/canopy-paint" }
+
+[features]
+default = ["window"]
+window = ["dep:winit", "dep:softbuffer"]
+
+[lib]
+path = "src/lib.rs"
+
+# Always available, no windowing deps: builds the UI and renders one frame to a PPM.
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+
+# The windowed welcome app; needs the `window` feature (on by default).
+[[bin]]
+name = "canopy-welcome"
+path = "src/bin/window.rs"
+required-features = ["window"]
+
+# Make this excluded example its own standalone workspace root. The root Cargo.toml
+# already `exclude`s it, but when the repo is checked out *inside* another directory
+# tree (e.g. a git worktree nested under the main checkout) Cargo can otherwise walk
+# up past this package and bind it to an outer workspace it isn't a member of. An
+# empty `[workspace]` table pins the boundary here so `cargo build`/`run` works from
+# this directory in every layout.
+[workspace]

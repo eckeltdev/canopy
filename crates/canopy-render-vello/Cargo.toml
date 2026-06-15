@@ -10,6 +10,9 @@ rust-version.workspace = true
 [dependencies]
 canopy-traits = { path = "../canopy-traits" }
 canopy-text-baked = { path = "../canopy-text-baked" }
+# Real-glyph rasterizer for the GPU text path: shapes + rasterizes a Text run to
+# an 8-bit alpha-coverage mask we upload as a texture (see `GlyphRun`).
+canopy-text-parley = { path = "../canopy-text-parley" }
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

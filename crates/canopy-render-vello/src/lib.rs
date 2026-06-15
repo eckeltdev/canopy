@@ -10,27 +10,39 @@
 //! the offscreen target for a swapchain is a thin follow-up.
 //!
 //! ## How it draws
-//! Everything reduces to **colored quads** in pixel space, drawn by one instanced
-//! pipeline (see `quad.wgsl`):
-//! - [`DisplayItem::Rect`] becomes a single instance.
-//! - [`DisplayItem::Text`] is expanded on the CPU into one instance per "ink"
-//!   pixel of the baked 8x8 font ([`canopy_text_baked`]), scaled by
-//!   `max(1, size / 8)` — exactly matching the software renderer's blit, so the
-//!   two backends produce the same glyphs.
-//! - [`DisplayItem::Glyphs`] (the shaped, capable-tier path) is not rasterized
-//!   here yet, matching the software backend.
+//! Two alpha-blended pipelines share one render pass, drawn in display-list
+//! order so back-to-front compositing is correct:
+//! - [`DisplayItem::Rect`] becomes a single **colored-quad** instance
+//!   (`quad.wgsl`).
+//! - [`DisplayItem::Text`] is rasterized to a **real antialiased coverage mask**
+//!   by [`canopy_text_parley::TextEngine`], uploaded as an `R8Unorm` texture, and
+//!   drawn as one **textured glyph quad** (`glyph.wgsl`) tinted with the ink
+//!   color. This gives the GPU the same sharp, antialiased text the CPU
+//!   "sharp-text" path produces — partial-coverage edge pixels and all — which
+//!   the old baked 8×8 expansion could never do.
+//! - [`DisplayItem::Glyphs`] (the pre-shaped path) is not rasterized here yet;
+//!   the demos emit `Text`, which is what we render.
 //!
-//! Keeping text as quads means the crate needs no font rasterizer or Parley
-//! dependency: it stays self-contained.
+//! ### Why coverage-textured quads (approach A) over per-pixel quads (B)
+//! We rasterize each run **once** into a coverage texture and draw it with a
+//! single quad, rather than emitting one alpha-blended quad per non-zero
+//! coverage pixel. Approach A is the cleaner, far cheaper path: a 200-px line of
+//! text is one draw call and one small texture instead of thousands of
+//! per-frame instances, and the GPU's bilinear sampler does the compositing.
+//! The cost is the extra texture/bind-group churn per run and a sampler in the
+//! pipeline — both negligible next to per-pixel instancing. Glyph placement is
+//! top-aligned to the run's `origin` (the coverage mask is the tight ink box;
+//! see [`GlyphRun`]).
 //!
 //! ## Color
 //! Canopy colors are straight-alpha sRGB bytes. The offscreen target is
 //! `Rgba8UnormSrgb`, so the shader receives linearized colors and the readback is
 //! sRGB again — i.e. byte-for-byte round-trips for opaque fills. Alpha blending is
-//! straight `src.a` over the existing target.
+//! straight `src.a` over the existing target, so the antialiased coverage edges
+//! of glyphs composite smoothly onto whatever rect sits behind them.
 
 use bytemuck::{Pod, Zeroable};
-use canopy_text_baked::{glyph, CELL_H, CELL_W};
+use canopy_text_parley::{Glyphs, TextEngine};
 use canopy_traits::{Color, DisplayItem, DisplayList, HostError, Point, Rect, Renderer, Size};
 use wgpu::util::DeviceExt;
 
@@ -54,6 +66,22 @@ struct QuadInstance {
 struct Viewport {
     size: [f32; 2],
     _pad: [f32; 2],
+}
+
+/// The per-glyph-run uniform consumed by `glyph.wgsl`: where to place the
+/// coverage mask and the ink color to tint it with.
+///
+/// Laid out to match the WGSL `GlyphRun` struct exactly (`origin`+`size`+`color`
+/// = 8 floats = 32 bytes, already 16-byte aligned, so no trailing pad needed).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GlyphRunUniform {
+    /// Top-left origin of the coverage rect, in pixels.
+    origin: [f32; 2],
+    /// Size of the coverage rect, in pixels (= the mask's width/height).
+    size: [f32; 2],
+    /// Straight-alpha RGBA ink color in `[0, 1]`.
+    color: [f32; 4],
 }
 
 impl QuadInstance {
@@ -93,12 +121,41 @@ fn srgb_to_linear(byte: u8) -> f32 {
     }
 }
 
-/// Lower a [`DisplayList`] into a flat list of colored-quad instances in pixel
-/// space, back-to-front. [`DisplayItem::Text`] is expanded into one quad per ink
-/// pixel of the baked font; [`DisplayItem::Glyphs`] is skipped (not yet
-/// rasterized on any tier).
-fn lower(scene: &DisplayList) -> Vec<QuadInstance> {
-    let mut quads = Vec::new();
+/// A rasterized text run ready to upload: its coverage mask plus where to place
+/// it (pixel-space top-left) and the ink color to tint it with.
+///
+/// The mask's `width`/`height` are the **tight ink box** of the run (the
+/// rasterizer trims leading/top blank space). We top-left-align that box to the
+/// run's `origin`, the same place the baked path started drawing — so a Text run
+/// lands inside its layout box rather than floating.
+struct GlyphRun {
+    /// Top-left placement in pixels.
+    origin: Point,
+    /// The 8-bit alpha-coverage mask (row-major, `width*height` bytes).
+    mask: Glyphs,
+    /// Ink color.
+    color: Color,
+}
+
+/// One thing to draw, in display-list order. Keeping rects and glyph runs in a
+/// single ordered list lets us paint them back-to-front in one render pass, so a
+/// glyph run drawn after its background rect composites on top of it correctly.
+enum DrawCmd {
+    /// A solid colored quad (from [`DisplayItem::Rect`]).
+    Rect(QuadInstance),
+    /// A textured, antialiased glyph run (from [`DisplayItem::Text`]).
+    Glyphs(GlyphRun),
+}
+
+/// Lower a [`DisplayList`] into an ordered list of draw commands.
+///
+/// [`DisplayItem::Rect`] becomes a colored quad; [`DisplayItem::Text`] is
+/// rasterized to a real antialiased coverage mask via `engine` and becomes a
+/// textured glyph run; [`DisplayItem::Glyphs`] is skipped (the pre-shaped path
+/// is not rasterized on any tier yet). Order is preserved for correct
+/// compositing.
+fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
+    let mut cmds = Vec::new();
     for item in &scene.items {
         match item {
             // NOTE: `radius` is ignored here for now — the GPU path draws square
@@ -106,65 +163,54 @@ fn lower(scene: &DisplayList) -> Vec<QuadInstance> {
             // shader) are deferred to a later batch; the CPU renderers already
             // round, so cards/pills look correct on the software tier today.
             DisplayItem::Rect { rect, color, .. } => {
-                quads.push(QuadInstance::rect(*rect, *color));
+                cmds.push(DrawCmd::Rect(QuadInstance::rect(*rect, *color)));
             }
             DisplayItem::Text {
                 origin,
                 text,
                 color,
                 size,
-            } => push_text_quads(&mut quads, *origin, text, *color, *size),
+            } => {
+                // Rasterize the run to an antialiased coverage mask once. An
+                // empty/whitespace run yields a zero-ink mask, which draws as
+                // nothing — fine to keep (a fully-transparent quad).
+                let mask = engine.rasterize(text, *size, *color);
+                cmds.push(DrawCmd::Glyphs(GlyphRun {
+                    origin: *origin,
+                    mask,
+                    color: *color,
+                }));
+            }
             DisplayItem::Glyphs { .. } => {}
         }
     }
-    quads
-}
-
-/// Expand a baked-font text run into one quad per ink pixel.
-///
-/// Mirrors `canopy_render_soft::Buffer::blit_text`: `scale = max(1, size / 8)`,
-/// one cell advance of `8 * scale` per character, and each set bit (0x80 =
-/// leftmost) drawn as a `scale`x`scale` block.
-fn push_text_quads(
-    out: &mut Vec<QuadInstance>,
-    origin: Point,
-    text: &str,
-    color: Color,
-    size: f32,
-) {
-    let scale = ((size / CELL_H as f32) as i32).max(1) as f32;
-    let advance = CELL_W as f32 * scale;
-    for (col, ch) in text.chars().enumerate() {
-        let bitmap = glyph(ch);
-        let cell_x = origin.x + col as f32 * advance;
-        for (row, bits) in bitmap.iter().enumerate() {
-            for bit in 0..CELL_W as usize {
-                if bits & (0x80 >> bit) != 0 {
-                    out.push(QuadInstance {
-                        origin: [cell_x + bit as f32 * scale, origin.y + row as f32 * scale],
-                        size: [scale, scale],
-                        color: color_to_linear_rgba(color),
-                    });
-                }
-            }
-        }
-    }
+    cmds
 }
 
 /// The texture format of the offscreen render target and the readback. sRGB so
 /// straight-alpha byte colors round-trip.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// A GPU device + pipeline that renders colored quads into an offscreen texture.
+/// A GPU device + pipelines that render a display list into an offscreen texture.
 ///
-/// Construct once with [`GpuRenderer::new`]; it owns the `wgpu` device/queue and
-/// the render pipeline. The offscreen texture is (re)allocated to match the
+/// Construct once with [`GpuRenderer::new`]; it owns the `wgpu` device/queue, the
+/// colored-quad and textured-glyph render pipelines, and a [`TextEngine`] used to
+/// rasterize Text runs. The offscreen texture is (re)allocated to match the
 /// requested size on [`render`](Renderer::render) / [`resize`](Renderer::resize).
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
+    /// Solid colored-quad pipeline (rects).
+    rect_pipeline: wgpu::RenderPipeline,
+    /// Textured glyph-quad pipeline (antialiased text).
+    glyph_pipeline: wgpu::RenderPipeline,
     viewport_layout: wgpu::BindGroupLayout,
+    /// Layout for a glyph run's `(uniform, texture, sampler)` bind group.
+    glyph_layout: wgpu::BindGroupLayout,
+    /// Bilinear sampler for the coverage texture (shared across runs).
+    sampler: wgpu::Sampler,
+    /// Real-glyph rasterizer, reused frame-to-frame (it caches shaped glyphs).
+    text_engine: TextEngine,
     width: u32,
     height: u32,
     clear: Color,
@@ -214,7 +260,7 @@ impl GpuRenderer {
         Some(Self::from_device(device, queue, width, height, clear))
     }
 
-    /// Build the pipeline on an already-initialized device/queue.
+    /// Build the pipelines on an already-initialized device/queue.
     fn from_device(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -222,11 +268,7 @@ impl GpuRenderer {
         height: u32,
         clear: Color,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("canopy quad shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
-        });
-
+        // Shared viewport uniform layout (group 0), used by both pipelines.
         let viewport_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("canopy viewport bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -241,75 +283,32 @@ impl GpuRenderer {
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("canopy pipeline layout"),
-            bind_group_layouts: &[Some(&viewport_layout)],
-            immediate_size: 0,
-        });
+        let rect_pipeline = build_rect_pipeline(&device, &viewport_layout);
+        let (glyph_pipeline, glyph_layout) = build_glyph_pipeline(&device, &viewport_layout);
 
-        // One instance buffer; each QuadInstance is origin(vec2) + size(vec2) +
-        // color(vec4), stepped per-instance.
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<QuadInstance>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: 8,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: 16,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
-        };
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("canopy quad pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[instance_layout],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TARGET_FORMAT,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
+        // One bilinear, clamped sampler for every coverage texture. Linear
+        // filtering smooths the mask under any scaling; clamp-to-edge keeps the
+        // border from bleeding the wrap color into AA edges.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("canopy coverage sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
         });
 
         Self {
             device,
             queue,
-            pipeline,
+            rect_pipeline,
+            glyph_pipeline,
             viewport_layout,
+            glyph_layout,
+            sampler,
+            text_engine: TextEngine::new(),
             width: width.max(1),
             height: height.max(1),
             clear,
@@ -320,37 +319,303 @@ impl GpuRenderer {
     /// Render `scene` into a fresh offscreen texture and copy it back to RGBA8
     /// (row-major). Always allocates the target at the current size, so it is safe
     /// to call after a `resize`.
-    fn render_frame(&self, scene: &DisplayList) -> Vec<u8> {
-        let quads = lower(scene);
-        draw_quads(
+    fn render_frame(&mut self, scene: &DisplayList) -> Vec<u8> {
+        let cmds = lower(scene, &mut self.text_engine);
+        draw_frame(
             &self.device,
             &self.queue,
-            &self.pipeline,
+            &self.rect_pipeline,
+            &self.glyph_pipeline,
             &self.viewport_layout,
+            &self.glyph_layout,
+            &self.sampler,
             self.width,
             self.height,
             self.clear,
-            &quads,
+            &cmds,
         )
     }
 }
 
-/// The whole offscreen draw: allocate target + readback buffers, encode one
-/// render pass, copy the texture to the readback buffer, map it, and unswizzle
-/// the row-padded copy into a tight RGBA8 `Vec`.
+/// Build the colored-quad pipeline (rects): instanced, alpha-blended, sourcing
+/// `quad.wgsl`. Mirrors the original opaque pipeline but kept here so the two
+/// pipelines are built side by side.
+fn build_rect_pipeline(
+    device: &wgpu::Device,
+    viewport_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("canopy quad shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("canopy rect pipeline layout"),
+        bind_group_layouts: &[Some(viewport_layout)],
+        immediate_size: 0,
+    });
+
+    // One instance buffer; each QuadInstance is origin(vec2) + size(vec2) +
+    // color(vec4), stepped per-instance.
+    let instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<QuadInstance>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("canopy quad pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[instance_layout],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Build the textured glyph-quad pipeline (antialiased text), sourcing
+/// `glyph.wgsl`. No vertex buffer: the quad corners come from `vertex_index` and
+/// each run rebinds group 1 = `(GlyphRun uniform, coverage texture, sampler)`.
 ///
-/// Free function (not a method) so the test can exercise it directly, and so the
-/// borrow of device/queue/pipeline stays explicit.
-#[allow(clippy::too_many_arguments)]
-fn draw_quads(
+/// Returns the pipeline and the group-1 bind-group layout so runs can build
+/// their bind groups.
+fn build_glyph_pipeline(
+    device: &wgpu::Device,
+    viewport_layout: &wgpu::BindGroupLayout,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("canopy glyph shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("glyph.wgsl").into()),
+    });
+
+    // Group 1: per-run uniform (placement + ink), the coverage texture, and the
+    // sampler. Uniform is visible to the vertex stage (placement) and fragment
+    // stage (ink color); the texture/sampler are fragment-only.
+    let glyph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("canopy glyph bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("canopy glyph pipeline layout"),
+        bind_group_layouts: &[Some(viewport_layout), Some(&glyph_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("canopy glyph pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    (pipeline, glyph_layout)
+}
+
+/// Upload a run's coverage mask as an `R8Unorm` texture and build its group-1
+/// bind group `(uniform, texture view, sampler)`.
+///
+/// Returns `None` for a zero-area mask (nothing to draw). The mask bytes are
+/// uploaded with the wgpu 256-byte row alignment requirement honored.
+fn build_glyph_bind_group(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    pipeline: &wgpu::RenderPipeline,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    run: &GlyphRun,
+) -> Option<wgpu::BindGroup> {
+    let w = run.mask.width;
+    let h = run.mask.height;
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("canopy coverage texture"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // Single 8-bit channel: the alpha-coverage value, sampled as `.r`.
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    // `write_texture` handles row padding internally, so we can hand it the
+    // tight `width`-byte rows directly (1 byte per pixel for R8Unorm).
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &run.mask.coverage,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let uniform = GlyphRunUniform {
+        origin: [run.origin.x, run.origin.y],
+        size: [w as f32, h as f32],
+        color: color_to_linear_rgba(run.color),
+    };
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("canopy glyph run uniform"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("canopy glyph bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    }))
+}
+
+/// The whole offscreen draw: allocate target + readback buffers, encode one
+/// render pass that paints every [`DrawCmd`] back-to-front (rects via the
+/// colored-quad pipeline, text via the textured glyph pipeline), copy the
+/// texture to the readback buffer, map it, and unswizzle the row-padded copy
+/// into a tight RGBA8 `Vec`.
+///
+/// Free function (not a method) so the test can exercise it directly, and so the
+/// borrows of device/queue/pipelines stay explicit.
+#[allow(clippy::too_many_arguments)]
+fn draw_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rect_pipeline: &wgpu::RenderPipeline,
+    glyph_pipeline: &wgpu::RenderPipeline,
     viewport_layout: &wgpu::BindGroupLayout,
+    glyph_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
     width: u32,
     height: u32,
     clear: Color,
-    quads: &[QuadInstance],
+    cmds: &[DrawCmd],
 ) -> Vec<u8> {
     let width = width.max(1);
     let height = height.max(1);
@@ -371,7 +636,7 @@ fn draw_quads(
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Viewport uniform.
+    // Viewport uniform (group 0), shared by both pipelines.
     let viewport = Viewport {
         size: [width as f32, height as f32],
         _pad: [0.0, 0.0],
@@ -381,7 +646,7 @@ fn draw_quads(
         contents: bytemuck::bytes_of(&viewport),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let viewport_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("canopy viewport bind group"),
         layout: viewport_layout,
         entries: &[wgpu::BindGroupEntry {
@@ -390,14 +655,44 @@ fn draw_quads(
         }],
     });
 
-    // Instance buffer (may be empty — then we just clear). An empty slice cannot
-    // be uploaded, so an empty list gets one zero placeholder we then never draw,
-    // keeping the buffer valid.
+    // Build per-command GPU resources up front (these borrow the device, which
+    // the render pass also needs immutably — fine, but the resources must
+    // outlive the pass, so they live here).
+    //
+    // Rect instances are packed into one shared vertex buffer; each rect draws
+    // `instance_base..instance_base+1` of it. Glyph runs each get a bind group.
+    let mut rect_instances: Vec<QuadInstance> = Vec::new();
+    enum Cmd {
+        /// Draw instance `i` of the shared rect instance buffer.
+        Rect(u32),
+        /// Draw the glyph quad for this prepared bind group.
+        Glyphs(wgpu::BindGroup),
+    }
+    let mut plan: Vec<Cmd> = Vec::new();
+    for cmd in cmds {
+        match cmd {
+            DrawCmd::Rect(inst) => {
+                let i = rect_instances.len() as u32;
+                rect_instances.push(*inst);
+                plan.push(Cmd::Rect(i));
+            }
+            DrawCmd::Glyphs(run) => {
+                if let Some(bg) = build_glyph_bind_group(device, queue, glyph_layout, sampler, run)
+                {
+                    plan.push(Cmd::Glyphs(bg));
+                }
+                // A zero-area / all-whitespace run is dropped (nothing to draw).
+            }
+        }
+    }
+
+    // The rect instance buffer. An empty slice cannot be uploaded, so an empty
+    // list gets one zero placeholder we then never reference.
     let placeholder = [QuadInstance::zeroed()];
-    let instance_bytes: &[u8] = if quads.is_empty() {
+    let instance_bytes: &[u8] = if rect_instances.is_empty() {
         bytemuck::cast_slice(&placeholder)
     } else {
-        bytemuck::cast_slice(quads)
+        bytemuck::cast_slice(&rect_instances)
     };
     let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("canopy instance buffer"),
@@ -423,7 +718,7 @@ fn draw_quads(
     {
         let clear_linear = color_to_linear_rgba(clear);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("canopy quad pass"),
+            label: Some("canopy frame pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
                 resolve_target: None,
@@ -443,12 +738,35 @@ fn draw_quads(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        if !quads.is_empty() {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.set_vertex_buffer(0, instance_buf.slice(..));
-            // 6 vertices (two triangles) per instance.
-            pass.draw(0..6, 0..quads.len() as u32);
+
+        // Group 0 (viewport) is the same for both pipelines.
+        pass.set_bind_group(0, &viewport_group, &[]);
+        pass.set_vertex_buffer(0, instance_buf.slice(..));
+
+        // Track which pipeline is bound to avoid redundant `set_pipeline` calls.
+        // Painting strictly in `plan` order preserves back-to-front compositing.
+        let mut current_is_glyph: Option<bool> = None;
+        for step in &plan {
+            match step {
+                Cmd::Rect(i) => {
+                    if current_is_glyph != Some(false) {
+                        pass.set_pipeline(rect_pipeline);
+                        current_is_glyph = Some(false);
+                    }
+                    // 6 vertices (two triangles), this single instance.
+                    pass.draw(0..6, *i..*i + 1);
+                }
+                Cmd::Glyphs(bg) => {
+                    if current_is_glyph != Some(true) {
+                        pass.set_pipeline(glyph_pipeline);
+                        current_is_glyph = Some(true);
+                    }
+                    pass.set_bind_group(1, bg, &[]);
+                    // 6 vertices (two triangles); the glyph pipeline ignores
+                    // instancing (quad corners come from `vertex_index`).
+                    pass.draw(0..6, 0..1);
+                }
+            }
         }
     }
 
@@ -504,9 +822,10 @@ fn draw_quads(
 /// One-shot offscreen render: rasterize `scene` at `size` over a `clear`
 /// background and return the RGBA8 pixels (row-major, 4 bytes per pixel).
 ///
-/// This spins up a fresh `wgpu` device, so it is convenient for tests and tools
-/// but heavier than reusing a [`GpuRenderer`]. **Panics** if no GPU adapter is
-/// available — use [`try_render_to_rgba`] to handle that case gracefully.
+/// This spins up a fresh `wgpu` device and `TextEngine`, so it is convenient for
+/// tests and tools but heavier than reusing a [`GpuRenderer`]. **Panics** if no
+/// GPU adapter is available — use [`try_render_to_rgba`] to handle that case
+/// gracefully.
 pub fn render_to_rgba(scene: &DisplayList, size: Size, clear: Color) -> Vec<u8> {
     try_render_to_rgba(scene, size, clear).expect("no GPU adapter available")
 }
@@ -514,7 +833,7 @@ pub fn render_to_rgba(scene: &DisplayList, size: Size, clear: Color) -> Vec<u8> 
 /// Fallible one-shot offscreen render. Returns `None` if no GPU adapter could be
 /// acquired; otherwise the RGBA8 pixels (row-major).
 pub fn try_render_to_rgba(scene: &DisplayList, size: Size, clear: Color) -> Option<Vec<u8>> {
-    let r = GpuRenderer::new(size.w as u32, size.h as u32, clear)?;
+    let mut r = GpuRenderer::new(size.w as u32, size.h as u32, clear)?;
     Some(r.render_frame(scene))
 }
 
@@ -584,10 +903,11 @@ mod tests {
     }
 
     #[test]
-    fn lowering_expands_text_to_ink_quads() {
-        // 'A' at scale 1 (size 8) has a known number of ink bits; lowering must
-        // emit exactly that many quads and skip the surrounding background.
-        let ink_bits: usize = glyph('A').iter().map(|b| b.count_ones() as usize).sum();
+    fn lowering_rasterizes_text_to_a_glyph_run() {
+        // A Text run lowers to exactly one antialiased glyph run (not N opaque
+        // ink quads): the coverage mask carries partial-coverage edges the baked
+        // path could never produce.
+        let mut engine = TextEngine::new();
         let scene = DisplayList {
             items: vec![DisplayItem::Text {
                 origin: Point { x: 3.0, y: 5.0 },
@@ -598,13 +918,68 @@ mod tests {
                     b: 3,
                     a: 255,
                 },
-                size: 8.0,
+                size: 16.0,
             }],
         };
-        let quads = lower(&scene);
-        assert_eq!(quads.len(), ink_bits, "one quad per ink pixel");
-        // Every quad is a 1x1 block (scale 1) at integer offsets from the origin.
-        assert!(quads.iter().all(|q| q.size == [1.0, 1.0]));
+        let cmds = lower(&scene, &mut engine);
+        assert_eq!(cmds.len(), 1, "one Text item -> one draw command");
+        let DrawCmd::Glyphs(run) = &cmds[0] else {
+            panic!("Text must lower to a glyph run");
+        };
+        assert!(
+            run.mask.width > 0 && run.mask.height > 0,
+            "the run has a sized coverage mask"
+        );
+        assert!(run.mask.ink_pixels() > 0, "the run has some ink");
+        let partial = run
+            .mask
+            .coverage
+            .iter()
+            .filter(|&&c| c > 0 && c < 255)
+            .count();
+        assert!(
+            partial > 0,
+            "antialiased mask must have partial-coverage pixels, got {partial}"
+        );
+    }
+
+    #[test]
+    fn lowering_keeps_back_to_front_order() {
+        // A rect then a text run must lower to a Rect command before a Glyphs
+        // command, so the glyph composites on top of its background.
+        let mut engine = TextEngine::new();
+        let scene = DisplayList {
+            items: vec![
+                DisplayItem::Rect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 8.0, h: 8.0 },
+                    },
+                    color: Color {
+                        r: 9,
+                        g: 9,
+                        b: 9,
+                        a: 255,
+                    },
+                    radius: 0.0,
+                },
+                DisplayItem::Text {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    text: "x".into(),
+                    color: Color {
+                        r: 1,
+                        g: 1,
+                        b: 1,
+                        a: 255,
+                    },
+                    size: 16.0,
+                },
+            ],
+        };
+        let cmds = lower(&scene, &mut engine);
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], DrawCmd::Rect(_)), "rect first");
+        assert!(matches!(cmds[1], DrawCmd::Glyphs(_)), "glyphs second");
     }
 
     #[test]
@@ -687,28 +1062,33 @@ mod tests {
         assert_eq!(at(30, 30), [0, 0, 0, 255], "outside block is clear");
     }
 
-    /// Text renders ink pixels matching the baked font through the full GPU path.
+    /// THE GLYPH PARITY TEST: render a real Text run on a contrasting background
+    /// on the actual Metal GPU and prove the output has true antialiased ink —
+    /// partial-coverage gradient pixels between background and full ink, which the
+    /// old baked 8×8 path could never produce — and that ink lands where the text
+    /// is. Skips cleanly if no adapter exists.
     #[test]
-    fn text_ink_paints_on_gpu() {
-        let size = Size { w: 32.0, h: 16.0 };
+    fn text_renders_antialiased_glyphs_on_gpu() {
+        // Big white text on a dark surface, the demo's contrast.
+        let size = Size { w: 160.0, h: 48.0 };
         let bg = Color {
-            r: 0x10,
-            g: 0x20,
-            b: 0x30,
+            r: 0x1e,
+            g: 0x1e,
+            b: 0x2e,
             a: 255,
         };
         let ink = Color {
-            r: 255,
-            g: 255,
-            b: 255,
+            r: 0xcd,
+            g: 0xd6,
+            b: 0xf4,
             a: 255,
         };
         let scene = DisplayList {
             items: vec![DisplayItem::Text {
-                origin: Point { x: 0.0, y: 0.0 },
-                text: "A".into(),
+                origin: Point { x: 8.0, y: 8.0 },
+                text: "Canopy".into(),
                 color: ink,
-                size: 8.0,
+                size: 32.0,
             }],
         };
         let Some(px) = try_render_to_rgba(&scene, size, bg) else {
@@ -716,17 +1096,155 @@ mod tests {
             return;
         };
         let w = size.w as usize;
-        let at = |x: usize, y: usize| {
-            let i = (y * w + x) * 4;
-            [px[i], px[i + 1], px[i + 2], px[i + 3]]
-        };
-        // 'A' row 0 = 0x38 -> columns 2,3,4 ink; column 0 clear (background).
-        assert_eq!(at(2, 0), [255, 255, 255, 255], "ink pixel of 'A' apex");
-        assert_eq!(
-            at(0, 0),
-            [0x10, 0x20, 0x30, 255],
-            "off-glyph keeps background"
+        let h = size.h as usize;
+        assert_eq!(px.len(), w * h * 4);
+
+        // Classify every pixel against the two endpoints. A baked path produces
+        // ONLY background or full-ink pixels (hard 0/255 edges); a real AA
+        // rasterizer fills the gap with partial-coverage gradient pixels.
+        let mut ink_px = 0usize; // close to full ink
+        let mut bg_px = 0usize; // close to background
+        let mut aa_px = 0usize; // strictly between -> antialiasing
+        let (mut sum_x, mut sum_y, mut ink_weight) = (0f64, 0f64, 0f64);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let r = px[i] as i32;
+                let g = px[i + 1] as i32;
+                let b = px[i + 2] as i32;
+                // Distance from the two endpoints in RGB.
+                let d_bg =
+                    (r - bg.r as i32).abs() + (g - bg.g as i32).abs() + (b - bg.b as i32).abs();
+                let d_ink =
+                    (r - ink.r as i32).abs() + (g - ink.g as i32).abs() + (b - ink.b as i32).abs();
+                if d_bg <= 6 {
+                    bg_px += 1;
+                } else if d_ink <= 6 {
+                    ink_px += 1;
+                } else {
+                    // Genuinely between the endpoints: an antialiased edge pixel.
+                    aa_px += 1;
+                }
+                // Weight ink-ward pixels for a rough centroid of the text.
+                if d_bg > 6 {
+                    let weight = (d_bg as f64) / ((d_bg + d_ink) as f64 + 1.0);
+                    sum_x += x as f64 * weight;
+                    sum_y += y as f64 * weight;
+                    ink_weight += weight;
+                }
+            }
+        }
+        eprintln!(
+            "glyph GPU render: bg={bg_px} ink={ink_px} aa(partial)={aa_px} of {} px",
+            w * h
         );
+
+        // Real ink must be present...
+        assert!(ink_px > 0, "expected full-ink pixels in the glyphs");
+        // ...and crucially, antialiased gradient pixels must exist. This is the
+        // parity proof: the baked path could only ever emit 0/255, never these.
+        assert!(
+            aa_px > 20,
+            "expected many antialiased (partial-coverage) pixels, got {aa_px}"
+        );
+        // Most of the surface is still background (text is sparse).
+        assert!(
+            bg_px > ink_px,
+            "background should dominate a short text run"
+        );
+
+        // Ink must land roughly where the text is: left-anchored at x=8, on the
+        // upper band. The centroid should sit in the left-center, not off-canvas.
+        assert!(ink_weight > 0.0, "must have inked pixels for a centroid");
+        let cx = sum_x / ink_weight;
+        let cy = sum_y / ink_weight;
+        eprintln!("ink centroid ~ ({cx:.1}, {cy:.1})");
+        assert!(
+            cx > 8.0 && cx < (w as f64),
+            "ink centroid x {cx:.1} should be right of the origin and on-canvas"
+        );
+        assert!(
+            cy > 0.0 && cy < (h as f64),
+            "ink centroid y {cy:.1} should be on-canvas"
+        );
+    }
+
+    /// Glyph ink composites OVER a background rect: with a rect behind the text,
+    /// the off-glyph pixels show the rect color (not the clear), proving the two
+    /// pipelines share one alpha-blended pass in back-to-front order.
+    #[test]
+    fn text_composites_over_rect_on_gpu() {
+        let size = Size { w: 96.0, h: 40.0 };
+        let clear = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let card = Color {
+            r: 0x45,
+            g: 0x47,
+            b: 0x5a,
+            a: 255,
+        };
+        let ink = Color {
+            r: 0xa6,
+            g: 0xe3,
+            b: 0xa1,
+            a: 255,
+        };
+        let scene = DisplayList {
+            items: vec![
+                // A full-surface card behind the text.
+                DisplayItem::Rect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 96.0, h: 40.0 },
+                    },
+                    color: card,
+                    radius: 0.0,
+                },
+                DisplayItem::Text {
+                    origin: Point { x: 6.0, y: 8.0 },
+                    text: "Hi".into(),
+                    color: ink,
+                    size: 24.0,
+                },
+            ],
+        };
+        let Some(px) = try_render_to_rgba(&scene, size, clear) else {
+            eprintln!("no GPU adapter; skipping GPU assertion");
+            return;
+        };
+        let w = size.w as usize;
+        let h = size.h as usize;
+
+        // A corner well away from any glyph shows the card color, never the
+        // black clear — so the rect painted and the text didn't wipe it.
+        let corner = {
+            let i = ((h - 1) * w + (w - 1)) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        assert_eq!(
+            corner,
+            [card.r, card.g, card.b],
+            "off-glyph pixel must show the card behind the text"
+        );
+
+        // Some pixel must be near the green ink (the glyphs actually drew).
+        let mut found_ink = false;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let d = (px[i] as i32 - ink.r as i32).abs()
+                    + (px[i + 1] as i32 - ink.g as i32).abs()
+                    + (px[i + 2] as i32 - ink.b as i32).abs();
+                if d <= 12 {
+                    found_ink = true;
+                }
+            }
+        }
+        assert!(found_ink, "expected green glyph ink over the card");
     }
 
     /// `GpuRenderer` used through the trait stashes the frame for readback.

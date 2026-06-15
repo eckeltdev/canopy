@@ -4,6 +4,7 @@ resolver = "2"
 # workspace. Build it from examples/canopy-demo directly.
 exclude = [
     "examples/canopy-demo",
+    "examples/canopy-welcome",
     "examples/canopy-plugin-counter",
     "examples/canopy-component-guest",
 ]

@@ -1,0 +1,56 @@
+/* Canopy welcome — the "create-canopy-app" landing stylesheet.
+ *
+ * This is a REAL file the app reads at runtime (located via CARGO_MANIFEST_DIR),
+ * so editing it and saving HOT-RELOADS the live window: the windowed binary
+ * watches this file, re-parses it, re-applies every styled node's classes, and
+ * redraws — no restart. Try changing `.btn`'s `background` and saving.
+ *
+ * Catppuccin-ish palette, rounded corners everywhere (cards ~12px, buttons/pills
+ * ~8px), generous padding and gaps. Only the properties canopy-style-css
+ * understands take effect: background, color, width, height, gap, padding,
+ * direction, border-radius. */
+
+/* The dark canvas. The layout engine has no centering primitive (no margin/justify),
+ * so we center the content the only honest way available: a fat, symmetric canvas
+ * padding frames the fixed-width content column. 760px canvas − 560px content leaves
+ * 200px of gutter; an 88px canvas pad + 12px content pad ≈ 100px each side. */
+.canvas { background: #1e1e2e; direction: column; padding: 88px; gap: 20px; width: 760px }
+
+/* The centered content column: a fixed width so it reads as a centered card stack on
+ * the canvas, with comfortable vertical rhythm between the logo, heading, card and
+ * footer. */
+.content { direction: column; gap: 18px; padding: 12px; width: 560px }
+
+/* --- The Canopy logo: rounded-rect "leaves" in greens/teal forming a little
+ *     tree/canopy. Two stacked rows of leaves (the canopy) over a short trunk. --- */
+.logo     { direction: column; gap: 4px; padding: 6px; width: 132px }
+.leafrow  { direction: row; gap: 6px }
+.leaf     { width: 36px; height: 24px; border-radius: 12px }
+.leaf-green { background: #a6e3a1 }
+.leaf-teal  { background: #94e2d5 }
+.leaf-blue  { background: #89b4fa }
+.trunkrow { direction: row; gap: 6px; padding: 2px }
+.trunk    { background: #6c7086; width: 14px; height: 18px; border-radius: 6px }
+
+/* --- Heading + tagline --- */
+.title   { color: #cdd6f4; height: 56px }
+.tagline { color: #9399b2; height: 20px }
+
+/* --- The counter card ---
+ * NOTE: buttons/pills set padding but NOT a fixed height — they size to their text
+ * child plus padding. A fixed height smaller than (text + 2*padding) would squeeze
+ * the text leaf to zero, so we let the content drive the height. The label's own
+ * `height` (via the text node default) sets the glyph size; padding gives the
+ * chunky, rounded look. */
+.card { background: #313244; direction: column; gap: 14px; padding: 24px; border-radius: 12px; width: 520px }
+.btn  { background: #45475a; color: #cdd6f4; padding: 14px; border-radius: 8px }
+/* :hover lightens the button under the pointer (driven live by the windowed host). */
+.btn:hover { background: #585b70 }
+.hint { color: #6c7086; height: 18px }
+
+/* --- Footer pills/links --- */
+.footer { direction: row; gap: 12px; padding: 4px }
+.pill { background: #313244; color: #9399b2; padding: 12px; border-radius: 8px }
+.pill:hover { background: #585b70 }
+/* GitHub pill text is blue; it shares `.pill` for the rounded surface + hover. */
+.pill-link { color: #89b4fa }
