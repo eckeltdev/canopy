@@ -38,6 +38,7 @@ jobs:
           -p canopy-protocol -p canopy-traits -p canopy-core -p canopy-signals
           -p canopy-view -p canopy-dom -p canopy-paint -p canopy-render-soft
           -p canopy-text-baked -p canopy-transport-native -p canopy-host
+          -p canopy-layout-taffy -p canopy-style-css
 
   deny:
     name: cargo-deny (bans getrandom, license/advisory gate)

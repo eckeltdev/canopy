@@ -1,0 +1,25 @@
+[package]
+name = "canopy-layout-taffy"
+description = "Canopy layout via the real Taffy flexbox engine: a drop-in alternative to canopy-paint's hand-rolled flex that maps the host Dom's inline styles onto a Taffy tree, computes geometry, and emits the same DisplayList + LayoutResult shape. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-paint = { path = "../canopy-paint" }
+taffy = { version = "0.11", default-features = false, features = [
+    "flexbox",
+    "alloc",
+    "taffy_tree",
+] }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+
+[lints]
+workspace = true

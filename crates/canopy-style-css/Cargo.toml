@@ -1,0 +1,21 @@
+[package]
+name = "canopy-style-css"
+description = "Canopy CSS-lite: parses a class-rule stylesheet (`.name { prop: value }`) into resolved (PropId, value) declarations that feed the existing inline-style path. A documented subset — no cascade, no selectors beyond a single class. no_std + alloc, zero external deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-paint = { path = "../canopy-paint" }
+canopy-view = { path = "../canopy-view" }
+
+[dev-dependencies]
+canopy-dom = { path = "../canopy-dom" }
+canopy-core = { path = "../canopy-core" }
+canopy-traits = { path = "../canopy-traits" }
+
+[lints]
+workspace = true
