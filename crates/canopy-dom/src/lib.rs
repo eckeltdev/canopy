@@ -18,7 +18,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use canopy_protocol::{ElementTag, EventKind, HandlerId, NodeId, Op, OpReader, StrId};
+use canopy_protocol::{ElementTag, EventKind, HandlerId, NodeId, Op, OpReader, PropId, StrId};
 use canopy_traits::{HostError, OpSink};
 
 /// The implicit host root. Top-level nodes are inserted under this id; it is never
@@ -36,6 +36,8 @@ pub struct Node {
     pub parent: Option<NodeId>,
     /// Children, in order.
     pub children: Vec<NodeId>,
+    /// Resolved inline styles, by property id.
+    pub styles: BTreeMap<PropId, String>,
     /// `(event, handler)` subscriptions registered on this node.
     pub listeners: Vec<(EventKind, HandlerId)>,
 }
@@ -62,6 +64,16 @@ impl Dom {
     /// The text content of a text node, if `node` exists and is text.
     pub fn text_of(&self, node: NodeId) -> Option<&str> {
         self.nodes.get(&node)?.text.as_deref()
+    }
+
+    /// Borrow a node by handle.
+    pub fn node(&self, node: NodeId) -> Option<&Node> {
+        self.nodes.get(&node)
+    }
+
+    /// The resolved inline style value for `node`'s `prop`, if set.
+    pub fn style(&self, node: NodeId, prop: PropId) -> Option<&str> {
+        self.nodes.get(&node)?.styles.get(&prop).map(String::as_str)
     }
 
     /// The children of `node` (or of [`ROOT`] for the top level).
@@ -214,11 +226,19 @@ impl Dom {
                 n.listeners.retain(|(e, _)| *e != event);
             }
 
-            // Style/attribute application is a no-op until the style engine lands;
-            // accept (don't reject) so a guest can author them now. They still
-            // require a live target so a bad handle is caught.
+            // Inline styles are retained as resolved strings, ready for the style
+            // engine / paint pass.
+            Op::SetInlineStyle { node, prop, value } => {
+                let value = self.resolve_str(value)?;
+                self.nodes
+                    .get_mut(&node)
+                    .ok_or(HostError::BadHandle)?
+                    .styles
+                    .insert(prop, value);
+            }
+            // Attribute/class application lands with the style engine; for now they
+            // require a live target (so a bad handle is caught) but store nothing.
             Op::SetAttribute { node, .. }
-            | Op::SetInlineStyle { node, .. }
             | Op::SetClass { node, .. }
             | Op::RemoveClass { node, .. } => {
                 self.require(node)?;
@@ -272,6 +292,19 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&e.take_batch(0)).unwrap();
         assert_eq!(dom.text_of(t), Some("b"));
+    }
+
+    #[test]
+    fn inline_styles_are_retained() {
+        use canopy_protocol::PropId;
+        const BG: PropId = PropId::new(1);
+        let mut e = Emitter::new();
+        let n = e.create_element(ElementTag::new(1));
+        e.append(ROOT, n);
+        e.set_inline_style(n, BG, "#202830");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+        assert_eq!(dom.style(n, BG), Some("#202830"));
     }
 
     #[test]

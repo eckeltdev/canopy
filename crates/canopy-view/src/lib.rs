@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use canopy_core::Emitter;
-use canopy_protocol::{ElementTag, EventKind, EventPayload, HandlerId, NodeId};
+use canopy_protocol::{ElementTag, EventKind, EventPayload, HandlerId, NodeId, PropId};
 use canopy_signals::Runtime;
 
 /// A shared, mutable [`Emitter`] that reactive bindings write into.
@@ -75,6 +75,13 @@ impl App {
     /// Append `child` to `parent`.
     pub fn append(&self, parent: NodeId, child: NodeId) {
         self.emitter.borrow_mut().append(parent, child);
+    }
+
+    /// Set an inline style property on a node.
+    pub fn style(&self, node: NodeId, prop: PropId, value: &str) {
+        self.emitter
+            .borrow_mut()
+            .set_inline_style(node, prop, value);
     }
 
     /// Bind a text node to a closure. `f` is run now (subscribing the signals it

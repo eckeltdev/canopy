@@ -39,6 +39,8 @@ canopy-core host side → backends behind canopy-traits:
 | `canopy-signals` | yes | The fine-grained reactive runtime (signals + effects + batched flush). |
 | `canopy-view` | yes | Signal-based reactivity: an `App` that ties signals to the emitter so a changed value emits one targeted op. |
 | `canopy-dom` | yes | Host-side retained tree + `OpSink`: decodes the op-stream and enforces handle ownership. |
+| `canopy-paint` | yes | Scene builder: walks the `Dom` into a renderer-agnostic `DisplayList` (trivial stack layout for now; Taffy/Stylo behind the traits later). |
+| `canopy-render-soft` | yes | CPU rasterizer painting a `DisplayList` into an RGBA buffer — the `Renderer` seam, and the bare-metal/RPi render path. |
 
 Host-side backends (`canopy-render-vello`, `canopy-style-stylo`, `canopy-text-parley`,
 `canopy-plat-winit`), the transports (`canopy-transport-native`, `-wasmtime`), the

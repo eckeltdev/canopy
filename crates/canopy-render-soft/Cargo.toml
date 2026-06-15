@@ -1,0 +1,20 @@
+[package]
+name = "canopy-render-soft"
+description = "Canopy software renderer: a no_std CPU rasterizer that paints a DisplayList into an RGBA buffer. The bare-metal/RPi Renderer impl, validated on desktop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+
+[dev-dependencies]
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-paint = { path = "../canopy-paint" }
+canopy-view = { path = "../canopy-view" }
+
+[lints]
+workspace = true

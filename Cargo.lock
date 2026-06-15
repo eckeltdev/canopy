@@ -19,8 +19,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-paint"
+version = "0.0.0"
+dependencies = [
+ "canopy-core",
+ "canopy-dom",
+ "canopy-protocol",
+ "canopy-traits",
+]
+
+[[package]]
 name = "canopy-protocol"
 version = "0.0.0"
+
+[[package]]
+name = "canopy-render-soft"
+version = "0.0.0"
+dependencies = [
+ "canopy-dom",
+ "canopy-paint",
+ "canopy-protocol",
+ "canopy-traits",
+ "canopy-view",
+]
 
 [[package]]
 name = "canopy-signals"

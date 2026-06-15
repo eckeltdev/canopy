@@ -7,6 +7,8 @@ members = [
     "crates/canopy-signals",
     "crates/canopy-view",
     "crates/canopy-dom",
+    "crates/canopy-paint",
+    "crates/canopy-render-soft",
 ]
 
 # The four crates above are the guest-side core: they MUST stay `no_std` + `alloc`
