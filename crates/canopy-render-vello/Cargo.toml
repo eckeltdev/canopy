@@ -1,0 +1,18 @@
+[package]
+name = "canopy-render-vello"
+description = "Canopy GPU renderer: a wgpu-backed canopy_traits::Renderer that rasterizes a DisplayList offscreen and reads it back to RGBA8. The Tier-0 / Metal path, validated headless on desktop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+canopy-text-baked = { path = "../canopy-text-baked" }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

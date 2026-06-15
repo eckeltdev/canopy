@@ -24,8 +24,9 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use canopy_core::Emitter;
+use canopy_input::Focus;
 use canopy_protocol::{ElementTag, EventKind, EventPayload, HandlerId, NodeId, PropId};
-use canopy_signals::Runtime;
+use canopy_signals::{Runtime, Signal};
 
 /// A shared, mutable [`Emitter`] that reactive bindings write into.
 pub type SharedEmitter = Rc<RefCell<Emitter>>;
@@ -42,11 +43,26 @@ pub const COLUMN: ElementTag = ElementTag::new(1);
 pub const ROW: ElementTag = ElementTag::new(2);
 /// Well-known element kind: a clickable button. See [`COLUMN`] for the convention.
 pub const BUTTON: ElementTag = ElementTag::new(3);
+/// Well-known element kind: a single-line text input. See [`COLUMN`] for why these
+/// ids are a host convention. An input is an element with one text child that mirrors
+/// the input's editable buffer; [`App::text_input`] builds exactly that shape and
+/// [`App::type_into`] drives the buffer.
+pub const INPUT: ElementTag = ElementTag::new(4);
 /// Well-known event kind: a pointer click. See [`COLUMN`] for why this is a host
 /// convention; [`App::on_click`] is sugar for `on(node, CLICK, ..)`.
 pub const CLICK: EventKind = EventKind::new(1);
 
 type HandlerMap = Rc<RefCell<BTreeMap<HandlerId, Box<dyn FnMut(EventPayload)>>>>;
+
+/// Per-input editing state: the reactive buffer (its writes drive the bound text via
+/// an effect) and the text-child node that displays it. Stored against the input
+/// element so [`App::type_into`] can find the buffer for a given input handle.
+struct InputState {
+    /// The editable text buffer; a bound effect emits a `SetText` when it changes.
+    buffer: Signal<String>,
+    /// The text child whose content mirrors `buffer` (kept for introspection/tests).
+    text_node: NodeId,
+}
 
 /// The reactive application surface: a signal runtime, an op-stream emitter, and an
 /// event-handler registry, wired so signal writes turn into targeted ops.
@@ -55,6 +71,10 @@ pub struct App {
     emitter: SharedEmitter,
     handlers: HandlerMap,
     next_handler: Cell<u32>,
+    /// Editable buffers, keyed by their input element node.
+    inputs: RefCell<BTreeMap<NodeId, InputState>>,
+    /// Which input element currently receives keyboard input.
+    focus: RefCell<Focus>,
 }
 
 impl App {
@@ -65,6 +85,8 @@ impl App {
             emitter: Rc::new(RefCell::new(Emitter::new())),
             handlers: Rc::new(RefCell::new(BTreeMap::new())),
             next_handler: Cell::new(0),
+            inputs: RefCell::new(BTreeMap::new()),
+            focus: RefCell::new(Focus::new()),
         }
     }
 
@@ -185,6 +207,98 @@ impl App {
     /// `self.on(node, CLICK, f)`; returns the handler id the host echoes back.
     pub fn on_click<F: FnMut(EventPayload) + 'static>(&self, node: NodeId, f: F) -> HandlerId {
         self.on(node, CLICK, f)
+    }
+
+    // ---- Text input + focus ----------------------------------------------
+    //
+    // A text input is an [`INPUT`] element with a single text child bound to an
+    // internal [`canopy_signals::Signal<String>`]. Editing goes through the same
+    // reactive hot path as everything else: [`App::type_into`] writes the signal and
+    // a bound effect emits one `SetText`, so there is no special-cased mutation path.
+
+    /// Create a single-line text input seeded with `initial`, returning the **input
+    /// element** node.
+    ///
+    /// The element is an [`INPUT`] with one text child whose content is bound to an
+    /// internal buffer signal. The initial mount emits `CreateElement` (the input),
+    /// `CreateText` + `InsertBefore` (its child), and the binding's first `SetText`.
+    /// Drive the buffer with [`App::type_into`]; mount the returned node wherever the
+    /// host wants it (it is not appended anywhere automatically).
+    pub fn text_input(&self, initial: &str) -> NodeId {
+        let input = self.element(INPUT);
+        let text_node = self.text(initial);
+        self.append(input, text_node);
+
+        // The buffer is the source of truth; bind the child to it so any future write
+        // (via `type_into`) re-runs the effect and emits exactly one `SetText`.
+        let buffer = self.rt.signal(String::from(initial));
+        {
+            let buffer = buffer.clone();
+            self.bind_text(text_node, move || buffer.get());
+        }
+
+        self.inputs
+            .borrow_mut()
+            .insert(input, InputState { buffer, text_node });
+        input
+    }
+
+    /// Apply one [`canopy_input::Key`] to `input`'s buffer, updating its displayed
+    /// text via the reactive binding.
+    ///
+    /// This runs [`canopy_input::apply`] on the current buffer, writes the result back
+    /// into the input's signal, and flushes — so the bound effect emits a single
+    /// `SetText` reflecting the new string. Typing a character grows the buffer,
+    /// `Backspace` shrinks it, and `Enter` leaves the text unchanged (a host watching
+    /// for submit checks [`canopy_input::Key::is_submit`]). A no-op edit (`Enter`, or
+    /// `Backspace` on an empty buffer) still re-runs the binding to the same value.
+    ///
+    /// Does nothing if `input` was not produced by [`App::text_input`].
+    pub fn type_into(&self, input: NodeId, key: canopy_input::Key) {
+        let buffer = match self.inputs.borrow().get(&input) {
+            Some(state) => state.buffer.clone(),
+            None => return,
+        };
+        let next = canopy_input::apply(&buffer.get(), key);
+        buffer.set(next);
+        self.rt.flush();
+    }
+
+    /// The current text of `input`'s buffer, or [`None`] if `input` is not a text
+    /// input built by [`App::text_input`]. Handy for hosts and tests that want the
+    /// model value without decoding the op-stream.
+    pub fn input_value(&self, input: NodeId) -> Option<String> {
+        self.inputs
+            .borrow()
+            .get(&input)
+            .map(|state| state.buffer.get())
+    }
+
+    /// The text-child node that displays `input`'s buffer, or [`None`] if `input` is
+    /// not a text input. Exposed so a host (or test) can correlate `SetText` ops with
+    /// the input that produced them.
+    pub fn input_text_node(&self, input: NodeId) -> Option<NodeId> {
+        self.inputs
+            .borrow()
+            .get(&input)
+            .map(|state| state.text_node)
+    }
+
+    /// Move keyboard focus to `node`. The orchestrator routes key events to the
+    /// focused node; for a text input it would translate each platform key into a
+    /// [`canopy_input::Key`] and call [`App::type_into`] on this node.
+    pub fn focus(&self, node: NodeId) {
+        self.focus.borrow_mut().set(node);
+    }
+
+    /// The currently focused node, if any. See [`App::focus`].
+    pub fn focused(&self) -> Option<NodeId> {
+        self.focus.borrow().get()
+    }
+
+    /// Clear keyboard focus so no node receives key events.
+    pub fn blur(&self) {
+        self.focus.borrow_mut().clear();
     }
 }
 
@@ -320,7 +434,8 @@ macro_rules! __rsx_children {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use canopy_protocol::{decode_all, NodeId, Op, PropId};
+    use canopy_input::Key;
+    use canopy_protocol::{decode_all, NodeId, Op, PropId, StrId};
 
     /// The demo host root (matches `canopy-dom`'s `ROOT = NodeId::new(0)`).
     const ROOT: NodeId = NodeId::new(0);
@@ -329,6 +444,29 @@ mod tests {
 
     fn count<F: Fn(&Op) -> bool>(ops: &[Op], pred: F) -> usize {
         ops.iter().filter(|o| pred(o)).count()
+    }
+
+    /// Resolve a [`StrId`] to its UTF-8 string by scanning the `InternString` ops in
+    /// a batch (the same table a host builds while applying the stream).
+    fn resolve(ops: &[Op], id: StrId) -> Option<String> {
+        ops.iter().find_map(|o| match o {
+            Op::InternString { id: i, bytes } if *i == id => {
+                Some(String::from_utf8(bytes.clone()).unwrap())
+            }
+            _ => None,
+        })
+    }
+
+    /// The string set by the **last** `SetText` targeting `node`, resolved via the
+    /// batch's intern table — i.e. the input's displayed value after the edits.
+    fn last_set_text(ops: &[Op], node: NodeId) -> Option<String> {
+        ops.iter()
+            .rev()
+            .find_map(|o| match o {
+                Op::SetText { node: n, text } if *n == node => Some(*text),
+                _ => None,
+            })
+            .and_then(|id| resolve(ops, id))
     }
     fn create_elements(ops: &[Op]) -> usize {
         count(ops, |o| matches!(o, Op::CreateElement { .. }))
@@ -463,5 +601,105 @@ mod tests {
         assert!(ops.iter().any(|o| matches!(
             o, Op::SetInlineStyle { node, prop, .. } if *node == styled && *prop == BG
         )));
+    }
+
+    #[test]
+    fn input_const_is_stable() {
+        assert_eq!(INPUT.raw(), 4);
+    }
+
+    #[test]
+    fn text_input_builds_an_input_element_with_a_bound_text_child() {
+        let app = App::new();
+        let input = app.text_input("");
+        let ops = decode_all(&app.take_batch(0)).unwrap();
+
+        // One INPUT element and one text child, the child appended under the input.
+        assert_eq!(create_elements(&ops), 1);
+        assert_eq!(create_texts(&ops), 1);
+        assert!(ops.iter().any(|o| matches!(
+            o, Op::CreateElement { node, tag } if *node == input && *tag == INPUT
+        )));
+        let text_node = app.input_text_node(input).expect("input tracks its child");
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            Op::InsertBefore { parent, child, anchor }
+                if *parent == input && *child == text_node && anchor.is_null()
+        )));
+        assert_eq!(app.input_value(input).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn typing_chars_emits_set_text_reflecting_the_typed_string() {
+        let app = App::new();
+        let input = app.text_input("");
+        let text_node = app.input_text_node(input).unwrap();
+        let _ = app.take_batch(0); // drain the mount batch
+
+        // Type "ab" one Char at a time.
+        app.type_into(input, Key::Char('a'));
+        app.type_into(input, Key::Char('b'));
+        let ops = decode_all(&app.take_batch(1)).unwrap();
+
+        // Each keystroke re-ran the binding -> one SetText per Char, both on the
+        // input's text child, and the last reflects the full typed string.
+        assert_eq!(
+            count(
+                &ops,
+                |o| matches!(o, Op::SetText { node, .. } if *node == text_node)
+            ),
+            2,
+            "one SetText per typed character"
+        );
+        assert_eq!(last_set_text(&ops, text_node).as_deref(), Some("ab"));
+        assert_eq!(app.input_value(input).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn backspace_then_enter_drive_the_buffer_then_submit_is_a_noop() {
+        let app = App::new();
+        let input = app.text_input("hi");
+        let text_node = app.input_text_node(input).unwrap();
+        let _ = app.take_batch(0);
+
+        // Backspace shrinks the buffer; the displayed text follows.
+        app.type_into(input, Key::Backspace);
+        let ops = decode_all(&app.take_batch(1)).unwrap();
+        assert_eq!(last_set_text(&ops, text_node).as_deref(), Some("h"));
+        assert_eq!(app.input_value(input).as_deref(), Some("h"));
+
+        // Enter is a submit and leaves the text unchanged.
+        app.type_into(input, Key::Enter);
+        assert_eq!(app.input_value(input).as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn type_into_unknown_node_is_a_noop_and_emits_nothing() {
+        let app = App::new();
+        let _input = app.text_input("");
+        let _ = app.take_batch(0);
+
+        // A node that is not a tracked input: no panic, no value, no op.
+        app.type_into(NodeId::new(999), Key::Char('x'));
+        let ops = decode_all(&app.take_batch(1)).unwrap();
+        assert_eq!(count(&ops, |o| matches!(o, Op::SetText { .. })), 0);
+        assert_eq!(app.input_value(NodeId::new(999)), None);
+    }
+
+    #[test]
+    fn focus_set_get_and_blur() {
+        let app = App::new();
+        assert_eq!(app.focused(), None);
+
+        let input = app.text_input("");
+        app.focus(input);
+        assert_eq!(app.focused(), Some(input));
+
+        let other = app.text_input("");
+        app.focus(other);
+        assert_eq!(app.focused(), Some(other), "focus moves to the latest node");
+
+        app.blur();
+        assert_eq!(app.focused(), None);
     }
 }

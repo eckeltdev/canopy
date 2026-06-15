@@ -1,0 +1,25 @@
+[package]
+name = "canopy-plugin-panel"
+description = "Composites a plugin's retained tree into a sub-region of a host frame buffer. The plugin owns its own tree and coordinate space; the host lays it out for the panel viewport, rasterizes it standalone, and blits the result into the panel — so an untrusted plugin's UI can be dropped into a bigger app and can never reference host nodes. std crate; takes a plain `&Dom`, so it does not depend on wasmtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-layout-taffy = { path = "../canopy-layout-taffy" }
+canopy-render-soft = { path = "../canopy-render-soft" }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+# Test-only: build a plugin Dom by hand. `canopy-protocol` supplies `ElementTag`
+# (the `Emitter::create_element` argument); `canopy-paint` supplies the well-known
+# style `PropId`s (BG/WIDTH/HEIGHT) the layout engine reads.
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-paint = { path = "../canopy-paint" }
+
+[lints]
+workspace = true

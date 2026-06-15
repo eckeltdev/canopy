@@ -11,6 +11,7 @@ rust-version.workspace = true
 canopy-protocol = { path = "../canopy-protocol" }
 canopy-core = { path = "../canopy-core" }
 canopy-signals = { path = "../canopy-signals" }
+canopy-input = { path = "../canopy-input" }
 
 [dev-dependencies]
 canopy-dom = { path = "../canopy-dom" }

@@ -18,6 +18,10 @@ members = [
     "crates/canopy-layout-taffy",
     "crates/canopy-style-css",
     "crates/canopy-transport-wasmtime",
+    "crates/canopy-render-vello",
+    "crates/canopy-text-parley",
+    "crates/canopy-input",
+    "crates/canopy-plugin-panel",
 ]
 
 # The four crates above are the guest-side core: they MUST stay `no_std` + `alloc`

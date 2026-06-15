@@ -1,0 +1,18 @@
+[package]
+name = "canopy-text-parley"
+description = "Canopy capable-tier text engine: shapes and rasterizes real (antialiased) glyphs with cosmic-text + swash, against a bundled DejaVu Sans Mono font. The std replacement for the 8x8 baked font."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+cosmic-text = "0.14"
+# Matched to the version cosmic-text 0.14 pulls in; only needed to name
+# `Script` in our no-op `Fallback` impl (cosmic-text does not re-export it).
+unicode-script = "0.5"
+
+[lints]
+workspace = true
