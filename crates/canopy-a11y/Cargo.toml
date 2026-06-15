@@ -1,0 +1,21 @@
+[package]
+name = "canopy-a11y"
+description = "Canopy accessibility bridge: walks a canopy-dom retained tree into an AccessKit accessibility tree so Canopy UIs are screen-reader navigable (std)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+accesskit = "0.17"
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-view = { path = "../canopy-view" }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+canopy-traits = { path = "../canopy-traits" }
+
+[lints]
+workspace = true

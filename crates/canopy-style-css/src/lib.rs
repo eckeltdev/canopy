@@ -14,16 +14,35 @@
 //! so the resolved pairs feed the **existing inline-style path unchanged**:
 //! [`Stylesheet::apply`] simply replays them through [`canopy_view::App::style`].
 //!
+//! # Selectors and the `:hover` cascade
+//!
+//! The only selector is a single class, optionally with a `:hover` pseudo-class:
+//!
+//! ```text
+//! .btn       { background: #313244 }
+//! .btn:hover { background: #585b70 }
+//! ```
+//!
+//! A selector parses into `(class, Option<state>)`. Base rules (no state) always
+//! apply; `:hover` rules apply only when a node is hovered. [`Stylesheet::resolve`]
+//! is the **cascade resolver**: for each class in the list, in order, it appends the
+//! class's base declarations and then (when `hovered`) its `:hover` declarations,
+//! with **last-wins** semantics on each [`PropId`] — a later rule overrides an
+//! earlier one on the same property, while properties no rule touches are preserved.
+//! [`Stylesheet::apply_state`] replays that resolution onto an [`App`]; the host
+//! re-calls it whenever a node's hover state flips.
+//!
 //! # What this is *not*
 //!
 //! This is a deliberate subset, not a CSS engine:
 //!
-//! - The only selector is a single bare class (`.name`). No element, id,
-//!   descendant, or compound selectors; no pseudo-classes; no media queries.
-//! - There is **no cascade across the tree** and no specificity. [`apply`] expands a
-//!   node's classes into inline-style ops on *that node only*; "later overrides
-//!   earlier" applies within the class list you pass, exactly like writing those
-//!   inline styles by hand in that order.
+//! - The only selectors are a bare class (`.name`) and `.name:hover`. No element,
+//!   id, descendant, or compound selectors; no pseudo-classes beyond `:hover`; no
+//!   media queries.
+//! - There is **no cascade across the tree** and no specificity. [`apply`] and
+//!   [`apply_state`] expand a node's classes into inline-style ops on *that node
+//!   only*; "later overrides earlier" applies within the class list you pass,
+//!   exactly like writing those inline styles by hand in that order.
 //! - Unknown properties are silently ignored (skipped, never an error), as is any
 //!   malformed fragment, so a partial stylesheet still yields the rules it could
 //!   parse.
@@ -31,6 +50,7 @@
 //! `no_std` + `alloc`; zero external crates.
 //!
 //! [`apply`]: Stylesheet::apply
+//! [`apply_state`]: Stylesheet::apply_state
 
 #![cfg_attr(not(test), no_std)]
 
@@ -47,10 +67,26 @@ use canopy_view::App;
 /// value, in source order.
 type Decl = (PropId, String);
 
-/// One parsed class rule: the class name and its resolved declarations.
+/// The interaction state a rule's `:hover`-style pseudo-class binds it to.
+///
+/// `Base` rules (a plain `.name` selector) always apply; stateful rules apply only
+/// when the node is in that state. Today the only stateful variant is [`State::Hover`]
+/// (`.name:hover`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// A plain class rule with no pseudo-class; always applies.
+    Base,
+    /// A `:hover` rule; applies only when the node is hovered.
+    Hover,
+}
+
+/// One parsed class rule: the class name, its interaction state, and its resolved
+/// declarations.
 struct Rule {
     /// The class selector, without the leading `.`.
     class: String,
+    /// Whether this rule is a base rule or a `:hover` rule.
+    state: State,
     /// Declarations whose property name mapped to a known [`PropId`], in order.
     decls: Vec<Decl>,
 }
@@ -71,27 +107,73 @@ impl Stylesheet {
         Self::default()
     }
 
-    /// The resolved declarations for `class` (without a leading `.`), in source
-    /// order. Returns an empty slice if no rule names that class.
+    /// The resolved **base** declarations for `class` (without a leading `.`), in
+    /// source order. Returns an empty slice if no base rule names that class.
     ///
-    /// When the same class appears in more than one rule, the rules' declarations
-    /// are concatenated in source order, so a later rule's property wins under
-    /// [`apply`]'s "later overrides earlier" replay.
+    /// This is the base-only path: `:hover` rules are not considered here — use
+    /// [`resolve`] for the stateful cascade. When the same class appears in more than
+    /// one base rule, the *first* base rule's declarations are returned (the original
+    /// behavior); the full last-wins concatenation across rules lives in [`resolve`].
+    ///
+    /// [`resolve`]: Stylesheet::resolve
     pub fn declarations(&self, class: &str) -> &[Decl] {
         for rule in &self.rules {
-            if rule.class == class {
+            if rule.class == class && rule.state == State::Base {
                 return &rule.decls;
             }
         }
         &[]
     }
 
+    /// Resolve the final declarations for a node from its `classes`, applying the
+    /// **last-wins cascade**.
+    ///
+    /// For each class in `classes`, in order, this layers in:
+    /// 1. that class's base (`.name`) rules, then
+    /// 2. its `:hover` (`.name:hover`) rules, but only when `hovered` is `true`.
+    ///
+    /// Within that sequence a later declaration overrides an earlier one on the same
+    /// [`PropId`] (so a `:hover` rule overrides the base rule for the property it
+    /// sets, while leaving other properties from the base intact), and later classes
+    /// override earlier classes. Properties no matching rule touches are absent from
+    /// the result. Classes with no matching rule contribute nothing; an empty or
+    /// all-unknown `classes` list yields an empty `Vec`.
+    ///
+    /// The returned pairs are ordered by first appearance of each property, which is
+    /// the order the inline-style ops are replayed in [`apply_state`].
+    pub fn resolve(&self, classes: &[&str], hovered: bool) -> Vec<Decl> {
+        let mut resolved: Vec<Decl> = Vec::new();
+        for class in classes {
+            // Base rules first, then `:hover` rules, both in source order, so a
+            // `:hover` declaration overrides the base for the same property.
+            for rule in &self.rules {
+                if rule.class != *class {
+                    continue;
+                }
+                let matches = match rule.state {
+                    State::Base => true,
+                    State::Hover => hovered,
+                };
+                if !matches {
+                    continue;
+                }
+                for (prop, value) in &rule.decls {
+                    cascade(&mut resolved, *prop, value);
+                }
+            }
+        }
+        resolved
+    }
+
     /// Apply `classes` to `node` on `app`, in order, by replaying each resolved
     /// declaration through [`App::style`]. Later classes override earlier ones
     /// because the later inline-style op simply overwrites the property.
     ///
-    /// This expands classes into the existing inline-style ops; there is no cascade
-    /// across the tree (see the crate docs).
+    /// This is the base-only replay (no `:hover`); use [`apply_state`] to fold hover
+    /// state into the cascade. There is no cascade across the tree (see the crate
+    /// docs).
+    ///
+    /// [`apply_state`]: Stylesheet::apply_state
     pub fn apply(&self, app: &App, node: NodeId, classes: &[&str]) {
         for class in classes {
             for (prop, value) in self.declarations(class) {
@@ -99,6 +181,36 @@ impl Stylesheet {
             }
         }
     }
+
+    /// Apply the [`resolve`]d declarations for `classes` at the given `hovered` state
+    /// onto `node`, replaying each through [`App::style`].
+    ///
+    /// The host calls this whenever a node's hover state changes: passing
+    /// `hovered = true` layers the `:hover` rules over the base, and passing
+    /// `hovered = false` re-applies the base-only resolution. Because each call
+    /// re-emits the full resolved set, the latest call's values overwrite whatever a
+    /// prior call wrote for the properties both touch.
+    ///
+    /// [`resolve`]: Stylesheet::resolve
+    pub fn apply_state(&self, app: &App, node: NodeId, classes: &[&str], hovered: bool) {
+        for (prop, value) in self.resolve(classes, hovered) {
+            app.style(node, prop, &value);
+        }
+    }
+}
+
+/// Fold one declaration into the resolved set with last-wins semantics: overwrite the
+/// value if `prop` is already present (preserving its original position), otherwise
+/// append it.
+fn cascade(resolved: &mut Vec<Decl>, prop: PropId, value: &str) {
+    for entry in resolved.iter_mut() {
+        if entry.0 == prop {
+            entry.1.clear();
+            entry.1.push_str(value);
+            return;
+        }
+    }
+    resolved.push((prop, value.to_string()));
 }
 
 /// Parse a CSS-lite stylesheet of class rules into a [`Stylesheet`].
@@ -120,12 +232,23 @@ pub fn parse(css: &str) -> Stylesheet {
         }
         i += 1; // consume the dot
 
-        // Read the class name up to whitespace or `{`.
+        // Read the selector (class plus optional `:state`) up to whitespace or `{`.
         let name_start = i;
         while i < bytes.len() && bytes[i] != b'{' && !bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        let class = css[name_start..i].to_string();
+        let selector = &css[name_start..i];
+        // Split the selector into a class and an optional pseudo-class state.
+        let (class, state) = match selector.split_once(':') {
+            Some((class, "hover")) => (class.to_string(), State::Hover),
+            // An unknown pseudo-class (`:focus`, `::before`, …) is outside this subset:
+            // drop the whole rule so it can't masquerade as a base rule.
+            Some(_) => {
+                skip_rule(bytes, &mut i);
+                continue;
+            }
+            None => (selector.to_string(), State::Base),
+        };
 
         // Skip to the opening brace; bail if the rule is truncated.
         while i < bytes.len() && bytes[i] != b'{' {
@@ -150,10 +273,29 @@ pub fn parse(css: &str) -> Stylesheet {
             continue;
         }
         let decls = parse_block(body);
-        rules.push(Rule { class, decls });
+        rules.push(Rule {
+            class,
+            state,
+            decls,
+        });
     }
 
     Stylesheet { rules }
+}
+
+/// Advance `i` past the rest of the current rule's block: skip to the opening `{`,
+/// then to and past the matching `}`. Used to drop a rule whose selector is outside
+/// this subset without mis-parsing its body as a fresh rule.
+fn skip_rule(bytes: &[u8], i: &mut usize) {
+    while *i < bytes.len() && bytes[*i] != b'{' {
+        *i += 1;
+    }
+    while *i < bytes.len() && bytes[*i] != b'}' {
+        *i += 1;
+    }
+    if *i < bytes.len() {
+        *i += 1; // consume `}`
+    }
 }
 
 /// Remove `/* … */` comments, replacing each with a single space so adjacent tokens
@@ -340,5 +482,112 @@ mod tests {
         dom.apply(&app.take_batch(0)).unwrap();
         assert_eq!(dom.style(node, BG), None);
         assert_eq!(dom.style(node, PADDING), None);
+    }
+
+    // --- :hover + cascade --------------------------------------------------
+
+    const HOVER_CSS: &str =
+        ".btn { background:#313244; padding:5px } .btn:hover { background:#585b70 }";
+
+    #[test]
+    fn hover_rule_does_not_leak_into_base_declarations() {
+        // `declarations` is the base-only path: it must ignore the `:hover` rule.
+        let sheet = parse(HOVER_CSS);
+        assert_eq!(
+            sheet.declarations("btn"),
+            &[(BG, "#313244".to_string()), (PADDING, "5".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_base_when_not_hovered() {
+        let sheet = parse(HOVER_CSS);
+        let resolved = sheet.resolve(&["btn"], false);
+        assert_eq!(
+            resolved,
+            vec![(BG, "#313244".to_string()), (PADDING, "5".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_hover_overrides_base_and_keeps_untouched_props() {
+        let sheet = parse(HOVER_CSS);
+        let resolved = sheet.resolve(&["btn"], true);
+        // background overridden by `:hover`, padding preserved from the base rule.
+        assert_eq!(
+            resolved,
+            vec![(BG, "#585b70".to_string()), (PADDING, "5".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_class_is_empty() {
+        let sheet = parse(HOVER_CSS);
+        assert!(sheet.resolve(&["nope"], false).is_empty());
+        assert!(sheet.resolve(&["nope"], true).is_empty());
+        assert!(sheet.resolve(&[], true).is_empty());
+    }
+
+    #[test]
+    fn resolve_multiple_classes_cascade_in_order() {
+        let sheet =
+            parse(".base { background:#111111; color:#eeeeee } .skin { background:#222222 }");
+        let resolved = sheet.resolve(&["base", "skin"], false);
+        // `skin`'s background wins (later class), `base`'s color is preserved.
+        assert_eq!(
+            resolved,
+            vec![(BG, "#222222".to_string()), (FG, "#eeeeee".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_hover_cascades_across_multiple_classes() {
+        let sheet =
+            parse(".a { background:#111111 } .b:hover { background:#222222 } .a:hover { background:#333333 }");
+        // base-only: only `.a`'s base applies.
+        assert_eq!(
+            sheet.resolve(&["a", "b"], false),
+            vec![(BG, "#111111".to_string())]
+        );
+        // hovered, walking classes in order:
+        // class `a`: base #111111 then its `:hover` #333333 -> #333333;
+        // class `b`: `:hover` #222222 overrides -> #222222 (later class wins).
+        assert_eq!(
+            sheet.resolve(&["a", "b"], true),
+            vec![(BG, "#222222".to_string())]
+        );
+    }
+
+    #[test]
+    fn unknown_pseudo_class_rule_is_dropped() {
+        // `:focus` is outside the subset: the whole rule is dropped, and it must not
+        // be mistaken for a base `.btn` rule.
+        let sheet = parse(".btn:focus { background:#000000 } .btn { background:#313244 }");
+        assert_eq!(sheet.declarations("btn"), &[(BG, "#313244".to_string())]);
+        assert_eq!(
+            sheet.resolve(&["btn"], true),
+            vec![(BG, "#313244".to_string())]
+        );
+    }
+
+    #[test]
+    fn apply_state_writes_hover_then_base_onto_the_node() {
+        let sheet = parse(HOVER_CSS);
+        let app = App::new();
+        let node = app.el(COLUMN);
+        app.append(NodeId::new(0), node);
+
+        // Hover on: background becomes the hover color, padding stays.
+        sheet.apply_state(&app, node, &["btn"], true);
+        let mut dom = Dom::new();
+        dom.apply(&app.take_batch(0)).unwrap();
+        assert_eq!(dom.style(node, BG), Some("#585b70"));
+        assert_eq!(dom.style(node, PADDING), Some("5"));
+
+        // Hover off: background reverts to the base color.
+        sheet.apply_state(&app, node, &["btn"], false);
+        dom.apply(&app.take_batch(0)).unwrap();
+        assert_eq!(dom.style(node, BG), Some("#313244"));
+        assert_eq!(dom.style(node, PADDING), Some("5"));
     }
 }

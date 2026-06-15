@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "accesskit"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d3b8f9bae46a948369bc4a03e815d4ed6d616bd00de4051133a5019dc31c5a"
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -128,6 +134,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-a11y"
+version = "0.0.0"
+dependencies = [
+ "accesskit",
+ "canopy-core",
+ "canopy-dom",
+ "canopy-protocol",
+ "canopy-traits",
+ "canopy-view",
+]
+
+[[package]]
+name = "canopy-cli"
+version = "0.0.0"
+
+[[package]]
 name = "canopy-core"
 version = "0.0.0"
 dependencies = [
@@ -211,6 +233,19 @@ dependencies = [
  "canopy-text-baked",
  "canopy-traits",
  "canopy-view",
+]
+
+[[package]]
+name = "canopy-render-text"
+version = "0.0.0"
+dependencies = [
+ "canopy-core",
+ "canopy-dom",
+ "canopy-layout-taffy",
+ "canopy-protocol",
+ "canopy-render-soft",
+ "canopy-text-parley",
+ "canopy-traits",
 ]
 
 [[package]]

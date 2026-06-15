@@ -1,0 +1,15 @@
+[package]
+name = "canopy-cli"
+description = "The `canopy` developer command: scaffold a new Canopy app (`canopy new`) and build it (`canopy build`). A light std binary with hand-rolled arg parsing — no extra deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "canopy"
+path = "src/main.rs"
+
+[lints]
+workspace = true

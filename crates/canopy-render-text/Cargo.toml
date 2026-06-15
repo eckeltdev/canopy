@@ -1,0 +1,22 @@
+[package]
+name = "canopy-render-text"
+description = "Canopy capable-tier renderer: lays out a Dom via Taffy and rasterizes its DisplayList into a software RGBA buffer with REAL antialiased glyphs (via canopy-text-parley), alpha-over compositing the coverage masks so AA edges look right."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-layout-taffy = { path = "../canopy-layout-taffy" }
+canopy-render-soft = { path = "../canopy-render-soft" }
+canopy-text-parley = { path = "../canopy-text-parley" }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+canopy-protocol = { path = "../canopy-protocol" }
+
+[lints]
+workspace = true

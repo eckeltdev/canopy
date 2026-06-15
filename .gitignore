@@ -1,4 +1,7 @@
 /target
+# Defensive: a stray per-crate target dir (e.g. an agent running a one-off build)
+# should never be committed even though the workspace shares the root /target.
+**/target/
 **/*.rs.bk
 *.pdb
 .DS_Store

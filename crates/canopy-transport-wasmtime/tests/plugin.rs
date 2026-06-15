@@ -25,11 +25,11 @@ fn plugin_builds_the_tree() {
 
     let dom = host.dom();
 
-    // The guest mounts a column with two text children: 1 element + 2 text = 3 nodes.
+    // The guest mounts a column with three text children: 1 element + 3 text = 4 nodes.
     assert_eq!(
         dom.node_count(),
-        3,
-        "column + heading + subtitle = three nodes"
+        4,
+        "column + heading + line + subtitle = four nodes"
     );
 
     // One top-level node (the column) under the implicit ROOT.
@@ -37,9 +37,9 @@ fn plugin_builds_the_tree() {
     assert_eq!(roots.len(), 1, "exactly one top-level node");
     let column = roots[0];
 
-    // The column carries the two text children, in order.
+    // The column carries the three text children, in order.
     let kids = dom.children(column);
-    assert_eq!(kids.len(), 2, "heading + subtitle");
+    assert_eq!(kids.len(), 3, "heading + line + subtitle");
 
     // Some text node mentions the sandboxed plugin — proving the bytes the *guest*
     // emitted (inside the sandbox) actually landed in the host tree.
@@ -69,7 +69,7 @@ fn no_wasi_required() {
         "guest instantiates and runs with only canopy_apply linked (no wasi): {result:?}"
     );
     // It still produced a tree, confirming the single import was sufficient.
-    assert_eq!(host.dom().node_count(), 3);
+    assert_eq!(host.dom().node_count(), 4);
 }
 
 /// Capability proof, the other direction: a module that imports something we do NOT
