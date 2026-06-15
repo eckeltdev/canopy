@@ -337,6 +337,7 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "canopy-text-baked",
+ "canopy-text-parley",
  "canopy-traits",
  "pollster",
  "wgpu",
