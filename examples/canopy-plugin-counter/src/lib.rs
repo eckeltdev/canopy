@@ -55,19 +55,24 @@ pub extern "C" fn run() {
     let column = e.create_element(COLUMN);
     e.append(ROOT, column);
     e.set_inline_style(column, DIRECTION, "column");
-    e.set_inline_style(column, BG, "#1e1e2e");
-    e.set_inline_style(column, PADDING, "16");
-    e.set_inline_style(column, GAP, "8");
+    e.set_inline_style(column, BG, "#181825");
+    e.set_inline_style(column, PADDING, "12");
+    e.set_inline_style(column, GAP, "6");
 
-    let heading = e.create_text("hello from a sandboxed plugin");
+    let heading = e.create_text("sandboxed plugin");
     e.append(column, heading);
     e.set_inline_style(heading, FG, "#a6e3a1");
-    e.set_inline_style(heading, HEIGHT, "20");
+    e.set_inline_style(heading, HEIGHT, "16");
 
-    let subtitle = e.create_text("(untrusted wasm built this)");
+    let l2 = e.create_text("untrusted wasm");
+    e.append(column, l2);
+    e.set_inline_style(l2, FG, "#cdd6f4");
+    e.set_inline_style(l2, HEIGHT, "16");
+
+    let subtitle = e.create_text("built this panel");
     e.append(column, subtitle);
-    e.set_inline_style(subtitle, FG, "#cdd6f4");
-    e.set_inline_style(subtitle, HEIGHT, "16");
+    e.set_inline_style(subtitle, FG, "#6c7086");
+    e.set_inline_style(subtitle, HEIGHT, "14");
 
     // Snapshot the batch. Bind it to a variable so the buffer stays alive for the
     // whole duration of the host call below.

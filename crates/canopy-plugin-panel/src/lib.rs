@@ -87,6 +87,11 @@ fn copy_into(dst: &mut Buffer, src: &Buffer, dst_x: usize, dst_y: usize) {
                 break;
             }
             let [r, g, b, a] = src.pixel(sx, sy);
+            // Fully-transparent panel pixels (the cleared backdrop a plugin didn't
+            // paint) leave the host untouched, so the host's panel fill shows through.
+            if a == 0 {
+                continue;
+            }
             dst.fill_rect(
                 Rect {
                     origin: Point {

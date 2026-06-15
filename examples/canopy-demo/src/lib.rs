@@ -12,15 +12,16 @@
 
 use canopy_dom::{Dom, ROOT};
 use canopy_layout_taffy::{hit_test, layout};
-use canopy_protocol::HandlerId;
+use canopy_protocol::{HandlerId, NodeId};
 use canopy_signals::Signal;
 use canopy_traits::{Point, Size};
+use canopy_transport_wasmtime::PluginHost;
 use canopy_view::{App, CLICK, COLUMN, ROW};
 
-/// Logical viewport the demo is designed for.
-pub const VIEW_W: f32 = 360.0;
+/// Logical viewport: the app UI on the left, the untrusted-plugin panel on the right.
+pub const VIEW_W: f32 = 720.0;
 /// Logical viewport height.
-pub const VIEW_H: f32 = 300.0;
+pub const VIEW_H: f32 = 320.0;
 
 /// The demo's stylesheet — authored as CSS class rules, parsed at build time and
 /// expanded onto nodes via [`canopy_style_css`]. Catppuccin-ish palette.
@@ -35,6 +36,8 @@ const STYLES: &str = "
 .itemrow { direction: row; gap: 8px }
 .item   { color: #cdd6f4; height: 18px }
 .footer { color: #6c7086; height: 16px }
+.field  { background: #313244; padding: 5px }
+.fieldtext { color: #cdd6f4; height: 18px }
 ";
 
 /// The built demo: the reactive [`App`] plus the counter signal.
@@ -43,6 +46,8 @@ pub struct Demo {
     pub app: App,
     /// The counter value (exposed so the headless renderer can set a lively start).
     pub count: Signal<i32>,
+    /// The text-input field node, so the host can route typed keys to it.
+    pub input: NodeId,
 }
 
 /// Assemble the demo UI and return the live [`App`].
@@ -58,6 +63,15 @@ pub fn build() -> Demo {
     let header = app.label("Canopy demo");
     css.apply(&app, header, &["header"]);
     app.mount(root, header);
+
+    // A focused text-input field — the windowed host routes typed keys here.
+    let field = app.text_input("todo: ");
+    css.apply(&app, field, &["field"]);
+    if let Some(text_node) = app.input_text_node(field) {
+        css.apply(&app, text_node, &["fieldtext"]);
+    }
+    app.focus(field);
+    app.mount(root, field);
 
     // --- Counter: [-]  Count: N  [+] ---
     let count = rt.signal(0i32);
@@ -139,11 +153,29 @@ pub fn build() -> Demo {
     css.apply(&app, footer, &["footer"]);
     {
         let remaining = remaining.clone();
-        app.bind_text(footer, move || format!("{} items remaining", remaining.get()));
+        app.bind_text(footer, move || {
+            format!("{} items remaining", remaining.get())
+        });
     }
     app.mount(root, footer);
 
-    Demo { app, count }
+    Demo {
+        app,
+        count,
+        input: field,
+    }
+}
+
+/// Load and run the untrusted wasm plugin in a Wasmtime sandbox, returning the host
+/// (whose `dom()` holds the UI the plugin built) — or `None` if the wasm is missing
+/// or the sandbox rejects it. The plugin is granted exactly one import and cannot
+/// reach the filesystem, network, or this app's tree; the host composites its result
+/// into a panel. The wasm path is baked in by `build.rs`.
+pub fn run_plugin() -> Option<PluginHost> {
+    let wasm = std::fs::read(env!("CANOPY_PLUGIN_WASM")).ok()?;
+    let mut host = PluginHost::new().ok()?;
+    host.run(&wasm).ok()?;
+    Some(host)
 }
 
 /// Resolve a pointer position to the click handler that should fire, using the real

@@ -11,18 +11,36 @@
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
-use canopy_demo::{build, click_handler, Demo, VIEW_H, VIEW_W};
+use canopy_demo::{build, click_handler, run_plugin, Demo, VIEW_H, VIEW_W};
 use canopy_dom::Dom;
+use canopy_input::Key;
 use canopy_layout_taffy::build_scene;
 use canopy_protocol::EventPayload;
 use canopy_render_soft::SoftwareRenderer;
-use canopy_traits::{Color, OpSink, Point, Renderer, Size};
+use canopy_traits::{Color, OpSink, Point, Rect, Renderer, Size};
+use canopy_transport_wasmtime::PluginHost;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Translate a winit key press into a Canopy text-edit [`Key`].
+fn translate_key(event: &KeyEvent) -> Option<Key> {
+    match &event.logical_key {
+        WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
+        WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
+        WinitKey::Named(NamedKey::Space) => Some(Key::Char(' ')),
+        _ => event
+            .text
+            .as_ref()
+            .and_then(|s| s.chars().next())
+            .filter(|c| !c.is_control())
+            .map(Key::Char),
+    }
+}
 
 const CLEAR: Color = Color {
     r: 0x1e,
@@ -36,6 +54,9 @@ struct DemoApp {
     dom: Dom,
     seq: u32,
     cursor: PhysicalPosition<f64>,
+    /// The untrusted wasm plugin, run once at startup; its `dom()` is composited
+    /// into a panel each frame. `None` if the sandbox couldn't load it.
+    plugin: Option<PluginHost>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -51,8 +72,20 @@ impl DemoApp {
             dom,
             seq: 1,
             cursor: PhysicalPosition::new(0.0, 0.0),
+            plugin: run_plugin(),
             window: None,
             surface: None,
+        }
+    }
+
+    /// Type a key into the focused text field, then re-apply and redraw.
+    fn on_key(&mut self, key: Key) {
+        self.demo.app.type_into(self.demo.input, key);
+        let batch = self.demo.app.take_batch(self.seq);
+        self.seq += 1;
+        let _ = self.dom.apply(&batch);
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -81,6 +114,45 @@ impl DemoApp {
         renderer
             .render(&build_scene(&self.dom, viewport))
             .expect("render");
+
+        // Composite the untrusted plugin into a bordered panel on the right.
+        let label = Color {
+            r: 0xf3,
+            g: 0x8b,
+            b: 0xa8,
+            a: 255,
+        };
+        let border = Color {
+            r: 0x45,
+            g: 0x47,
+            b: 0x5a,
+            a: 255,
+        };
+        let plugin_bg = Color {
+            r: 0x18,
+            g: 0x18,
+            b: 0x25,
+            a: 255,
+        };
+        let px = (viewport.w - 312.0).max(0.0);
+        let buf = renderer.buffer_mut();
+        buf.blit_text(Point { x: px, y: 24.0 }, "untrusted plugin:", label, 16.0);
+        let frame = Rect {
+            origin: Point { x: px, y: 48.0 },
+            size: Size { w: 300.0, h: 104.0 },
+        };
+        let inner = Rect {
+            origin: Point {
+                x: px + 2.0,
+                y: 50.0,
+            },
+            size: Size { w: 296.0, h: 100.0 },
+        };
+        buf.fill_rect(frame, border);
+        buf.fill_rect(inner, plugin_bg);
+        if let Some(host) = &self.plugin {
+            canopy_plugin_panel::render_panel(buf, inner, host.dom());
+        }
 
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
@@ -141,6 +213,14 @@ impl ApplicationHandler for DemoApp {
                 button: MouseButton::Left,
                 ..
             } => self.on_click(),
+            WindowEvent::KeyboardInput {
+                event: ref key_event,
+                ..
+            } if key_event.state == ElementState::Pressed => {
+                if let Some(key) = translate_key(key_event) {
+                    self.on_key(key);
+                }
+            }
             _ => {}
         }
     }

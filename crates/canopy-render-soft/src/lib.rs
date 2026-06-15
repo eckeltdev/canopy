@@ -162,6 +162,12 @@ impl SoftwareRenderer {
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
+
+    /// Mutable access to the frame buffer — e.g. to composite another surface (a
+    /// plugin panel) into the painted frame before presenting.
+    pub fn buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.buffer
+    }
 }
 
 impl Renderer for SoftwareRenderer {

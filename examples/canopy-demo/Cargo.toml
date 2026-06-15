@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 # `cargo run` launches the window; the headless renderer is `cargo run --bin render`.
 default-run = "canopy-demo"
+# build.rs compiles the untrusted wasm plugin so the demo can host it in a panel.
+build = "build.rs"
 
 # This example is intentionally OUTSIDE the core workspace (see the root
 # Cargo.toml `exclude`) so the no_std core never inherits winit/softbuffer.
@@ -22,6 +24,10 @@ canopy-signals = { path = "../../crates/canopy-signals" }
 canopy-render-soft = { path = "../../crates/canopy-render-soft" }
 canopy-layout-taffy = { path = "../../crates/canopy-layout-taffy" }
 canopy-style-css = { path = "../../crates/canopy-style-css" }
+canopy-input = { path = "../../crates/canopy-input" }
+# Host an untrusted wasm plugin in a panel.
+canopy-transport-wasmtime = { path = "../../crates/canopy-transport-wasmtime" }
+canopy-plugin-panel = { path = "../../crates/canopy-plugin-panel" }
 
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
