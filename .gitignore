@@ -5,3 +5,6 @@
 
 # Workflow agent worktrees (harness scratch)
 /.claude/worktrees/
+
+# Nested example build dir + lockfile noise
+/examples/canopy-demo/target/

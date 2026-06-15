@@ -1,0 +1,45 @@
+[package]
+name = "canopy-demo"
+description = "Example Canopy app: a click-driven counter + list. Headless `render` binary plus a windowed macOS/desktop binary (winit + softbuffer)."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+# `cargo run` launches the window; the headless renderer is `cargo run --bin render`.
+default-run = "canopy-demo"
+
+# This example is intentionally OUTSIDE the core workspace (see the root
+# Cargo.toml `exclude`) so the no_std core never inherits winit/softbuffer.
+# Build the windowed app:   cargo run            (from this directory)
+# Render a frame headless:  cargo run --no-default-features --bin render
+
+[dependencies]
+canopy-protocol = { path = "../../crates/canopy-protocol" }
+canopy-traits = { path = "../../crates/canopy-traits" }
+canopy-dom = { path = "../../crates/canopy-dom" }
+canopy-paint = { path = "../../crates/canopy-paint" }
+canopy-view = { path = "../../crates/canopy-view" }
+canopy-signals = { path = "../../crates/canopy-signals" }
+canopy-render-soft = { path = "../../crates/canopy-render-soft" }
+canopy-host = { path = "../../crates/canopy-host" }
+
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+[features]
+default = ["window"]
+window = ["dep:winit", "dep:softbuffer"]
+
+[lib]
+path = "src/lib.rs"
+
+# Always available, no windowing deps: renders one frame to a PPM.
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+
+# The windowed app; needs the `window` feature (on by default).
+[[bin]]
+name = "canopy-demo"
+path = "src/bin/window.rs"
+required-features = ["window"]

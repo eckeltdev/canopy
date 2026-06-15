@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# The windowed example pulls winit/softbuffer; keep it out of the no_std core
+# workspace. Build it from examples/canopy-demo directly.
+exclude = ["examples/canopy-demo"]
 members = [
     "crates/canopy-protocol",
     "crates/canopy-traits",
