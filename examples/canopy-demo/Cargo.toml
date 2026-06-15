@@ -17,11 +17,11 @@ default-run = "canopy-demo"
 canopy-protocol = { path = "../../crates/canopy-protocol" }
 canopy-traits = { path = "../../crates/canopy-traits" }
 canopy-dom = { path = "../../crates/canopy-dom" }
-canopy-paint = { path = "../../crates/canopy-paint" }
 canopy-view = { path = "../../crates/canopy-view" }
 canopy-signals = { path = "../../crates/canopy-signals" }
 canopy-render-soft = { path = "../../crates/canopy-render-soft" }
-canopy-host = { path = "../../crates/canopy-host" }
+canopy-layout-taffy = { path = "../../crates/canopy-layout-taffy" }
+canopy-style-css = { path = "../../crates/canopy-style-css" }
 
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }

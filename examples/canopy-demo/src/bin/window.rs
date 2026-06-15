@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use canopy_demo::{build, click_handler, Demo, VIEW_H, VIEW_W};
 use canopy_dom::Dom;
-use canopy_paint::build_scene;
+use canopy_layout_taffy::build_scene;
 use canopy_protocol::EventPayload;
 use canopy_render_soft::SoftwareRenderer;
 use canopy_traits::{Color, OpSink, Point, Renderer, Size};

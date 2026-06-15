@@ -171,11 +171,11 @@ name = "canopy-demo"
 version = "0.0.0"
 dependencies = [
  "canopy-dom",
- "canopy-host",
- "canopy-paint",
+ "canopy-layout-taffy",
  "canopy-protocol",
  "canopy-render-soft",
  "canopy-signals",
+ "canopy-style-css",
  "canopy-traits",
  "canopy-view",
  "softbuffer",
@@ -191,12 +191,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "canopy-host"
+name = "canopy-layout-taffy"
 version = "0.0.0"
 dependencies = [
  "canopy-dom",
  "canopy-paint",
+ "canopy-protocol",
  "canopy-traits",
+ "taffy",
 ]
 
 [[package]]
@@ -223,6 +225,15 @@ dependencies = [
 [[package]]
 name = "canopy-signals"
 version = "0.0.0"
+
+[[package]]
+name = "canopy-style-css"
+version = "0.0.0"
+dependencies = [
+ "canopy-paint",
+ "canopy-protocol",
+ "canopy-view",
+]
 
 [[package]]
 name = "canopy-text-baked"
@@ -1262,6 +1273,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1311,6 +1323,15 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slotmap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "smallvec"
@@ -1399,6 +1420,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "taffy"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfde4e2f8595f222ceaae1fb16b4963952e9b33e358869dc4cd6316b0e0790cd"
+dependencies = [
+ "arrayvec",
+ "serde",
+ "slotmap",
 ]
 
 [[package]]
