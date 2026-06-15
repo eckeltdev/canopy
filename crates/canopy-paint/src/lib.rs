@@ -139,9 +139,10 @@ fn rect_contains(rect: &Rect, point: Point) -> bool {
 /// [`hit_test`] consumes; the `DisplayList` is what a [`canopy_traits::Renderer`]
 /// paints.
 ///
-/// Top-level nodes stack down the viewport's main axis; each is offered the full
-/// viewport box as its available space, so an element with no explicit cross size
-/// stretches to fill the viewport's cross extent.
+/// Top-level nodes stack down the viewport. A top-level node with no explicit
+/// width stretches to the viewport width (the common "fill the screen" case);
+/// nested nodes are sized to their content (or an explicit width/height), so flex
+/// rows and buttons stay tight rather than inheriting the viewport's box.
 pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
     let mut items = Vec::new();
     let mut rects = Vec::new();
@@ -152,6 +153,7 @@ pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
             root,
             Point { x: 0.0, y },
             viewport,
+            true,
             &mut items,
             &mut rects,
         );
@@ -189,6 +191,7 @@ fn layout_node(
     id: NodeId,
     origin: Point,
     avail: Size,
+    stretch_to_viewport: bool,
     out: &mut Vec<DisplayItem>,
     rects: &mut Vec<(NodeId, Rect)>,
 ) -> Size {
@@ -273,7 +276,7 @@ fn layout_node(
                 y: content_origin.y,
             },
         };
-        let size = layout_node(dom, child, child_origin, child_avail, out, rects);
+        let size = layout_node(dom, child, child_origin, child_avail, false, out, rects);
         let (child_main, child_cross) = match dir {
             Direction::Column => (size.h, size.w),
             Direction::Row => (size.w, size.h),
@@ -292,19 +295,17 @@ fn layout_node(
         Direction::Row => (content_main, content_cross),
     };
 
-    // Explicit size wins; otherwise content. On the cross axis a sizeless element
-    // stretches to its available extent (so a root column fills the viewport
-    // width), but never shrinks below its content.
-    let (w, h) = match dir {
-        Direction::Column => (
-            explicit_w.unwrap_or_else(|| content_w.max(avail.w)),
-            explicit_h.unwrap_or(content_h),
-        ),
-        Direction::Row => (
-            explicit_w.unwrap_or(content_w),
-            explicit_h.unwrap_or_else(|| content_h.max(avail.h)),
-        ),
-    };
+    // Explicit size wins; otherwise content. A top-level node with no explicit
+    // width stretches to the viewport width (the "fill the screen" case); nested
+    // nodes are content-sized so flex rows/buttons stay tight. Cross-axis stretch
+    // to a parent's box (align-items: stretch) is left for the real layout engine
+    // (Taffy) behind LayoutEngine.
+    let w = explicit_w.unwrap_or(if stretch_to_viewport {
+        content_w.max(avail.w)
+    } else {
+        content_w
+    });
+    let h = explicit_h.unwrap_or(content_h);
 
     let rect = Rect {
         origin,
