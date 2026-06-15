@@ -51,6 +51,8 @@ pub const GAP: PropId = PropId::new(5);
 pub const PADDING: PropId = PropId::new(6);
 /// Main-axis direction: `"row"` (horizontal) or `"column"` (vertical, the default).
 pub const DIRECTION: PropId = PropId::new(7);
+/// Corner radius for an element's background rect, in integer pixels (`0` = square).
+pub const RADIUS: PropId = PropId::new(8);
 
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;
@@ -121,8 +123,21 @@ fn style_direction(dom: &Dom, node: NodeId) -> Direction {
         .unwrap_or(Direction::Column)
 }
 
-fn rect_item(rect: Rect, color: Color) -> DisplayItem {
-    DisplayItem::Rect { rect, color }
+fn rect_item(rect: Rect, color: Color, radius: f32) -> DisplayItem {
+    DisplayItem::Rect {
+        rect,
+        color,
+        radius,
+    }
+}
+
+/// The node's corner [`RADIUS`] in logical px (default `0.0` = square).
+///
+/// Read inline like the other pixel styles; whole-pixel integer parsing keeps
+/// this crate honestly `no_std`. A node with no `radius`/`border-radius` style
+/// gets a square rect, exactly the legacy behavior.
+fn style_radius(dom: &Dom, node: NodeId) -> f32 {
+    style_dim(dom, node, RADIUS).unwrap_or(0.0)
 }
 
 /// Whether `rect` contains `point` (top/left inclusive, bottom/right exclusive).
@@ -215,7 +230,7 @@ fn layout_node(
             size: Size { w, h },
         };
         if let Some(bg) = style_color(dom, id, BG) {
-            out.push(rect_item(rect, bg));
+            out.push(rect_item(rect, bg, style_radius(dom, id)));
         }
         let fg = style_color(dom, id, FG).unwrap_or(DEFAULT_FG);
         out.push(DisplayItem::Text {
@@ -242,7 +257,7 @@ fn layout_node(
     let has_bg = style_color(dom, id, BG).is_some();
     if has_bg {
         // Placeholder; backfilled below once the final rect is known.
-        out.push(rect_item(Rect::default(), Color::default()));
+        out.push(rect_item(Rect::default(), Color::default(), 0.0));
     }
     let rect_index = rects.len();
     rects.push((id, Rect::default()));
@@ -314,7 +329,7 @@ fn layout_node(
     rects[rect_index].1 = rect;
     if has_bg {
         let bg = style_color(dom, id, BG).unwrap_or_default();
-        out[bg_index] = rect_item(rect, bg);
+        out[bg_index] = rect_item(rect, bg, style_radius(dom, id));
     }
     Size { w, h }
 }
@@ -351,7 +366,7 @@ mod tests {
         // First item is the column background (backfilled in place behind its
         // children), spanning the viewport width and the child's height.
         match &scene.items[0] {
-            DisplayItem::Rect { rect, color } => {
+            DisplayItem::Rect { rect, color, .. } => {
                 assert_eq!(
                     *color,
                     Color {
@@ -486,5 +501,50 @@ mod tests {
         assert_eq!(hit_test(&lay, Point { x: 80.0, y: 10.0 }), Some(col));
         // A point past everything resolves to nothing.
         assert_eq!(hit_test(&lay, Point { x: 500.0, y: 500.0 }), None);
+    }
+
+    #[test]
+    fn radius_style_flows_onto_the_emitted_rect() {
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, BG, "#313244");
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, RADIUS, "8");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+
+        // The single element background rect carries the parsed corner radius.
+        let radius = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .expect("background rect");
+        assert_eq!(radius, 8.0);
+    }
+
+    #[test]
+    fn no_radius_style_means_square() {
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, BG, "#313244");
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+
+        // Without a radius style the emitted rect is square (radius 0.0), preserving
+        // the legacy behavior.
+        match &scene.items[0] {
+            DisplayItem::Rect { radius, .. } => assert_eq!(*radius, 0.0),
+            other => panic!("expected a background rect, got {other:?}"),
+        }
     }
 }

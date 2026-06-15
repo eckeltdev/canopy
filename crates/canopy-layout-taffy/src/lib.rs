@@ -35,7 +35,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
-use canopy_paint::{BG, DIRECTION, FG, GAP, HEIGHT, PADDING, WIDTH};
+use canopy_paint::{BG, DIRECTION, FG, GAP, HEIGHT, PADDING, RADIUS, WIDTH};
 use canopy_protocol::{NodeId, PropId};
 use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, Size};
 
@@ -81,6 +81,13 @@ fn style_px(dom: &Dom, node: NodeId, prop: PropId) -> Option<u32> {
 
 fn style_color(dom: &Dom, node: NodeId, prop: PropId) -> Option<Color> {
     dom.style(node, prop).and_then(parse_color)
+}
+
+/// The node's corner [`RADIUS`] in logical px (default `0.0` = square). Geometry
+/// comes from Taffy, but the corner radius is a *paint* property, so it is read
+/// straight off the Dom here and threaded onto the emitted background rect.
+fn style_radius(dom: &Dom, node: NodeId) -> f32 {
+    style_px(dom, node, RADIUS).unwrap_or(0) as f32
 }
 
 /// Baked-font fixed pixel size for a text leaf: `scale = max(1, height_px / 8)`,
@@ -250,7 +257,11 @@ fn build_display_list(dom: &Dom, rects: &[(NodeId, Rect)]) -> Vec<DisplayItem> {
         let Some(node) = dom.node(id) else { continue };
         if let Some(text) = node.text.as_deref() {
             if let Some(bg) = style_color(dom, id, BG) {
-                items.push(DisplayItem::Rect { rect, color: bg });
+                items.push(DisplayItem::Rect {
+                    rect,
+                    color: bg,
+                    radius: style_radius(dom, id),
+                });
             }
             let fg = style_color(dom, id, FG).unwrap_or(DEFAULT_FG);
             items.push(DisplayItem::Text {
@@ -260,7 +271,11 @@ fn build_display_list(dom: &Dom, rects: &[(NodeId, Rect)]) -> Vec<DisplayItem> {
                 size: rect.size.h,
             });
         } else if let Some(bg) = style_color(dom, id, BG) {
-            items.push(DisplayItem::Rect { rect, color: bg });
+            items.push(DisplayItem::Rect {
+                rect,
+                color: bg,
+                radius: style_radius(dom, id),
+            });
         }
     }
     items
@@ -427,6 +442,30 @@ mod tests {
             .position(|i| matches!(i, DisplayItem::Rect { color, .. } if *color == child_bg))
             .unwrap();
         assert!(col_idx < child_idx, "parent background must paint first");
+    }
+
+    #[test]
+    fn radius_style_flows_onto_the_emitted_rect() {
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, BG, "#313244");
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, RADIUS, "8");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+
+        let radius = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .expect("background rect");
+        assert_eq!(radius, 8.0);
     }
 
     #[test]

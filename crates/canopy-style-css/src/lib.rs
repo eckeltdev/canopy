@@ -59,7 +59,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use canopy_paint::{BG, DIRECTION, FG, GAP, HEIGHT, PADDING, WIDTH};
+use canopy_paint::{BG, DIRECTION, FG, GAP, HEIGHT, PADDING, RADIUS, WIDTH};
 use canopy_protocol::{NodeId, PropId};
 use canopy_view::App;
 
@@ -355,6 +355,7 @@ fn map_property(name: &str) -> Option<PropId> {
         "height" => Some(HEIGHT),
         "gap" => Some(GAP),
         "padding" => Some(PADDING),
+        "border-radius" | "radius" => Some(RADIUS),
         "direction" | "flex-direction" => Some(DIRECTION),
         _ => None,
     }
@@ -363,7 +364,7 @@ fn map_property(name: &str) -> Option<PropId> {
 /// Normalize a value for `prop`: strip a trailing `px` from sizes (keeping the
 /// integer), and pass colors and directions through verbatim.
 fn normalize_value(prop: PropId, value: &str) -> String {
-    if prop == WIDTH || prop == HEIGHT || prop == GAP || prop == PADDING {
+    if prop == WIDTH || prop == HEIGHT || prop == GAP || prop == PADDING || prop == RADIUS {
         if let Some(num) = value.strip_suffix("px") {
             return num.trim().to_string();
         }
@@ -423,6 +424,16 @@ mod tests {
         let b = parse(".b { flex-direction: column }");
         assert_eq!(a.declarations("a"), &[(DIRECTION, "row".to_string())]);
         assert_eq!(b.declarations("b"), &[(DIRECTION, "column".to_string())]);
+    }
+
+    #[test]
+    fn border_radius_maps_to_radius_with_px_stripped() {
+        // Both spellings map to RADIUS, and the `px` unit is stripped like the other
+        // pixel dimensions so the value feeds the integer inline-style path.
+        let a = parse(".card { border-radius: 8px }");
+        let b = parse(".pill { radius: 16 }");
+        assert_eq!(a.declarations("card"), &[(RADIUS, "8".to_string())]);
+        assert_eq!(b.declarations("pill"), &[(RADIUS, "16".to_string())]);
     }
 
     #[test]

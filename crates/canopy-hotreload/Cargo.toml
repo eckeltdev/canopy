@@ -1,0 +1,23 @@
+[package]
+name = "canopy-hotreload"
+description = "Canopy dev-time hot reload: a debounced filesystem Watcher plus the re-apply glue that pushes a freshly rebuilt op-batch onto a live canopy-dom Dom, so editing a stylesheet / UI-description file updates the running tree without a restart (std; dev-only)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-dom = { path = "../canopy-dom" }
+canopy-traits = { path = "../canopy-traits" }
+# OS-level filesystem watching. `notify` is the de-facto standard (cargo-watch,
+# rust-analyzer, mdBook, …); MIT/CC0 dual-licensed. We coalesce its raw event
+# bursts ourselves, so we only need the default recommended backend.
+notify = "8.2"
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+canopy-protocol = { path = "../canopy-protocol" }
+
+[lints]
+workspace = true

@@ -127,6 +127,15 @@ pub enum DisplayItem {
         rect: Rect,
         /// Fill color.
         color: Color,
+        /// Corner radius in logical px; 0.0 = square.
+        ///
+        /// Renderers that don't implement rounding ignore this and draw a plain
+        /// rectangle (the legacy behavior); the CPU renderers
+        /// ([`canopy_render_soft`](https://docs.rs/canopy-render-soft) and
+        /// `canopy-render-text`) round the four corners. Renderers clamp the
+        /// radius to half the rect's shorter side, so an arbitrarily large value
+        /// yields a pill/stadium rather than overflowing the box.
+        radius: f32,
     },
     /// A run of shaped glyphs (capable tiers: Parley/Vello produce these).
     Glyphs {

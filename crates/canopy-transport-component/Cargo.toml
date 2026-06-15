@@ -1,0 +1,42 @@
+[package]
+name = "canopy-transport-component"
+description = "Canopy untrusted-COMPONENT transport: instantiates a real WebAssembly Component Model guest (built from wit/canopy.wit) in wasmtime, grants it exactly one imported capability (host.apply), and validates every op-batch through canopy-dom. The component-model peer of the core-wasm canopy-transport-wasmtime transport."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This is a host-side STD crate (wasmtime needs std) and is NOT in the no_std seam
+# guard. It still honors the workspace `unsafe_code = "deny"` lint: the component
+# boundary carries its `list<u8>` with an owned length, so there is no raw pointer
+# and no host-side `unsafe` memory access at all (unlike the core-wasm transport,
+# which still goes through wasmtime's safe `Memory::read`).
+#
+# `build.rs` builds the guest component (`examples/canopy-component-guest`) and hands
+# its path to the integration test via CANOPY_COMPONENT_WASM. Unlike the core-wasm
+# transport's build.rs, producing a *component* needs both the
+# `wasm32-unknown-unknown` target AND the `wasm-tools` CLI (to run
+# `wasm-tools component new`). If either is missing the build does NOT fail — it warns
+# and skips, leaving CANOPY_COMPONENT_WASM unset so the integration test build-and-
+# skips with a clear message. The crate's own unit tests (which cover the host
+# validation logic without a component) always run. See README.md for the manual
+# build steps.
+build = "build.rs"
+
+[dependencies]
+# COMPONENT model (not core modules): `component-model` pulls in the typed `bindgen!`
+# macro and the `wasmtime::component` API. No async, no pooling allocator, no WASI —
+# the linker grants the guest exactly one import and nothing else.
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "component-model"] }
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+
+[dev-dependencies]
+# Lets the tests build a forged op-batch with the same guest-side emitter the real
+# guest uses, to prove untrusted bytes are rejected (not trusted) by the host.
+canopy-core = { path = "../canopy-core" }
+canopy-protocol = { path = "../canopy-protocol" }
+
+[lints]
+workspace = true

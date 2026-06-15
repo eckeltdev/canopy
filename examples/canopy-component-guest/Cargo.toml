@@ -1,0 +1,43 @@
+[package]
+name = "canopy-component-guest"
+description = "Example untrusted Canopy guest as a real WebAssembly Component: wit-bindgen generates stubs from wit/canopy.wit, the guest implements the world's `run` export, builds a Canopy op-batch with canopy-core's Emitter, and hands it to the single imported `host.apply`. Links ONLY what the world grants — no WASI."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This guest is intentionally OUTSIDE the core workspace (see the root Cargo.toml
+# `exclude`). It is compiled to a wasm32 *component* out of band — see README.md for
+# the exact build steps — and is never part of a desktop `cargo build`. It does NOT
+# inherit the workspace `unsafe_code = "deny"` lint; wit-bindgen's generated glue
+# contains the canonical-ABI plumbing, which is `unsafe` by construction (it is the
+# one explicit FFI seam, exactly as in the core-wasm guest).
+
+# Stand alone as its own one-crate workspace. The guest is excluded from the core
+# workspace, and because this manifest can sit nested under a worktree checkout, an
+# empty `[workspace]` table pins it so cargo never walks up into an outer workspace.
+[workspace]
+
+[lib]
+# A core-wasm cdylib. The component is produced from this module by
+# `wasm-tools component new` (see README.md) — equivalently, building for
+# `wasm32-wasip2` emits a component directly.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Generates the guest-side bindings (the `Guest` trait + the imported `host` funcs)
+# from wit/canopy.wit. `default-features = false` drops async/std/bitflags so the
+# guest stays minimal; we keep `macros` (the `generate!`/`export!` proc-macros) and
+# `realloc` (the canonical-ABI allocator the host uses to hand us the return lists).
+wit-bindgen = { version = "0.58", default-features = false, features = ["macros", "realloc"] }
+# The SAME guest-side op builder the native and core-wasm guests use. Producing the
+# identical canopy-protocol wire bytes is the whole point: one core, many transports.
+canopy-core = { path = "../../crates/canopy-core" }
+canopy-protocol = { path = "../../crates/canopy-protocol" }
+canopy-paint = { path = "../../crates/canopy-paint" }
+
+[profile.release]
+# A panic must never unwind across the component boundary; abort instead. `opt-level
+# = "s"` keeps the produced module small.
+panic = "abort"
+opt-level = "s"

@@ -101,7 +101,11 @@ fn lower(scene: &DisplayList) -> Vec<QuadInstance> {
     let mut quads = Vec::new();
     for item in &scene.items {
         match item {
-            DisplayItem::Rect { rect, color } => {
+            // NOTE: `radius` is ignored here for now — the GPU path draws square
+            // quads. Rounded corners on the GPU (an SDF/rounded-quad fragment
+            // shader) are deferred to a later batch; the CPU renderers already
+            // round, so cards/pills look correct on the software tier today.
+            DisplayItem::Rect { rect, color, .. } => {
                 quads.push(QuadInstance::rect(*rect, *color));
             }
             DisplayItem::Text {
@@ -574,6 +578,7 @@ mod tests {
                     b: 0,
                     a: 255,
                 },
+                radius: 0.0,
             }],
         }
     }
@@ -664,6 +669,7 @@ mod tests {
                     b: 0,
                     a: 255,
                 },
+                radius: 0.0,
             }],
         };
         let Some(px) = try_render_to_rgba(&scene, size, clear) else {

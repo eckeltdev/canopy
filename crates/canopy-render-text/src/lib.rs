@@ -128,7 +128,9 @@ fn blend(src: u8, dst: u8, a: u32) -> u8 {
 
 /// Rasterize a single [`DisplayList`] onto `buffer` using `engine` for text.
 ///
-/// [`DisplayItem::Rect`] fills via [`Buffer::fill_rect`]; [`DisplayItem::Text`] is
+/// [`DisplayItem::Rect`] fills via [`Buffer::fill_rect`], or
+/// [`Buffer::fill_round_rect`] when it carries a positive `radius` (rounded cards
+/// and pills); [`DisplayItem::Text`] is
 /// shaped+rasterized by `engine` at the item's `size`/`color` and the resulting
 /// antialiased coverage mask is alpha-over composited at the item's `origin` (see
 /// [`composite_coverage`]). Pre-shaped [`DisplayItem::Glyphs`] runs are not emitted
@@ -139,7 +141,20 @@ fn blend(src: u8, dst: u8, a: u32) -> u8 {
 pub fn paint_display_list(buffer: &mut Buffer, engine: &mut TextEngine, scene: &DisplayList) {
     for item in &scene.items {
         match item {
-            DisplayItem::Rect { rect, color } => buffer.fill_rect(*rect, *color),
+            DisplayItem::Rect {
+                rect,
+                color,
+                radius,
+            } => {
+                // Reuse the software buffer's rounded fill so capable-tier cards and
+                // pills round identically to the constrained-tier path. Square is the
+                // common case, so only round when a positive radius is requested.
+                if *radius > 0.0 {
+                    buffer.fill_round_rect(*rect, *color, *radius);
+                } else {
+                    buffer.fill_rect(*rect, *color);
+                }
+            }
             DisplayItem::Text {
                 origin,
                 text,
