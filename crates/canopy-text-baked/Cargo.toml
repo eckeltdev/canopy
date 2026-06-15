@@ -1,0 +1,11 @@
+[package]
+name = "canopy-text-baked"
+description = "Canopy baked-font text backend: an 8x8 monospace bitmap glyph atlas for printable ASCII, for constrained / bare-metal renderers (no_std + alloc, zero deps)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

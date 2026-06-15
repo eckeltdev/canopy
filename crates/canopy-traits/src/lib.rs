@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use canopy_protocol::NodeId;
 
@@ -127,12 +128,28 @@ pub enum DisplayItem {
         /// Fill color.
         color: Color,
     },
-    /// A run of shaped glyphs.
+    /// A run of shaped glyphs (capable tiers: Parley/Vello produce these).
     Glyphs {
         /// Shaped glyphs.
         glyphs: ShapedGlyphs,
         /// Fill color.
         color: Color,
+    },
+    /// A run of unshaped text, drawn by a baked bitmap font on constrained tiers.
+    ///
+    /// The renderer lays the `text` out as a monospace run starting at `origin`,
+    /// painting "ink" pixels in `color`. `size` is the target cell height in
+    /// logical pixels; the baked font is 8px tall, so the integer scale factor is
+    /// `max(1, (size / 8).floor())`.
+    Text {
+        /// Top-left pen position of the first cell.
+        origin: Point,
+        /// The text to draw.
+        text: String,
+        /// Ink color.
+        color: Color,
+        /// Target cell height in logical pixels (scale = `size / 8`).
+        size: f32,
     },
 }
 

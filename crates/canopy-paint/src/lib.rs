@@ -8,13 +8,16 @@
 //! engines are wired. `Stylo` (style) and `Taffy` (layout) drop in behind the
 //! `StyleEngine` / `LayoutEngine` traits without changing this crate's output type.
 //!
-//! Text is emitted as a placeholder filled box sized to its content; real glyph
-//! runs ([`canopy_traits::DisplayItem::Glyphs`]) arrive with the Parley / baked-font
-//! text backend.
+//! Text nodes are emitted as [`canopy_traits::DisplayItem::Text`] runs, which the
+//! software renderer paints with a baked 8x8 bitmap font; the optional text
+//! background still emits a [`canopy_traits::DisplayItem::Rect`] behind the run.
+//! Shaped runs ([`canopy_traits::DisplayItem::Glyphs`]) arrive with the capable-tier
+//! Parley text backend.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
@@ -101,15 +104,22 @@ fn layout_node(
         None => return Size::default(),
     };
 
-    // Text leaf: a placeholder box sized to its content.
+    // Text leaf: a baked-font run, with an optional background rect behind it.
     if let Some(text) = node.text.as_deref() {
-        let w = style_dim(dom, id, WIDTH).unwrap_or(text.chars().count() as f32 * TEXT_ADVANCE);
         let h = style_dim(dom, id, HEIGHT).unwrap_or(TEXT_HEIGHT);
+        // Advance scales with the requested cell height; 8px per char at 16px tall.
+        let advance = TEXT_ADVANCE * (h / TEXT_HEIGHT);
+        let w = style_dim(dom, id, WIDTH).unwrap_or(text.chars().count() as f32 * advance);
         if let Some(bg) = style_color(dom, id, BG) {
             out.push(rect_item(origin, w, h, bg));
         }
         let fg = style_color(dom, id, FG).unwrap_or(DEFAULT_FG);
-        out.push(rect_item(origin, w, h, fg));
+        out.push(DisplayItem::Text {
+            origin,
+            text: text.to_string(),
+            color: fg,
+            size: h,
+        });
         return Size { w, h };
     }
 
@@ -183,19 +193,37 @@ mod tests {
             }
             _ => panic!("expected the column background rect first"),
         }
-        // The text box uses its foreground color and measured width.
+        // The text leaf emits a Text run carrying the content, the foreground color,
+        // and the requested cell height — not a placeholder foreground rect.
         let fg = Color {
             r: 0xff,
             g: 0xd0,
             b: 0x40,
             a: 255,
         };
-        let text_rect = scene.items.iter().find_map(|i| match i {
-            DisplayItem::Rect { rect, color } if *color == fg => Some(*rect),
-            _ => None,
-        });
-        let r = text_rect.expect("text foreground rect");
-        assert_eq!(r.size.w, 16.0);
-        assert_eq!(r.size.h, 20.0);
+        let text_item = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text {
+                    origin,
+                    text,
+                    color,
+                    size,
+                } => Some((*origin, text.clone(), *color, *size)),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(text_item.1, "ab");
+        assert_eq!(text_item.2, fg);
+        assert_eq!(text_item.3, 20.0);
+        // No foreground-colored Rect is emitted for the text anymore.
+        assert!(
+            !scene.items.iter().any(|i| matches!(
+                i,
+                DisplayItem::Rect { color, .. } if *color == fg
+            )),
+            "text must not emit a foreground placeholder rect"
+        );
     }
 }

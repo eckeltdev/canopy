@@ -1,0 +1,14 @@
+[package]
+name = "canopy-transport-native"
+description = "Canopy in-process transport: a same-address-space channel that moves op/event byte batches between a compiled-in guest and the host with no serialization (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "canopy-host"
+description = "Canopy headless host loop: owns the retained Dom and a Renderer, applies op batches, and paints the scene into a DisplayList (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+canopy-paint = { path = "../canopy-paint" }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-render-soft = { path = "../canopy-render-soft" }
+
+[lints]
+workspace = true

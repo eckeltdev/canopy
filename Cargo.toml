@@ -9,6 +9,9 @@ members = [
     "crates/canopy-dom",
     "crates/canopy-paint",
     "crates/canopy-render-soft",
+    "crates/canopy-text-baked",
+    "crates/canopy-transport-native",
+    "crates/canopy-host",
 ]
 
 # The four crates above are the guest-side core: they MUST stay `no_std` + `alloc`

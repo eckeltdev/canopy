@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Workflow agent worktrees (harness scratch)
+/.claude/worktrees/

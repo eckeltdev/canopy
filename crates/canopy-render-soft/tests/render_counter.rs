@@ -30,6 +30,18 @@ fn render(app: &App, dom: &Dom) -> SoftwareRenderer {
     r
 }
 
+/// Scan a rectangular pixel region for any pixel matching `want`.
+fn region_has(
+    r: &SoftwareRenderer,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    want: [u8; 4],
+) -> bool {
+    (y0..y1).any(|y| (x0..x1).any(|x| r.buffer().pixel(x, y) == want))
+}
+
 #[test]
 fn signal_counter_renders_and_reacts_to_pixels() {
     let app = App::new();
@@ -58,10 +70,16 @@ fn signal_counter_renders_and_reacts_to_pixels() {
     dom.apply(&app.take_batch(0)).unwrap();
     let r = render(&app, &dom);
 
-    // "Count: 0" is 8 chars * 8px = 64px wide, 20px tall, at the origin.
-    assert_eq!(r.buffer().pixel(10, 10), LABEL_FG, "inside the label box");
+    // "Count: 0" is 8 chars, 20px tall, drawn with the baked font at the origin.
+    // The glyphs are scale-2 ink on the column background, so individual pixels
+    // are either fg ink or column bg — scan the label box for at least one ink
+    // pixel rather than asserting a solid fill.
+    assert!(
+        region_has(&r, 0, 0, 80, 20, LABEL_FG),
+        "label box should contain foreground ink"
+    );
     assert_eq!(
-        r.buffer().pixel(100, 10),
+        r.buffer().pixel(180, 10),
         COL_BG,
         "past the label but inside the column background"
     );
@@ -82,9 +100,8 @@ fn signal_counter_renders_and_reacts_to_pixels() {
     assert_eq!(dom.text_of(label), Some("Count: 1"));
 
     let r2 = render(&app, &dom);
-    assert_eq!(
-        r2.buffer().pixel(10, 10),
-        LABEL_FG,
+    assert!(
+        region_has(&r2, 0, 0, 80, 20, LABEL_FG),
         "label still painted after update"
     );
 }

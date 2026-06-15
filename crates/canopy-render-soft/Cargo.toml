@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 canopy-traits = { path = "../canopy-traits" }
+canopy-text-baked = { path = "../canopy-text-baked" }
 
 [dev-dependencies]
 canopy-protocol = { path = "../canopy-protocol" }

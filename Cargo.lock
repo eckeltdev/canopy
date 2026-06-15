@@ -19,6 +19,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopy-host"
+version = "0.0.0"
+dependencies = [
+ "canopy-core",
+ "canopy-dom",
+ "canopy-paint",
+ "canopy-protocol",
+ "canopy-render-soft",
+ "canopy-traits",
+]
+
+[[package]]
 name = "canopy-paint"
 version = "0.0.0"
 dependencies = [
@@ -39,6 +51,7 @@ dependencies = [
  "canopy-dom",
  "canopy-paint",
  "canopy-protocol",
+ "canopy-text-baked",
  "canopy-traits",
  "canopy-view",
 ]
@@ -48,10 +61,21 @@ name = "canopy-signals"
 version = "0.0.0"
 
 [[package]]
+name = "canopy-text-baked"
+version = "0.0.0"
+
+[[package]]
 name = "canopy-traits"
 version = "0.0.0"
 dependencies = [
  "canopy-protocol",
+]
+
+[[package]]
+name = "canopy-transport-native"
+version = "0.0.0"
+dependencies = [
+ "canopy-traits",
 ]
 
 [[package]]
