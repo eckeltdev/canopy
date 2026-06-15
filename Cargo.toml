@@ -2,7 +2,7 @@
 resolver = "2"
 # The windowed example pulls winit/softbuffer; keep it out of the no_std core
 # workspace. Build it from examples/canopy-demo directly.
-exclude = ["examples/canopy-demo"]
+exclude = ["examples/canopy-demo", "examples/canopy-plugin-counter"]
 members = [
     "crates/canopy-protocol",
     "crates/canopy-traits",
@@ -17,6 +17,7 @@ members = [
     "crates/canopy-host",
     "crates/canopy-layout-taffy",
     "crates/canopy-style-css",
+    "crates/canopy-transport-wasmtime",
 ]
 
 # The four crates above are the guest-side core: they MUST stay `no_std` + `alloc`

@@ -1,0 +1,32 @@
+[package]
+name = "canopy-transport-wasmtime"
+description = "Canopy untrusted-plugin transport: runs a wasm32 guest in a wasmtime sandbox with exactly one granted host import (canopy_apply), memory + fuel + epoch caps, and host-side handle validation. The runtime-enforced peer of the compiled-in native transport."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This is a host-side STD crate (wasmtime needs std), so it is NOT subject to the
+# no_std seam guard. It still honors the workspace `unsafe_code = "deny"` lint: every
+# guest-memory read goes through wasmtime's safe, bounds-checked accessors.
+build = "build.rs"
+
+[dependencies]
+# CORE wasm modules only — no component model, no async, no pooling allocator. `wat`
+# lets the safety test assemble a tiny forged guest inline.
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-traits = { path = "../canopy-traits" }
+canopy-dom = { path = "../canopy-dom" }
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
+# Lets the adversarial/safety tests assemble tiny forged guests from WAT text.
+wat = "1"
+# For the render_plugin example: rasterize the UI the sandboxed guest builds.
+canopy-layout-taffy = { path = "../canopy-layout-taffy" }
+canopy-render-soft = { path = "../canopy-render-soft" }
+
+[lints]
+workspace = true
