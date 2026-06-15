@@ -53,23 +53,24 @@ pub fn build() -> Welcome {
     let count = ui.signal(0i32);
 
     let root = rsx!(ui =>
-        Column class="canvas" {
-            Column class="content" {
+        <div class="canvas">
+            <div class="content">
                 { logo(&ui) }
-                Label class="title" { "Canopy" }
-                Label class="tagline" { "web-like native UI — no JavaScript runtime" }
-                Column class="card" {
-                    Button class="btn"
-                        on_click({ let c = count.clone(); move |_| c.update(|n| *n += 1) })
-                        bind_text({ let c = count.clone(); move || format!("count is {}", c.get()) })
-                    Label class="hint" { "Edit styles.css and save to hot-reload" }
-                }
-                Row class="footer" {
-                    Button class="pill" { "docs" }
-                    Button class="pill pill-link" { "github" }
-                }
-            }
-        }
+                <span class="title">"Canopy"</span>
+                <span class="tagline">"web-like native UI — no JavaScript runtime"</span>
+                <div class="card">
+                    <button class="btn"
+                        on:click={ let c = count.clone(); move |_| c.update(|n| *n += 1) }>
+                        { let c = count.clone(); move || format!("count is {}", c.get()) }
+                    </button>
+                    <span class="hint">"Edit styles.css and save to hot-reload"</span>
+                </div>
+                <div class="footer">
+                    <button class="pill">"docs"</button>
+                    <button class="pill pill-link">"github"</button>
+                </div>
+            </div>
+        </div>
     );
     ui.mount_root(root);
 
@@ -79,22 +80,24 @@ pub fn build() -> Welcome {
 /// The Canopy logo: two rows of rounded "leaves" (the canopy) over a short trunk, each
 /// piece a pure rounded-rect element background (no text, no image files). A component
 /// is just a function that builds a subtree on the shared [`Ui`] and returns its root.
+/// (A `<div>` is a flex container whose row/column direction is set by its CSS class —
+/// `.leafrow`/`.trunkrow` carry `direction: row` — exactly like real flexbox.)
 fn logo(ui: &Ui) -> NodeId {
     rsx!(ui =>
-        Column class="logo" {
-            Row class="leafrow" {
-                Column class="leaf leaf-green" {}
-                Column class="leaf leaf-teal" {}
-                Column class="leaf leaf-green" {}
-            }
-            Row class="leafrow" {
-                Column class="leaf leaf-teal" {}
-                Column class="leaf leaf-blue" {}
-            }
-            Row class="trunkrow" {
-                Column class="trunk" {}
-            }
-        }
+        <div class="logo">
+            <div class="leafrow">
+                <div class="leaf leaf-green"/>
+                <div class="leaf leaf-teal"/>
+                <div class="leaf leaf-green"/>
+            </div>
+            <div class="leafrow">
+                <div class="leaf leaf-teal"/>
+                <div class="leaf leaf-blue"/>
+            </div>
+            <div class="trunkrow">
+                <div class="trunk"/>
+            </div>
+        </div>
     )
 }
 
