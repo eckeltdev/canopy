@@ -6,6 +6,7 @@ exclude = [
     "examples/canopy-demo",
     "examples/canopy-welcome",
     "examples/canopy-landing",
+    "examples/canopy-landing-gpu",
     "examples/canopy-plugin-counter",
     "examples/canopy-component-guest",
 ]

@@ -1,0 +1,57 @@
+[package]
+name = "canopy-landing-gpu"
+description = "The GPU-rasterized twin of `canopy-landing`: the same dark, minimal, animated one-page Canopy landing (staggered fade + slide-up entrance, ambient pulsing dots), but the window rasterizes on the GPU via canopy-render-vello (Metal on macOS) instead of the CPU software path. Design inspiration: x.ai."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+default-run = "canopy-landing-gpu"
+
+# Excluded from the core workspace (see the root Cargo.toml `exclude`) so the no_std
+# core never inherits winit/softbuffer. From this directory:
+#   cargo run                                       # the animated window (GPU-rasterized)
+#   cargo run --no-default-features --bin render    # a settled still -> PPM, on the GPU
+
+[dependencies]
+# The batteries-included authoring layer (Ui + rsx!), which re-exports the core.
+canopy-ui = { path = "../../crates/canopy-ui" }
+# Render-side types (Color/Size/Renderer trait), the layout engine that lowers the
+# settled DOM to a DisplayList, and the GPU renderer that rasterizes it.
+canopy-traits = { path = "../../crates/canopy-traits" }
+canopy-layout-taffy = { path = "../../crates/canopy-layout-taffy" }
+canopy-render-vello = { path = "../../crates/canopy-render-vello" }
+# The animation timeline (tweens with delay + repeat) and the paint PropId consts
+# (OPACITY, TRANSLATE_Y, WIDTH) the entrance animations bind to.
+canopy-anim = { path = "../../crates/canopy-anim" }
+canopy-paint = { path = "../../crates/canopy-paint" }
+
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+[features]
+default = ["window"]
+window = ["dep:winit", "dep:softbuffer"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+
+[[bin]]
+name = "canopy-landing-gpu"
+path = "src/bin/window.rs"
+required-features = ["window"]
+
+# Pin the workspace boundary (standalone example; see canopy-landing for the why).
+[workspace]
+
+# Optimize DEPENDENCIES even in a dev (`cargo run`) build, while keeping this crate
+# itself unoptimized for fast incremental builds. The per-frame cost lives almost
+# entirely in the GPU renderer's deps (wgpu, naga) + cosmic-text (dependencies), so an
+# unoptimized debug build of them is dramatically slower and the window feels laggy.
+# This is the standard fix for real-time/graphics dev: `cargo run` stays smooth,
+# `cargo run --release` is still fastest.
+[profile.dev.package."*"]
+opt-level = 3
