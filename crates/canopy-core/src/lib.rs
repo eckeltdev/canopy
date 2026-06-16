@@ -20,7 +20,9 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use canopy_protocol::{ElementTag, EventKind, HandlerId, NodeId, Op, OpEncoder, PropId, StrId};
+use canopy_protocol::{
+    AttrId, ElementTag, EventKind, HandlerId, NodeId, Op, OpEncoder, PropId, StrId,
+};
 
 /// Builds a batched op-stream: allocates node handles, interns strings, and
 /// accumulates ops until [`Emitter::take_batch`] wraps and drains them.
@@ -113,6 +115,24 @@ impl Emitter {
     pub fn set_class(&mut self, node: NodeId, class: &str) {
         let class = self.intern(class);
         self.pending.push(Op::SetClass { node, class });
+    }
+
+    /// Remove a class.
+    pub fn remove_class(&mut self, node: NodeId, class: &str) {
+        let class = self.intern(class);
+        self.pending.push(Op::RemoveClass { node, class });
+    }
+
+    /// Set an attribute (e.g. the id via [`AttrId::ID`]).
+    pub fn set_attribute(&mut self, node: NodeId, attr: AttrId, value: &str) {
+        let value = self.intern(value);
+        self.pending.push(Op::SetAttribute { node, attr, value });
+    }
+
+    /// Declare an element's CSS local name (e.g. `"div"`), for a host-side cascade.
+    pub fn set_tag_name(&mut self, node: NodeId, name: &str) {
+        let name = self.intern(name);
+        self.pending.push(Op::SetTagName { node, name });
     }
 
     /// Subscribe `node` to `event`, routing matches to `handler`.

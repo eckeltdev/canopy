@@ -18,7 +18,9 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use canopy_protocol::{ElementTag, EventKind, HandlerId, NodeId, Op, OpReader, PropId, StrId};
+use canopy_protocol::{
+    AttrId, ElementTag, EventKind, HandlerId, NodeId, Op, OpReader, PropId, StrId,
+};
 use canopy_traits::{HostError, OpSink};
 
 /// The implicit host root. Top-level nodes are inserted under this id; it is never
@@ -38,6 +40,16 @@ pub struct Node {
     pub children: Vec<NodeId>,
     /// Resolved inline styles, by property id.
     pub styles: BTreeMap<PropId, String>,
+    /// CSS local name (e.g. `"div"`), if the guest declared one via
+    /// [`Op::SetTagName`]. Constrained tiers leave this `None`; capable tiers that
+    /// run a real cascade need it for type selectors.
+    pub tag_name: Option<String>,
+    /// CSS class names, in declaration order (from [`Op::SetClass`] /
+    /// [`Op::RemoveClass`]). Retained for a host-side cascade (e.g. Stylo).
+    pub classes: Vec<String>,
+    /// Attributes by id (from [`Op::SetAttribute`]); `attrs[ATTR_ID]` is the
+    /// element id. Retained for a host-side cascade (id/attribute selectors).
+    pub attrs: BTreeMap<AttrId, String>,
     /// `(event, handler)` subscriptions registered on this node.
     pub listeners: Vec<(EventKind, HandlerId)>,
 }
@@ -74,6 +86,26 @@ impl Dom {
     /// The resolved inline style value for `node`'s `prop`, if set.
     pub fn style(&self, node: NodeId, prop: PropId) -> Option<&str> {
         self.nodes.get(&node)?.styles.get(&prop).map(String::as_str)
+    }
+
+    /// The node's CSS local name (e.g. `"div"`), if the guest declared one.
+    pub fn tag_name(&self, node: NodeId) -> Option<&str> {
+        self.nodes.get(&node)?.tag_name.as_deref()
+    }
+
+    /// The node's CSS class names, in declaration order.
+    pub fn classes(&self, node: NodeId) -> &[String] {
+        self.nodes.get(&node).map(|n| n.classes.as_slice()).unwrap_or(&[])
+    }
+
+    /// The resolved value of `node`'s attribute `attr`, if set.
+    pub fn attr(&self, node: NodeId, attr: AttrId) -> Option<&str> {
+        self.nodes.get(&node)?.attrs.get(&attr).map(String::as_str)
+    }
+
+    /// The node's CSS id ([`AttrId::ID`]), if set.
+    pub fn id(&self, node: NodeId) -> Option<&str> {
+        self.attr(node, AttrId::ID)
     }
 
     /// The children of `node` (or of [`ROOT`] for the top level).
@@ -236,12 +268,35 @@ impl Dom {
                     .styles
                     .insert(prop, value);
             }
-            // Attribute/class application lands with the style engine; for now they
-            // require a live target (so a bad handle is caught) but store nothing.
-            Op::SetAttribute { node, .. }
-            | Op::SetClass { node, .. }
-            | Op::RemoveClass { node, .. } => {
-                self.require(node)?;
+            // Element identity, retained for a host-side cascade (e.g. Stylo). A
+            // constrained tier that resolves styles author-side never emits these,
+            // so this is pure overhead-free addition for the capable tier.
+            Op::SetClass { node, class } => {
+                let class = self.resolve_str(class)?;
+                let n = self.nodes.get_mut(&node).ok_or(HostError::BadHandle)?;
+                if !n.classes.iter().any(|c| *c == class) {
+                    n.classes.push(class);
+                }
+            }
+            Op::RemoveClass { node, class } => {
+                let class = self.resolve_str(class)?;
+                self.nodes
+                    .get_mut(&node)
+                    .ok_or(HostError::BadHandle)?
+                    .classes
+                    .retain(|c| *c != class);
+            }
+            Op::SetAttribute { node, attr, value } => {
+                let value = self.resolve_str(value)?;
+                self.nodes
+                    .get_mut(&node)
+                    .ok_or(HostError::BadHandle)?
+                    .attrs
+                    .insert(attr, value);
+            }
+            Op::SetTagName { node, name } => {
+                let name = self.resolve_str(name)?;
+                self.nodes.get_mut(&node).ok_or(HostError::BadHandle)?.tag_name = Some(name);
             }
 
             // host -> guest op; never valid in a guest -> host batch.
@@ -305,6 +360,40 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&e.take_batch(0)).unwrap();
         assert_eq!(dom.style(n, BG), Some("#202830"));
+    }
+
+    #[test]
+    fn element_identity_is_retained_for_the_capable_tier() {
+        // A capable-tier guest declares tag-name + classes + id; the host retains
+        // them so a host-side cascade (Stylo) can match selectors against the REAL
+        // tree. (The constrained tier never emits these — pure addition.)
+        let mut e = Emitter::new();
+        let n = e.create_element(ElementTag::new(1));
+        e.append(ROOT, n);
+        e.set_tag_name(n, "button");
+        e.set_class(n, "btn");
+        e.set_class(n, "primary");
+        e.set_class(n, "btn"); // dedup: already present
+        e.set_attribute(n, AttrId::ID, "submit");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        assert_eq!(dom.tag_name(n), Some("button"));
+        assert_eq!(dom.classes(n), &["btn".to_string(), "primary".to_string()]);
+        assert_eq!(dom.id(n), Some("submit"));
+    }
+
+    #[test]
+    fn remove_class_drops_it() {
+        let mut e = Emitter::new();
+        let n = e.create_element(ElementTag::new(1));
+        e.append(ROOT, n);
+        e.set_class(n, "a");
+        e.set_class(n, "b");
+        e.remove_class(n, "a");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+        assert_eq!(dom.classes(n), &["b".to_string()]);
     }
 
     #[test]

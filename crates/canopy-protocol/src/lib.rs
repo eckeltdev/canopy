@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 /// Version tag carried by every [`Op::BeginBatch`]. Bump on any wire-format change
 /// so a host can support a window of protocol versions instead of breaking all
 /// guests at once.
-pub const PROTOCOL_VERSION: u16 = 0;
+pub const PROTOCOL_VERSION: u16 = 1;
 
 macro_rules! handle {
     ($(#[$m:meta])* $name:ident, $repr:ty) => {
@@ -99,6 +99,13 @@ impl NodeId {
     pub const fn is_null(self) -> bool {
         self.0 == u64::MAX
     }
+}
+
+impl AttrId {
+    /// The well-known **id** attribute. A capable-tier guest sets an element's CSS id
+    /// via `Op::SetAttribute { attr: AttrId::ID, .. }`; the host retains it (id /
+    /// attribute selectors). Reserved so it never collides with host-minted attr ids.
+    pub const ID: AttrId = AttrId::new(1);
 }
 
 /// A single mutation in the op-stream.
@@ -185,6 +192,18 @@ pub enum Op {
         /// Interned class name.
         class: StrId,
     },
+    /// Set an element's CSS local name (e.g. `"div"`, `"button"`).
+    ///
+    /// [`ElementTag`] is an opaque host-assigned id, not a CSS name; capable tiers
+    /// that run a real cascade (Stylo) need the type-selector name, so the guest
+    /// declares it here. Constrained tiers that resolve styles author-side never
+    /// emit this, and the host simply retains it for whatever style engine wants it.
+    SetTagName {
+        /// Target node.
+        node: NodeId,
+        /// Interned CSS local name.
+        name: StrId,
+    },
 
     /// Subscribe `node` to an event kind; the host routes matching events to
     /// `handler`. The grant is a capability: the guest only receives events for
@@ -267,6 +286,7 @@ mod tags {
     pub const ADD_LISTENER: u8 = 0x19;
     pub const REMOVE_LISTENER: u8 = 0x1A;
     pub const INTERN_STRING: u8 = 0x1B;
+    pub const SET_TAG_NAME: u8 = 0x1C;
     pub const DISPATCH_EVENT: u8 = 0x80;
 
     pub const PAYLOAD_NONE: u8 = 0;
@@ -359,6 +379,11 @@ impl OpEncoder {
                 self.w_u8(tags::REMOVE_CLASS);
                 self.w_u64(node.raw());
                 self.w_u32(class.raw());
+            }
+            Op::SetTagName { node, name } => {
+                self.w_u8(tags::SET_TAG_NAME);
+                self.w_u64(node.raw());
+                self.w_u32(name.raw());
             }
             Op::AddListener {
                 node,
@@ -582,6 +607,10 @@ impl<'a> OpReader<'a> {
             tags::REMOVE_CLASS => Ok(Op::RemoveClass {
                 node: NodeId::new(self.r_u64()?),
                 class: StrId::new(self.r_u32()?),
+            }),
+            tags::SET_TAG_NAME => Ok(Op::SetTagName {
+                node: NodeId::new(self.r_u64()?),
+                name: StrId::new(self.r_u32()?),
             }),
             tags::ADD_LISTENER => Ok(Op::AddListener {
                 node: NodeId::new(self.r_u64()?),
