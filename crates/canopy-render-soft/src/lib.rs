@@ -340,7 +340,23 @@ impl Renderer for SoftwareRenderer {
                     text,
                     color,
                     size,
-                } => self.buffer.blit_text(*origin, text, *color, *size),
+                    box_w,
+                    align,
+                } => {
+                    // Center / right-align the baked run within its box using the
+                    // run's OWN baked width (chars * advance at this size), offset by
+                    // `(box_w - run_w) * align` clamped to >= 0. For the baked path the
+                    // run usually equals the box, so the offset is ~0; `align == 0.0`
+                    // is byte-for-byte the legacy left-aligned blit.
+                    let scale = ((size / CELL_H as f32) as usize).max(1);
+                    let advance = (CELL_W as usize * scale) as f32;
+                    let run_w = text.chars().count() as f32 * advance;
+                    let origin = Point {
+                        x: origin.x + ((box_w - run_w) * align).max(0.0),
+                        y: origin.y,
+                    };
+                    self.buffer.blit_text(origin, text, *color, *size)
+                }
                 // Shaped-glyph rasterization arrives with the capable-tier text backend.
                 DisplayItem::Glyphs { .. } => {}
             }
@@ -540,6 +556,10 @@ mod tests {
                 text: "A".into(),
                 color: ink,
                 size: 8.0, // scale 1: glyph maps 1:1 onto the cell
+                // box equals the single-cell run, left-aligned: no offset, so this
+                // stays the legacy 1:1 blit at the origin.
+                box_w: 8.0,
+                align: 0.0,
             }],
         };
         r.render(&scene).unwrap();
@@ -561,6 +581,72 @@ mod tests {
         let any_ink =
             (0..8).any(|y| (0..8).any(|x| buf.pixel(x, y) == [ink.r, ink.g, ink.b, ink.a]));
         assert!(any_ink, "expected at least one ink pixel");
+    }
+
+    /// THE text-align proof on the deterministic baked path: a single-cell run in a
+    /// box much wider than the run, with `align = 0.5`, must have its ink land near
+    /// the box center — not near x=0. The baked 'A' at scale 1 is one 8px cell; a
+    /// `box_w` of 64 offsets it by `(64 - 8) * 0.5 = 28`, so the glyph cell occupies
+    /// columns 28..36 (its leftmost lit bit is cell-column 0 -> absolute column 28),
+    /// snug around the box midpoint (32), with the whole left region untouched
+    /// background.
+    #[test]
+    fn text_align_center_centers_the_baked_run_in_its_box() {
+        let bg = Color {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+            a: 255,
+        };
+        let ink = Color {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+            a: 255,
+        };
+        let box_w = 64.0_f32;
+        let mut r = SoftwareRenderer::new(box_w as usize, 8, bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Text {
+                origin: Point { x: 0.0, y: 0.0 },
+                text: "A".into(),
+                color: ink,
+                size: 8.0, // scale 1: one 8px cell
+                box_w,
+                align: 0.5, // centered
+            }],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+
+        let is_ink = |x: usize, y: usize| buf.pixel(x, y) == [ink.r, ink.g, ink.b, ink.a];
+        // The leftmost inked column across the whole buffer.
+        let leftmost_ink = (0..buf.width())
+            .find(|&x| (0..buf.height()).any(|y| is_ink(x, y)))
+            .expect("the run must have inked some column");
+
+        // Offset = (64 - 8) * 0.5 = 28; the 'A' glyph's leftmost lit bit is
+        // cell-column 0 (rows 0xC6/0xFE), so the leftmost ink is at absolute column
+        // 28 — snug around box center 32 and far from the left edge: proof the run is
+        // centered, not left-stuck.
+        assert_eq!(leftmost_ink, 28, "leftmost ink sits near the box center");
+        let center = (box_w as usize) / 2; // 32
+        assert!(
+            leftmost_ink.abs_diff(center) <= 4,
+            "leftmost ink {leftmost_ink} should be within a few px of center {center}"
+        );
+
+        // The entire left quarter of the box is untouched background — the glyphs are
+        // not stuck at the left edge.
+        for x in 0..(box_w as usize / 4) {
+            for y in 0..buf.height() {
+                assert_eq!(
+                    buf.pixel(x, y),
+                    [bg.r, bg.g, bg.b, bg.a],
+                    "left region must stay background, ink at ({x},{y})"
+                );
+            }
+        }
     }
 
     /// THE rounded-rect proof: a filled rounded rect over a contrasting background

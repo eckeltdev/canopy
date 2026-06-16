@@ -60,8 +60,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use canopy_paint::{
-    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TRANSLATE_X,
-    TRANSLATE_Y, WIDTH,
+    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
+    TRANSLATE_X, TRANSLATE_Y, WIDTH,
 };
 use canopy_protocol::{NodeId, PropId};
 use canopy_view::App;
@@ -385,6 +385,8 @@ fn map_property(name: &str) -> Option<PropId> {
         // Flex alignment keywords (values pass through verbatim).
         "align-items" | "align" => Some(ALIGN),
         "justify-content" | "justify" => Some(JUSTIFY),
+        // Text alignment keyword (left/center/right; passes through verbatim).
+        "text-align" => Some(TEXT_ALIGN),
         _ => None,
     }
 }
@@ -469,6 +471,33 @@ mod tests {
         let b = parse(".b { flex-direction: column }");
         assert_eq!(a.declarations("a"), &[(DIRECTION, "row".to_string())]);
         assert_eq!(b.declarations("b"), &[(DIRECTION, "column".to_string())]);
+    }
+
+    #[test]
+    fn text_align_maps_and_passes_keyword_through_verbatim() {
+        // `text-align` maps to TEXT_ALIGN, and its value is a keyword (not a length),
+        // so `normalize_value` must leave it untouched (no `px` strip).
+        let sheet = parse(".c { text-align: center } .r { text-align: right }");
+        assert_eq!(
+            sheet.declarations("c"),
+            &[(TEXT_ALIGN, "center".to_string())]
+        );
+        assert_eq!(
+            sheet.declarations("r"),
+            &[(TEXT_ALIGN, "right".to_string())]
+        );
+    }
+
+    #[test]
+    fn percent_sizes_pass_through_normalize_unchanged() {
+        // Percentages are not lengths-with-`px`: `normalize_value` only strips a
+        // trailing `px`, so a `%` value round-trips verbatim for the layout engine to
+        // resolve into a Taffy `percent`.
+        let sheet = parse(".fill { width: 100%; height: 50% }");
+        assert_eq!(
+            sheet.declarations("fill"),
+            &[(WIDTH, "100%".to_string()), (HEIGHT, "50%".to_string())]
+        );
     }
 
     #[test]

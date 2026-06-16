@@ -150,8 +150,17 @@ pub enum DisplayItem {
     /// painting "ink" pixels in `color`. `size` is the target cell height in
     /// logical pixels; the baked font is 8px tall, so the integer scale factor is
     /// `max(1, (size / 8).floor())`.
+    ///
+    /// `box_w` and `align` let a renderer center or right-align the run **using its
+    /// own measured run width**, which is the honest way to align proportional
+    /// glyphs whose drawn width differs from the layout box's baked-font width.
+    /// Each renderer measures the run in its own metric (the real pixel width for
+    /// the antialiased Parley path; `char_count * advance` for the baked-font CPU
+    /// paths) and shifts the run's start x by `(box_w - run_width) * align`, clamped
+    /// to `>= 0`. With `align == 0.0` (the default) the run is unshifted, exactly the
+    /// legacy left/start-aligned behavior.
     Text {
-        /// Top-left pen position of the first cell.
+        /// Top-left pen position of the first cell, before any alignment shift.
         origin: Point,
         /// The text to draw.
         text: String,
@@ -159,6 +168,15 @@ pub enum DisplayItem {
         color: Color,
         /// Target cell height in logical pixels (scale = `size / 8`).
         size: f32,
+        /// The node's box width to align the run within, in logical pixels. The
+        /// renderer centers/right-aligns the run inside this width using its own
+        /// measured run width (see [`align`](DisplayItem::Text::align)).
+        box_w: f32,
+        /// Horizontal alignment of the run within `box_w`: `0.0` = left/start (the
+        /// default, legacy behavior), `0.5` = centered, `1.0` = right/end. The
+        /// renderer offsets the run's start x by `(box_w - run_width) * align`,
+        /// clamped to `>= 0` so a box narrower than the run never pushes ink left.
+        align: f32,
     },
 }
 

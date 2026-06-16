@@ -111,6 +111,19 @@ pub fn composite_coverage(
     }
 }
 
+/// The horizontal offset that aligns a run of width `run_w` within a box of width
+/// `box_w` at fraction `align` (`0.0` left, `0.5` center, `1.0` right): `(box_w −
+/// run_w) * align`, clamped to `>= 0`.
+///
+/// The clamp keeps a box narrower than its run from yielding a negative offset that
+/// would push ink off the left edge — a too-narrow box just falls back to left-
+/// aligned. With `align == 0.0` the offset is `0`, so an un-aligned run is left
+/// exactly where it was (the legacy behavior).
+#[inline]
+fn align_offset(box_w: f32, run_w: f32, align: f32) -> f32 {
+    ((box_w - run_w) * align).max(0.0)
+}
+
 /// `src` over `dst` with straight alpha `a` (0..=255), rounded: `src·a + dst·(255−a)`.
 ///
 /// Pure integer math (no float, no `unsafe`); `+127` gives round-to-nearest so the
@@ -156,11 +169,23 @@ pub fn paint_display_list(buffer: &mut Buffer, engine: &mut TextEngine, scene: &
                 text,
                 color,
                 size,
+                box_w,
+                align,
             } => {
                 let glyphs = engine.rasterize(text, *size, *color);
+                // Center / right-align the run within its box using the run's OWN
+                // real pixel width (`glyphs.width`) — the honest metric for these
+                // proportional glyphs, which the baked layout width over-estimates.
+                // Offset = (box_w - run_w) * align, clamped to >= 0 so a box narrower
+                // than the run never shoves ink off the left edge. align 0 => 0
+                // (legacy left-aligned).
+                let origin = Point {
+                    x: origin.x + align_offset(*box_w, glyphs.width as f32, *align),
+                    y: origin.y,
+                };
                 composite_coverage(
                     buffer,
-                    *origin,
+                    origin,
                     &glyphs.coverage,
                     glyphs.width,
                     glyphs.height,
@@ -282,6 +307,79 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&e.take_batch(0)).unwrap();
         dom
+    }
+
+    /// The alignment offset is `(box_w - run_w) * align`, clamped to >= 0.
+    #[test]
+    fn align_offset_centers_rights_and_clamps() {
+        // Centering a 20-wide run in a 100-wide box: (100 - 20) * 0.5 = 40.
+        assert_eq!(align_offset(100.0, 20.0, 0.5), 40.0);
+        // Right-aligning: (100 - 20) * 1.0 = 80.
+        assert_eq!(align_offset(100.0, 20.0, 1.0), 80.0);
+        // Left (align 0.0) never shifts, regardless of box width.
+        assert_eq!(align_offset(100.0, 20.0, 0.0), 0.0);
+        // A box narrower than the run clamps to 0 (never pushes ink left).
+        assert_eq!(align_offset(10.0, 20.0, 0.5), 0.0);
+    }
+
+    /// THE Parley-path centering proof: rendering a short run with `align = 0.5` in a
+    /// box much wider than the run lands the real antialiased ink centered in the box
+    /// — and strictly to the right of the same run drawn left-aligned. This exercises
+    /// the run's OWN measured pixel width, the whole point of text-align.
+    #[test]
+    fn centered_run_inks_the_middle_and_beats_left_aligned() {
+        let bg = color(0, 0, 0);
+        let ink = color(255, 255, 255);
+        let box_w = 200.0_f32;
+        let mut engine = TextEngine::new();
+
+        // Helper: render "Hi" at the given align and return the ink centroid x.
+        let centroid_x = |engine: &mut TextEngine, align: f32| -> f32 {
+            let mut buf = Buffer::new(box_w as usize, 24);
+            buf.clear(bg);
+            let scene = DisplayList {
+                items: vec![DisplayItem::Text {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    text: "Hi".into(),
+                    color: ink,
+                    size: 16.0,
+                    box_w,
+                    align,
+                }],
+            };
+            paint_display_list(&mut buf, engine, &scene);
+            let (mut sum_x, mut weight) = (0.0_f64, 0.0_f64);
+            for y in 0..buf.height() {
+                for x in 0..buf.width() {
+                    let v = buf.pixel(x, y)[0] as f64; // white-on-black: red == coverage
+                    if v > 0.0 {
+                        sum_x += x as f64 * v;
+                        weight += v;
+                    }
+                }
+            }
+            assert!(weight > 0.0, "the run must have inked something");
+            (sum_x / weight) as f32
+        };
+
+        let left_cx = centroid_x(&mut engine, 0.0);
+        let center_cx = centroid_x(&mut engine, 0.5);
+        let box_center = box_w / 2.0;
+
+        // Left-aligned ink hugs the left edge; centered ink sits near the box middle.
+        assert!(
+            left_cx < box_center * 0.6,
+            "left-aligned centroid {left_cx} should hug the left edge"
+        );
+        assert!(
+            (center_cx - box_center).abs() < 12.0,
+            "centered centroid {center_cx} should sit near box center {box_center}"
+        );
+        // And centering must move the ink decisively rightward vs. left-aligned.
+        assert!(
+            center_cx > left_cx + 40.0,
+            "centered ink ({center_cx}) must be well right of left-aligned ({left_cx})"
+        );
     }
 
     /// blend(ink, bg, a) lands strictly between the two endpoints at partial alpha.

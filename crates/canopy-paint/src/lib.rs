@@ -78,6 +78,15 @@ pub const ALIGN: PropId = PropId::new(12);
 /// On a column this distributes children vertically; on a row, horizontally — the
 /// honest way to center a hero or push a nav's ends apart without spacer hacks.
 pub const JUSTIFY: PropId = PropId::new(13);
+/// Horizontal **text alignment** of a node's text run within its own box (CSS
+/// `text-align`): `"left"`/`"center"`/`"right"`. Unlike [`JUSTIFY`] (which
+/// distributes child *boxes*), this aligns the *glyphs* inside the text node's box —
+/// applied by the renderer using its own measured run width, the honest way to
+/// center proportional text whose drawn width differs from the baked layout box. The
+/// value is a keyword string the layout engine maps to a `0.0`/`0.5`/`1.0` fraction
+/// on [`canopy_traits::DisplayItem::Text`]'s `align` field; an unrecognized or absent
+/// value is left-aligned (`0.0`).
+pub const TEXT_ALIGN: PropId = PropId::new(14);
 
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;
@@ -163,6 +172,18 @@ fn rect_item(rect: Rect, color: Color, radius: f32) -> DisplayItem {
 /// gets a square rect, exactly the legacy behavior.
 fn style_radius(dom: &Dom, node: NodeId) -> f32 {
     style_dim(dom, node, RADIUS).unwrap_or(0.0)
+}
+
+/// The node's [`TEXT_ALIGN`] as a `0.0`/`0.5`/`1.0` fraction: `"center"` => `0.5`,
+/// `"right"` => `1.0`, anything else (including absent) => `0.0` (left/start). The
+/// fraction rides onto the emitted [`DisplayItem::Text`]'s `align`, where the
+/// renderer applies it against its own measured run width.
+fn style_text_align(dom: &Dom, node: NodeId) -> f32 {
+    match dom.style(node, TEXT_ALIGN) {
+        Some("center") => 0.5,
+        Some("right") => 1.0,
+        _ => 0.0,
+    }
 }
 
 /// Whether `rect` contains `point` (top/left inclusive, bottom/right exclusive).
@@ -263,6 +284,12 @@ fn layout_node(
             text: text.to_string(),
             color: fg,
             size: h,
+            // Align within the node's own box width (this baked path's `w`), using
+            // the node's `text-align`. For the baked CPU run the box equals the
+            // run, so the offset is ~0; reading TEXT_ALIGN keeps it consistent with
+            // the Taffy path and renders any real-glyph tier correctly.
+            box_w: w,
+            align: style_text_align(dom, id),
         });
         rects.push((id, rect));
         return Size { w, h };
@@ -375,6 +402,10 @@ mod tests {
         assert_eq!(OPACITY.raw(), 9);
         assert_eq!(TRANSLATE_X.raw(), 10);
         assert_eq!(TRANSLATE_Y.raw(), 11);
+        // TEXT_ALIGN is the next free slot after JUSTIFY=13.
+        assert_eq!(ALIGN.raw(), 12);
+        assert_eq!(JUSTIFY.raw(), 13);
+        assert_eq!(TEXT_ALIGN.raw(), 14);
         let all = [
             BG,
             FG,
@@ -387,6 +418,9 @@ mod tests {
             OPACITY,
             TRANSLATE_X,
             TRANSLATE_Y,
+            ALIGN,
+            JUSTIFY,
+            TEXT_ALIGN,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -451,13 +485,19 @@ mod tests {
                     text,
                     color,
                     size,
-                } => Some((*origin, text.clone(), *color, *size)),
+                    box_w,
+                    align,
+                } => Some((*origin, text.clone(), *color, *size, *box_w, *align)),
                 _ => None,
             })
             .expect("text run");
         assert_eq!(text_item.1, "ab");
         assert_eq!(text_item.2, fg);
         assert_eq!(text_item.3, 16.0);
+        // box_w is the run's own box width (2 chars * 16px advance); no text-align
+        // was set, so the run is left-aligned (align 0.0).
+        assert_eq!(text_item.4, 32.0);
+        assert_eq!(text_item.5, 0.0);
         // No foreground-colored Rect is emitted for the text anymore.
         assert!(
             !scene.items.iter().any(|i| matches!(

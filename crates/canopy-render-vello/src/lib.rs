@@ -200,13 +200,25 @@ fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
                 text,
                 color,
                 size,
+                box_w,
+                align,
             } => {
                 // Rasterize the run to an antialiased coverage mask once. An
                 // empty/whitespace run yields a zero-ink mask, which draws as
                 // nothing — fine to keep (a fully-transparent quad).
                 let mask = engine.rasterize(text, *size, *color);
+                // Center / right-align the run within its box using the run's OWN
+                // real pixel width (`mask.width`, the tight ink box) — the honest
+                // metric for these proportional glyphs, exactly as the CPU sharp-text
+                // path does. Offset = (box_w - run_w) * align, clamped to >= 0 so a
+                // too-narrow box never pushes ink left; `align == 0.0` => 0 (legacy).
+                let offset = ((box_w - mask.width as f32) * align).max(0.0);
+                let origin = Point {
+                    x: origin.x + offset,
+                    y: origin.y,
+                };
                 cmds.push(DrawCmd::Glyphs(GlyphRun {
-                    origin: *origin,
+                    origin,
                     mask,
                     color: *color,
                 }));
@@ -961,6 +973,9 @@ mod tests {
                     a: 255,
                 },
                 size: 16.0,
+                // Left-aligned (align 0.0): box_w is irrelevant, no offset.
+                box_w: 0.0,
+                align: 0.0,
             }],
         };
         let cmds = lower(&scene, &mut engine);
@@ -1015,6 +1030,9 @@ mod tests {
                         a: 255,
                     },
                     size: 16.0,
+                    // Left-aligned (align 0.0): box_w is irrelevant, no offset.
+                    box_w: 0.0,
+                    align: 0.0,
                 },
             ],
         };
@@ -1131,6 +1149,9 @@ mod tests {
                 text: "Canopy".into(),
                 color: ink,
                 size: 32.0,
+                // Left-aligned (align 0.0): box_w is irrelevant, no offset.
+                box_w: 0.0,
+                align: 0.0,
             }],
         };
         let Some(px) = try_render_to_rgba(&scene, size, bg) else {
@@ -1251,6 +1272,9 @@ mod tests {
                     text: "Hi".into(),
                     color: ink,
                     size: 24.0,
+                    // Left-aligned (align 0.0): box_w is irrelevant, no offset.
+                    box_w: 0.0,
+                    align: 0.0,
                 },
             ],
         };

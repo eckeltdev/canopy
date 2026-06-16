@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
 use canopy_paint::{
-    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TRANSLATE_X,
-    TRANSLATE_Y, WIDTH,
+    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
+    TRANSLATE_X, TRANSLATE_Y, WIDTH,
 };
 use canopy_protocol::{NodeId, PropId};
 use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, Size};
@@ -45,8 +45,7 @@ use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, 
 use taffy::prelude::length;
 use taffy::{
     AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    Rect as TaffyRect,
-    Size as TaffySize, Style, TaffyTree,
+    Rect as TaffyRect, Size as TaffySize, Style, TaffyTree,
 };
 
 /// Baked-font cell advance at scale 1, in pixels.
@@ -92,6 +91,47 @@ fn style_color(dom: &Dom, node: NodeId, prop: PropId) -> Option<Color> {
 /// straight off the Dom here and threaded onto the emitted background rect.
 fn style_radius(dom: &Dom, node: NodeId) -> f32 {
     style_px(dom, node, RADIUS).unwrap_or(0) as f32
+}
+
+/// The node's [`TEXT_ALIGN`] as a `0.0`/`0.5`/`1.0` fraction: `"center"` => `0.5`,
+/// `"right"` => `1.0`, anything else (including absent) => `0.0` (left/start). The
+/// fraction rides onto the emitted [`DisplayItem::Text`]'s `align`, where the
+/// renderer applies it against its own measured run width — so a centered text node
+/// renders its glyphs centered within the box Taffy laid out for it.
+fn style_text_align(dom: &Dom, node: NodeId) -> f32 {
+    match dom.style(node, TEXT_ALIGN) {
+        Some("center") => 0.5,
+        Some("right") => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// Read a sizing property (`prop` is [`WIDTH`] or [`HEIGHT`]) into a Taffy
+/// [`Dimension`], accepting three forms:
+///
+/// - a **percentage** — `"100%"`, `"50%"` -> [`Dimension::percent`] of the fraction
+///   (`"50%"` -> `percent(0.5)`), resolved by Taffy against the available space;
+/// - a **length** — `"Npx"` or bare `"N"` -> [`Dimension::length`] of `N` px;
+/// - **absent / unparseable** -> [`Dimension::auto`] (content-sized), the default.
+///
+/// Percentages parse the integer part before `%` (the box-model sizes authors use
+/// are whole percents), and lengths reuse the integer-px reader, so no `std`-only
+/// float parsing creeps into this `no_std` crate.
+fn style_dimension(dom: &Dom, node: NodeId, prop: PropId) -> Dimension {
+    if let Some(s) = dom.style(node, prop) {
+        if let Some(pct) = s.strip_suffix('%') {
+            if let Ok(n) = pct.trim().parse::<u32>() {
+                // "50%" -> 0.5; integer-only division keeps this `no_std`-clean.
+                return Dimension::percent(n as f32 / 100.0);
+            }
+        }
+        // Tolerate a trailing "px" (the CSS path strips it, but be robust).
+        let num = s.strip_suffix("px").map(str::trim).unwrap_or(s);
+        if let Ok(n) = num.parse::<u32>() {
+            return Dimension::length(n as f32);
+        }
+    }
+    Dimension::auto()
 }
 
 /// Signed, fractional float value of `prop` on `node`, defaulting to `default` when
@@ -205,6 +245,36 @@ fn rect_contains(rect: &Rect, point: Point) -> bool {
         && point.y < rect.origin.y + rect.size.h
 }
 
+/// Resolve a **root** node's sizing property (`prop` is [`WIDTH`] or [`HEIGHT`])
+/// into a definite pixel size against the viewport `extent` (the viewport's width
+/// for [`WIDTH`], its height for [`HEIGHT`]), or `None` to leave the axis as Taffy
+/// laid it out (content/auto).
+///
+/// Taffy does not resolve a *root* node's percentage against the available space
+/// passed to `compute_layout`, so a `width: 100%` root would otherwise collapse to
+/// its content. We resolve it ourselves here:
+///
+/// - a **percentage** — `"100%"` -> `extent`, `"50%"` -> `extent * 0.5`;
+/// - a **length** — `"Npx"`/`"N"` -> `N` px (already definite, but we pin it so a
+///   root length is honored exactly even at the tree root);
+/// - **absent / auto** -> `None`, so a top-level node with no explicit size keeps
+///   its content height and the existing top-level *stacking* down the viewport is
+///   preserved (forcing auto to fill would make every top-level sibling
+///   viewport-tall).
+fn resolve_root_dimension(dom: &Dom, node: NodeId, prop: PropId, extent: f32) -> Option<f32> {
+    let s = dom.style(node, prop)?;
+    if let Some(pct) = s.strip_suffix('%') {
+        if let Ok(n) = pct.trim().parse::<u32>() {
+            // Integer-percent of the viewport extent; `n as f32 / 100.0` is
+            // `core`-safe (no `std`-only float intrinsics).
+            return Some(extent * (n as f32 / 100.0));
+        }
+        return None;
+    }
+    let num = s.strip_suffix("px").map(str::trim).unwrap_or(s);
+    num.parse::<u32>().ok().map(|n| n as f32)
+}
+
 /// Build the Taffy [`Style`] for one element from its inline styles.
 fn element_style(dom: &Dom, id: NodeId) -> Style {
     let dir = match dom.style(id, DIRECTION) {
@@ -213,12 +283,10 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
     };
     let gap = style_px(dom, id, GAP).unwrap_or(0) as f32;
     let pad = style_px(dom, id, PADDING).unwrap_or(0) as f32;
-    let width = style_px(dom, id, WIDTH)
-        .map(|w| Dimension::length(w as f32))
-        .unwrap_or(Dimension::auto());
-    let height = style_px(dom, id, HEIGHT)
-        .map(|h| Dimension::length(h as f32))
-        .unwrap_or(Dimension::auto());
+    // Width/height accept a percentage ("100%"/"50%"), a length ("Npx"/"N"), or are
+    // auto (content-sized) when absent — see `style_dimension`.
+    let width = style_dimension(dom, id, WIDTH);
+    let height = style_dimension(dom, id, HEIGHT);
     Style {
         flex_direction: dir,
         align_items: style_align(dom, id),
@@ -360,6 +428,29 @@ pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
     for &root in dom.children(ROOT) {
         let mut tree: TaffyTree<NodeId> = TaffyTree::new();
         let key = build_node(dom, root, &mut tree);
+
+        // Taffy does not resolve a *root* node's percentage against the available
+        // space, so a `width: 100%` / `height: 100%` root would collapse to its
+        // content. Resolve the root's own width/height against the viewport here and
+        // pin it as a definite length, so a root sized `100%` fills the window (and a
+        // `50%` root takes half). Auto/absent axes are left untouched, preserving the
+        // existing "top-level nodes stack down the viewport at content height".
+        if let Ok(style) = tree.style(key) {
+            let mut style = style.clone();
+            let mut changed = false;
+            if let Some(w) = resolve_root_dimension(dom, root, WIDTH, viewport.w) {
+                style.size.width = Dimension::length(w);
+                changed = true;
+            }
+            if let Some(h) = resolve_root_dimension(dom, root, HEIGHT, viewport.h) {
+                style.size.height = Dimension::length(h);
+                changed = true;
+            }
+            if changed {
+                tree.set_style(key, style).unwrap();
+            }
+        }
+
         tree.compute_layout(
             key,
             TaffySize {
@@ -431,6 +522,12 @@ fn build_display_list(dom: &Dom, rects: &[(NodeId, Rect)], opacities: &[f32]) ->
                 text: text.to_string(),
                 color: fade(fg, opacity),
                 size: rect.size.h,
+                // Align the glyphs within the node's laid-out box width using the
+                // node's `text-align`; the renderer offsets by `(box_w - run_w) *
+                // align` against its own measured run width, so a centered text node
+                // (in a box centered by `align-items: center`) renders centered ink.
+                box_w: rect.size.w,
+                align: style_text_align(dom, id),
             });
         } else if let Some(bg) = style_color(dom, id, BG) {
             items.push(DisplayItem::Rect {
@@ -489,7 +586,134 @@ mod tests {
 
         let (_scene, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
         let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
-        assert_eq!(child_rect.origin.x, 80.0, "child centered on the cross axis");
+        assert_eq!(
+            child_rect.origin.x, 80.0,
+            "child centered on the cross axis"
+        );
+    }
+
+    #[test]
+    fn percent_root_fills_the_viewport_and_percent_child_is_resolved() {
+        // THE fill-the-viewport proof: a root sized `100% x 100%` must fill the whole
+        // 800x600 viewport (Taffy alone would collapse a root percentage to content),
+        // and a `50%`-wide child resolves against the filled root -> 400 wide.
+        let mut e = Emitter::new();
+        let root = e.create_element(ElementTag::new(1));
+        e.append(ROOT, root);
+        e.set_inline_style(root, WIDTH, "100%");
+        e.set_inline_style(root, HEIGHT, "100%");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(root, child);
+        e.set_inline_style(child, WIDTH, "50%");
+        e.set_inline_style(child, HEIGHT, "100%");
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 800.0, h: 600.0 });
+        let root_rect = lay.rects.iter().find(|(id, _)| *id == root).unwrap().1;
+        assert_eq!(
+            root_rect.size,
+            Size { w: 800.0, h: 600.0 },
+            "100% x 100% root fills the viewport"
+        );
+        let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
+        assert_eq!(
+            child_rect.size.w, 400.0,
+            "50% child is half the filled root"
+        );
+        assert_eq!(
+            child_rect.size.h, 600.0,
+            "100% child matches the root height"
+        );
+    }
+
+    #[test]
+    fn half_percent_root_takes_half_the_viewport() {
+        // A `50% x 50%` root resolves against the viewport to a 400x300 box.
+        let mut e = Emitter::new();
+        let root = e.create_element(ElementTag::new(1));
+        e.append(ROOT, root);
+        e.set_inline_style(root, WIDTH, "50%");
+        e.set_inline_style(root, HEIGHT, "50%");
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 800.0, h: 600.0 });
+        let root_rect = lay.rects.iter().find(|(id, _)| *id == root).unwrap().1;
+        assert_eq!(root_rect.size, Size { w: 400.0, h: 300.0 });
+    }
+
+    #[test]
+    fn auto_root_still_content_sizes_and_stacks() {
+        // Resolving percentages must NOT change the auto path: a root with no explicit
+        // size still content-sizes (here, to its 30x20 child), preserving the existing
+        // top-level behavior rather than ballooning to the viewport.
+        let mut e = Emitter::new();
+        let root = e.create_element(ElementTag::new(1));
+        e.append(ROOT, root);
+        let child = e.create_element(ElementTag::new(2));
+        e.append(root, child);
+        e.set_inline_style(child, WIDTH, "30");
+        e.set_inline_style(child, HEIGHT, "20");
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 800.0, h: 600.0 });
+        let root_rect = lay.rects.iter().find(|(id, _)| *id == root).unwrap().1;
+        assert_eq!(
+            root_rect.size,
+            Size { w: 30.0, h: 20.0 },
+            "auto root content-sizes to its child, not the viewport"
+        );
+    }
+
+    #[test]
+    fn text_align_center_rides_onto_the_display_item() {
+        // A text node with `text-align: center` emits a Text run whose `align` is 0.5
+        // and whose `box_w` is the node's laid-out box width — the renderer does the
+        // actual centering against its own measured run width.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "200");
+        let t = e.create_text("ab"); // 2 chars
+        e.append(col, t);
+        e.set_inline_style(t, WIDTH, "160");
+        e.set_inline_style(t, HEIGHT, "16");
+        e.set_inline_style(t, TEXT_ALIGN, "center");
+        let dom = dom_from(e);
+
+        let (scene, _lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let (box_w, align) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { box_w, align, .. } => Some((*box_w, *align)),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(align, 0.5, "text-align: center -> 0.5");
+        assert_eq!(box_w, 160.0, "box_w is the text node's laid-out width");
+    }
+
+    #[test]
+    fn no_text_align_is_left_on_the_display_item() {
+        // The default (no text-align) emits align 0.0 — legacy left-aligned.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let t = e.create_text("ab");
+        e.append(col, t);
+        e.set_inline_style(t, HEIGHT, "16");
+        let dom = dom_from(e);
+
+        let (scene, _lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let align = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { align, .. } => Some(*align),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(align, 0.0, "no text-align -> left (0.0)");
     }
 
     #[test]
