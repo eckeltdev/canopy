@@ -1,0 +1,18 @@
+/* Canopy full-tier (Stylo) demo stylesheet — REAL CSS, cascaded by Servo's Stylo.
+ *
+ * This file is read at runtime: edit it and press any key in the window to hot-reload
+ * — the whole tree is re-cascaded through Stylo and redrawn. Try things the lite
+ * class-only engine can't do: add a descendant rule, lean on specificity, or change an
+ * inherited `color` on `.app` and watch it flow down.
+ *
+ * The two `.title` elements are the demo's punchline: the top-level one only matches
+ * `.title`, but the card's heading matches BOTH `.title` and the more-specific
+ * `.card .title`, so the cascade gives it white ink at a bigger size. */
+
+.app   { color: #c8ccd4; background: #15171c; font-size: 16px; padding: 22px }
+.title { font-size: 19px }
+.card  { background: #21242b; padding: 16px; border-radius: 10px }
+.card .title { color: #ffffff; font-size: 26px }
+.row   { font-size: 15px; padding: 7px }
+#cta   { background: #4c8bf5; color: #ffffff; padding: 12px; border-radius: 8px }
+.muted { color: #6b7080; font-size: 13px }

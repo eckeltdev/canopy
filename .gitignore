@@ -6,6 +6,9 @@
 *.pdb
 .DS_Store
 
+# Rendered output artifacts (examples write these; default path is the crate dir)
+*.ppm
+
 # Workflow agent worktrees (harness scratch)
 /.claude/worktrees/
 
