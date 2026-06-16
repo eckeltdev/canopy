@@ -10,8 +10,15 @@
 //!
 //! The display list is built by Canopy, not Taffy: backgrounds paint behind their
 //! children (one [`DisplayItem::Rect`] per element with a [`canopy_paint::BG`]
-//! color) and text leaves paint as [`DisplayItem::Text`] runs sized to the baked
-//! 8px font. Geometry — and only geometry — comes from Taffy.
+//! color) and text leaves paint as [`DisplayItem::Text`] runs sized to the node's
+//! requested pixel height. Geometry — and only geometry — comes from Taffy.
+//!
+//! A single tree walk ([`collect_rects`]) also resolves the **cascade's inherited
+//! properties** — `color` ([`FG`]) and `text-align` ([`TEXT_ALIGN`]) flow from a node to
+//! its descendants unless the descendant sets its own — alongside the compounding paint
+//! accumulators (`translate`, `opacity`). `background` ([`BG`]) is deliberately *not*
+//! inherited. This is a minimal, no-specificity inheritance pass (the constrained-tier
+//! answer); the `StyleEngine` trait reserves a full Stylo cascade for capable tiers.
 //!
 //! Style mapping (all inline, reusing the `canopy-paint` [`PropId`] consts):
 //! - [`DIRECTION`] `"row"`/`"column"` -> [`FlexDirection::Row`]/`Column` (default `Column`).
@@ -19,9 +26,9 @@
 //! - [`PADDING`] -> uniform Taffy `padding` (length px) on all four sides.
 //! - [`WIDTH`]/[`HEIGHT`] -> `size` of [`Dimension::length`] when set, else `auto`.
 //!
-//! Text leaves get a **fixed** Taffy size from the baked-font metrics, identical to
-//! `canopy-paint`: `scale = max(1, height_px / 8)` (integer; `height_px` from
-//! [`HEIGHT`] or `16`), `width = chars * 8 * scale`, `height = 8 * scale`.
+//! Text leaves get a Taffy size from the requested pixel height: `height` is [`HEIGHT`]
+//! (or `16`) exactly, and `width` is [`WIDTH`] when set, else a proportional estimate
+//! (`chars * height * 0.6`). The renderer bakes the exact font size from that height.
 //!
 //! [Taffy]: https://docs.rs/taffy
 //! Stays `no_std` + `alloc`: Taffy is pulled with `default-features = false` and
@@ -89,30 +96,48 @@ fn style_radius(dom: &Dom, node: NodeId) -> f32 {
     style_px(dom, node, RADIUS).unwrap_or(0) as f32
 }
 
-/// The node's [`TEXT_ALIGN`] as a `0.0`/`0.5`/`1.0` fraction: `"center"` => `0.5`,
-/// `"right"` => `1.0`, anything else (including absent) => `0.0` (left/start). The
-/// fraction rides onto the emitted [`DisplayItem::Text`]'s `align`, where the
-/// renderer applies it against its own measured run width — so a centered text node
+/// A node's OWN [`TEXT_ALIGN`] as a `0.0`/`0.5`/`1.0` fraction (`"center"` => `0.5`,
+/// `"right"` => `1.0`, anything else => `0.0` = left/start), or `None` if it sets none.
+/// The fraction ultimately rides onto the emitted [`DisplayItem::Text`]'s `align`, where
+/// the renderer applies it against its own measured run width — so a centered text node
 /// renders its glyphs centered within the box Taffy laid out for it.
-fn style_text_align(dom: &Dom, node: NodeId) -> f32 {
-    // `text-align` INHERITS, like CSS: a text node with no `text-align` of its own takes
-    // its nearest ancestor's. This is what lets `.btn { text-align: center }` center a
-    // button's text even though that text is an internal, unclassed label child the
-    // author never named. Walk up until a node sets it (or we run out of ancestors).
-    let mut id = node;
-    loop {
-        if let Some(v) = dom.style(id, TEXT_ALIGN) {
-            return match v {
-                "center" => 0.5,
-                "right" => 1.0,
-                _ => 0.0,
-            };
-        }
-        match dom.node(id).and_then(|n| n.parent) {
-            Some(parent) if parent != ROOT => id = parent,
-            _ => return 0.0,
-        }
-    }
+///
+/// `text-align` is a CSS **inherited** property; the inheritance itself happens once in
+/// the [`collect_rects`] tree walk (a node with no value takes its parent's resolved
+/// one), not as a per-read ancestor walk — so this only reports the node's local value.
+fn style_text_align_own(dom: &Dom, node: NodeId) -> Option<f32> {
+    dom.style(node, TEXT_ALIGN).map(|v| match v {
+        "center" => 0.5,
+        "right" => 1.0,
+        _ => 0.0,
+    })
+}
+
+/// The inherited (cascaded-down) style a node passes to its children: the CSS
+/// **inherited** properties (`color`/text-align here) plus the paint accumulators
+/// (translate offset, effective opacity) that also compound down the subtree.
+#[derive(Clone, Copy)]
+struct Inherited {
+    /// Accumulated translate offset (paint + hit-test).
+    translate: Point,
+    /// Effective opacity (multiplied down).
+    opacity: f32,
+    /// Resolved text color (`FG`); inherits when a node sets none.
+    fg: Color,
+    /// Resolved text alignment fraction; inherits when a node sets none.
+    align: f32,
+}
+
+/// The per-node resolved paint values [`collect_rects`] records alongside each rect,
+/// for [`build_display_list`] to read by index (parallel to the `rects` vec).
+#[derive(Clone, Copy)]
+struct NodePaint {
+    /// Effective opacity scaling every primitive this node emits.
+    opacity: f32,
+    /// Resolved (inherited) text color.
+    fg: Color,
+    /// Resolved (inherited) text-align fraction.
+    align: f32,
 }
 
 /// Read a sizing property (`prop` is [`WIDTH`] or [`HEIGHT`]) into a Taffy
@@ -353,33 +378,36 @@ fn build_node(dom: &Dom, id: NodeId, tree: &mut TaffyTree<NodeId>) -> taffy::Nod
 
 /// Walk the computed Taffy tree, accumulating parent offsets into absolute rects
 /// and recording `(NodeId, Rect)` in back-to-front tree order (parents before
-/// children), alongside a parallel `opacities` vec (one entry per pushed rect, same
-/// index) holding each node's **effective** opacity.
+/// children), alongside a parallel `paints` vec (one [`NodePaint`] per pushed rect,
+/// same index) holding each node's resolved opacity, color, and text-align.
 ///
-/// Two accumulators thread down the subtree, mirroring CSS `transform: translate`
-/// and `opacity`:
+/// The [`Inherited`] state threads down the subtree, mirroring the CSS cascade. Two of
+/// its fields **compound** (paint accumulators) and two **inherit** (cascaded properties):
 ///
-/// - **`parent_translate`** — the running paint offset. A node's own
+/// - **`translate`** *(compounds)* — the running paint offset. A node's own
 ///   [`style_translate`] is *added* to it; the sum shifts the node's absolute rect
 ///   **and** is passed to its children, so the whole subtree slides together with no
 ///   reflow. Because the shifted rect is what we record, both the display list (which
 ///   reads these rects) and [`hit_test`] (which scans them) see the node where it is
 ///   drawn — a translated node is hit at its painted position.
-/// - **`parent_opacity`** — the running effective opacity. A node's own
+/// - **`opacity`** *(compounds)* — the running effective opacity. A node's own
 ///   [`style_opacity`] *multiplies* it; the product is stored for this rect and
 ///   passed down, so setting opacity on a container fades its whole subtree. Opacity
 ///   is paint-only: it never touches the rect geometry, so hit-testing ignores it
 ///   (a faded node is still clickable).
-#[allow(clippy::too_many_arguments)]
+/// - **`fg` (`color`)** and **`align` (`text-align`)** *(inherit)* — a node's own value
+///   wins, else it takes the parent's resolved value. This is the cascade's inheritance
+///   step, performed once here so [`build_display_list`] can read the resolved value by
+///   index instead of walking ancestors per text node. `background` is intentionally NOT
+///   inherited (it stays a per-element read in `build_display_list`).
 fn collect_rects(
     dom: &Dom,
     tree: &TaffyTree<NodeId>,
     key: taffy::NodeId,
     parent_origin: Point,
-    parent_translate: Point,
-    parent_opacity: f32,
+    inherited: Inherited,
     rects: &mut Vec<(NodeId, Rect)>,
-    opacities: &mut Vec<f32>,
+    paints: &mut Vec<NodePaint>,
 ) {
     let layout = tree.layout(key).unwrap();
     // Taffy's relative box, made absolute by the parent's accumulated origin.
@@ -388,18 +416,29 @@ fn collect_rects(
         y: parent_origin.y + layout.location.y,
     };
 
-    // Fold this node's own translate/opacity into the inherited accumulators. The
-    // context maps the Taffy key back to a Dom node; a key with no context (none in
-    // practice) contributes no local style and just forwards the parent's values.
+    // Fold this node's own values into the inherited state. The context maps the Taffy
+    // key back to a Dom node; a key with no context (none in practice) contributes no
+    // local style and just forwards the parent's values.
+    //
+    // - translate/opacity COMPOUND (a CSS transform/opacity accumulates down a subtree);
+    // - fg (`color`) and align (`text-align`) INHERIT (a node's own value wins, else the
+    //   parent's resolved value is taken). This is the cascade's inheritance step, done
+    //   once here instead of as a per-read ancestor walk in `build_display_list`.
     let id = tree.get_node_context(key).copied();
     let local_translate = id
         .map(|id| style_translate(dom, id))
         .unwrap_or(Point { x: 0.0, y: 0.0 });
     let translate = Point {
-        x: parent_translate.x + local_translate.x,
-        y: parent_translate.y + local_translate.y,
+        x: inherited.translate.x + local_translate.x,
+        y: inherited.translate.y + local_translate.y,
     };
-    let opacity = parent_opacity * id.map(|id| style_opacity(dom, id)).unwrap_or(1.0);
+    let opacity = inherited.opacity * id.map(|id| style_opacity(dom, id)).unwrap_or(1.0);
+    let fg = id
+        .and_then(|id| style_color(dom, id, FG))
+        .unwrap_or(inherited.fg);
+    let align = id
+        .and_then(|id| style_text_align_own(dom, id))
+        .unwrap_or(inherited.align);
 
     // The recorded rect is the translated one, so paint and hit-test agree.
     let rect = Rect {
@@ -414,14 +453,18 @@ fn collect_rects(
     };
     if let Some(id) = id {
         rects.push((id, rect));
-        opacities.push(opacity);
+        paints.push(NodePaint { opacity, fg, align });
     }
-    // Children inherit the *untranslated* absolute origin (Taffy locations are
-    // relative to it) plus the accumulated translate/opacity.
+    // Children inherit the *untranslated* absolute origin (Taffy locations are relative
+    // to it) plus the accumulated/inherited style.
+    let child_inherited = Inherited {
+        translate,
+        opacity,
+        fg,
+        align,
+    };
     for child in tree.children(key).unwrap() {
-        collect_rects(
-            dom, tree, child, origin, translate, opacity, rects, opacities,
-        );
+        collect_rects(dom, tree, child, origin, child_inherited, rects, paints);
     }
 }
 
@@ -435,9 +478,10 @@ fn collect_rects(
 /// children, baked-font text runs) is built here from the Dom + the absolute rects.
 pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
     let mut rects: Vec<(NodeId, Rect)> = Vec::new();
-    // Effective opacity per rect, same index as `rects` (paint-only; not part of the
-    // returned `LayoutResult`, which hit-tests on geometry alone).
-    let mut opacities: Vec<f32> = Vec::new();
+    // Resolved paint per rect, same index as `rects` (paint-only; not part of the
+    // returned `LayoutResult`, which hit-tests on geometry alone). Holds the inherited
+    // `color`/`text-align` and the accumulated opacity for each node.
+    let mut paints: Vec<NodePaint> = Vec::new();
     let mut y = 0.0_f32;
     for &root in dom.children(ROOT) {
         let mut tree: TaffyTree<NodeId> = TaffyTree::new();
@@ -473,23 +517,28 @@ pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
             },
         )
         .unwrap();
-        // Each top-level subtree starts with no inherited translate and full opacity.
+        // Each top-level subtree starts with no inherited translate, full opacity, the
+        // default foreground, and left text-align — the cascade's initial values.
         collect_rects(
             dom,
             &tree,
             key,
             Point { x: 0.0, y },
-            Point { x: 0.0, y: 0.0 },
-            1.0,
+            Inherited {
+                translate: Point { x: 0.0, y: 0.0 },
+                opacity: 1.0,
+                fg: DEFAULT_FG,
+                align: 0.0,
+            },
             &mut rects,
-            &mut opacities,
+            &mut paints,
         );
         // Stack top-level siblings down the viewport, mirroring `canopy-paint`.
         let used_h = tree.layout(key).unwrap().size.height;
         y += used_h;
     }
 
-    let items = build_display_list(dom, &rects, &opacities);
+    let items = build_display_list(dom, &rects, &paints);
     (DisplayList { items }, LayoutResult { rects })
 }
 
@@ -502,51 +551,62 @@ pub fn build_scene(dom: &Dom, viewport: Size) -> DisplayList {
 }
 
 /// Build the [`DisplayList`] from the Dom, the absolute rects, and the per-rect
-/// effective opacities (`opacities[i]` belongs to `rects[i]`).
+/// resolved paint ([`NodePaint`]; `paints[i]` belongs to `rects[i]`).
 ///
 /// `rects` is in back-to-front tree order (parents before children), so iterating
 /// it forward naturally paints each element's background *behind* its descendants.
-/// Each element with a [`BG`] color emits a filled [`DisplayItem::Rect`]; each text
-/// node emits a [`DisplayItem::Text`] run with its [`FG`] color (or a default light
-/// gray) and a cell height equal to its rect height.
+/// Each element with a [`BG`] color emits a filled [`DisplayItem::Rect`] (background is
+/// read off the node — it does not inherit); each text node emits a [`DisplayItem::Text`]
+/// run colored by its already-resolved (inherited) [`FG`], aligned by its resolved
+/// `text-align`, with a cell height equal to its rect height.
 ///
 /// Every emitted color is [`fade`]d by that node's effective opacity, scaling the
 /// fill's / ink's alpha so a reduced-opacity subtree paints translucent and blends
 /// over whatever sits behind it. At full opacity (the overwhelmingly common case)
 /// [`scale_alpha`] returns the byte unchanged, so opaque scenes are byte-for-byte
 /// what they were before.
-fn build_display_list(dom: &Dom, rects: &[(NodeId, Rect)], opacities: &[f32]) -> Vec<DisplayItem> {
+fn build_display_list(
+    dom: &Dom,
+    rects: &[(NodeId, Rect)],
+    paints: &[NodePaint],
+) -> Vec<DisplayItem> {
     let mut items = Vec::new();
     for (i, &(id, rect)) in rects.iter().enumerate() {
         let Some(node) = dom.node(id) else { continue };
         // Parallel vecs are built together in `collect_rects`, so the index is always
-        // valid; default to opaque if a caller ever passes a short slice.
-        let opacity = opacities.get(i).copied().unwrap_or(1.0);
+        // valid; default to opaque/inherited-light if a caller ever passes a short slice.
+        let paint = paints.get(i).copied().unwrap_or(NodePaint {
+            opacity: 1.0,
+            fg: DEFAULT_FG,
+            align: 0.0,
+        });
         if let Some(text) = node.text.as_deref() {
+            // `background` is NOT inherited (per-element), so it is read off this node;
+            // the text `color` IS inherited (resolved in the tree walk -> `paint.fg`).
             if let Some(bg) = style_color(dom, id, BG) {
                 items.push(DisplayItem::Rect {
                     rect,
-                    color: fade(bg, opacity),
+                    color: fade(bg, paint.opacity),
                     radius: style_radius(dom, id),
                 });
             }
-            let fg = style_color(dom, id, FG).unwrap_or(DEFAULT_FG);
             items.push(DisplayItem::Text {
                 origin: rect.origin,
                 text: text.to_string(),
-                color: fade(fg, opacity),
+                color: fade(paint.fg, paint.opacity),
                 size: rect.size.h,
                 // Align the glyphs within the node's laid-out box width using the
-                // node's `text-align`; the renderer offsets by `(box_w - run_w) *
-                // align` against its own measured run width, so a centered text node
-                // (in a box centered by `align-items: center`) renders centered ink.
+                // resolved (inherited) `text-align`; the renderer offsets by
+                // `(box_w - run_w) * align` against its own measured run width, so a
+                // centered text node (in a box centered by `align-items: center`)
+                // renders centered ink.
                 box_w: rect.size.w,
-                align: style_text_align(dom, id),
+                align: paint.align,
             });
         } else if let Some(bg) = style_color(dom, id, BG) {
             items.push(DisplayItem::Rect {
                 rect,
-                color: fade(bg, opacity),
+                color: fade(bg, paint.opacity),
                 radius: style_radius(dom, id),
             });
         }
@@ -728,6 +788,138 @@ mod tests {
             })
             .expect("text run");
         assert_eq!(align, 0.0, "no text-align -> left (0.0)");
+    }
+
+    #[test]
+    fn color_inherits_from_an_ancestor() {
+        // `color` is a CSS *inherited* property: a text node with no `color` of its own
+        // takes its ancestor's. Here the column sets a yellow `color` and the nested
+        // text leaf sets none — the emitted Text run must be yellow, not the default.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, FG, "#ffd040");
+        // An intermediate wrapper with no color, to prove inheritance crosses depth.
+        let wrap = e.create_element(ElementTag::new(1));
+        e.append(col, wrap);
+        let t = e.create_text("hi");
+        e.append(wrap, t);
+        e.set_inline_style(t, HEIGHT, "16");
+        let dom = dom_from(e);
+
+        let (scene, _lay) = layout(&dom, Size { w: 100.0, h: 50.0 });
+        let color = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(
+            color,
+            Color {
+                r: 0xff,
+                g: 0xd0,
+                b: 0x40,
+                a: 255
+            },
+            "text with no color of its own inherits the ancestor's yellow"
+        );
+    }
+
+    #[test]
+    fn own_color_wins_over_inherited() {
+        // A node's OWN `color` overrides the inherited one. The column is yellow; the
+        // text node sets its own blue — the run must be blue.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, FG, "#ffd040");
+        let t = e.create_text("hi");
+        e.append(col, t);
+        e.set_inline_style(t, HEIGHT, "16");
+        e.set_inline_style(t, FG, "#89b4fa");
+        let dom = dom_from(e);
+
+        let (scene, _lay) = layout(&dom, Size { w: 100.0, h: 50.0 });
+        let color = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(
+            color,
+            Color {
+                r: 0x89,
+                g: 0xb4,
+                b: 0xfa,
+                a: 255
+            },
+            "the node's own color overrides the inherited one"
+        );
+    }
+
+    #[test]
+    fn text_align_inherits_from_an_ancestor() {
+        // `text-align` is inherited too: a centered container makes a descendant text
+        // node with no `text-align` of its own emit align 0.5.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "200");
+        e.set_inline_style(col, TEXT_ALIGN, "center");
+        let t = e.create_text("ab");
+        e.append(col, t);
+        e.set_inline_style(t, WIDTH, "160");
+        e.set_inline_style(t, HEIGHT, "16");
+        let dom = dom_from(e);
+
+        let (scene, _lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let align = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { align, .. } => Some(*align),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(
+            align, 0.5,
+            "text-align: center inherits onto the descendant"
+        );
+    }
+
+    #[test]
+    fn background_does_not_inherit() {
+        // `background` is a per-element property: setting it on a parent must NOT paint
+        // a background behind a child that sets none. The parent emits exactly one Rect
+        // (its own); the unstyled child contributes no fill.
+        let mut e = Emitter::new();
+        let parent = e.create_element(ElementTag::new(1));
+        e.append(ROOT, parent);
+        e.set_inline_style(parent, WIDTH, "100");
+        e.set_inline_style(parent, HEIGHT, "100");
+        e.set_inline_style(parent, BG, "#202020");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(parent, child);
+        e.set_inline_style(child, WIDTH, "40");
+        e.set_inline_style(child, HEIGHT, "20");
+        let dom = dom_from(e);
+
+        let (scene, _lay) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let rects = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count();
+        assert_eq!(
+            rects, 1,
+            "only the parent's background paints; bg never inherits"
+        );
     }
 
     #[test]

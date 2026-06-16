@@ -179,9 +179,16 @@ pub fn paint_display_list(buffer: &mut Buffer, engine: &mut TextEngine, scene: &
                 // Offset = (box_w - run_w) * align, clamped to >= 0 so a box narrower
                 // than the run never shoves ink off the left edge. align 0 => 0
                 // (legacy left-aligned).
+                //
+                // Vertically, the rasterized mask is the *trimmed* ink (its top blank is
+                // removed), so blitting it at the box top leaves the glyphs sitting high
+                // in the line box — visible when text is inside a padded pill. Center the
+                // ink within the `size`-tall line box so a vertically-centered text box
+                // (e.g. a button with `align-items: center`) reads as centered.
+                let vshift = ((*size - glyphs.height as f32) * 0.5).max(0.0);
                 let origin = Point {
                     x: origin.x + align_offset(*box_w, glyphs.width as f32, *align),
-                    y: origin.y,
+                    y: origin.y + vshift,
                 };
                 composite_coverage(
                     buffer,
