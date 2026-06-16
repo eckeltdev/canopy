@@ -1,43 +1,47 @@
 /* Canopy landing — dark, minimal, x.ai-inspired, centered, full-window. Read at
  * runtime; press a key in the window to hot-reload. Flat near-black canvas, near-white
- * ink, muted grays.
- *
- * The stage FILLS the window (width/height 100%) and re-fills on resize. Its
- * `justify-content: space-between` pins the nav to the top and the footer to the bottom
- * with the hero centered in the free space; `align-items: center` centers each row, and
- * `text-align: center` centers the copy within it. */
+ * ink, muted grays. Type sizes are website-typical (nav ~16px, body ~16-18px, a big
+ * display wordmark). */
 
 .stage {
   background: #060608;
   direction: column;
   justify-content: space-between;
   align-items: center;
-  padding: 56px;
+  padding: 60px;
   width: 100%;
   height: 100%;
 }
 
 /* Top nav: full width, brand left, links right. */
 .nav { direction: row; justify-content: space-between; align-items: center; width: 100% }
-.brand { color: #f5f5f7; height: 17px }
-.navlinks { direction: row; gap: 30px; align-items: center }
-.navlink { color: #74747f; height: 14px }
+.brand { color: #f5f5f7; height: 20px }
+.navlinks { direction: row; gap: 34px; align-items: center }
+.navlink { color: #80808b; height: 16px }
 
 /* The centered hero block. */
-.hero { direction: column; align-items: center; gap: 24px }
-.wordmark { color: #f5f5f7; height: 88px; text-align: center }
-.tagline  { color: #cfd0d7; height: 27px; text-align: center }
-.subline  { color: #60606a; height: 15px; text-align: center }
+.hero { direction: column; align-items: center; gap: 28px }
+.wordmark { color: #f5f5f7; height: 104px; text-align: center }
+.tagline  { color: #d2d3da; height: 34px; text-align: center }
+.subline  { color: #74747f; height: 17px; text-align: center }
 
 /* A thin accent rule that draws itself in (its width is animated). */
-.rule { background: #2e2e36; height: 2px; border-radius: 1px; width: 300px }
+.rule { background: #2e2e36; height: 2px; border-radius: 1px; width: 340px }
 
 /* A row of dots that pulse in an ambient wave (opacity ping-pongs). */
-.dotrow { direction: row; gap: 16px; align-items: center; padding: 2px }
-.dot { background: #f5f5f7; width: 8px; height: 8px; border-radius: 4px }
+.dotrow { direction: row; gap: 18px; align-items: center; padding: 4px }
+.dot { background: #f5f5f7; width: 9px; height: 9px; border-radius: 5px }
 
-/* Footer: a bright CTA pill above a muted status line, centered. */
-.footer { direction: column; align-items: center; gap: 14px }
-.cta { background: #f5f5f7; direction: row; padding: 14px; border-radius: 9px }
-.cta-text { color: #060608; height: 16px }
-.status { color: #4a4a52; height: 14px; text-align: center }
+/* Footer: a bright CTA pill above a muted status line, centered. The pill centers its
+ * label with flexbox (justify/align center) and the label is text-align: center too. */
+.footer { direction: column; align-items: center; gap: 18px }
+.cta {
+  background: #f5f5f7;
+  direction: row;
+  justify-content: center;
+  align-items: center;
+  padding: 16px;
+  border-radius: 11px;
+}
+.cta-text { color: #060608; height: 18px; text-align: center }
+.status { color: #50505a; height: 16px; text-align: center }

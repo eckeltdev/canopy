@@ -43,14 +43,16 @@
  * `height` (via the text node default) sets the glyph size; padding gives the
  * chunky, rounded look. */
 .card { background: #313244; direction: column; gap: 14px; padding: 24px; border-radius: 12px; width: 520px }
-.btn  { background: #45475a; color: #cdd6f4; padding: 14px; border-radius: 8px }
+/* The counter button is a full-width block; flexbox `align-items: center` (cross axis)
+ * + `justify-content: center` (main axis) center its content-sized label box. */
+.btn  { background: #45475a; color: #cdd6f4; padding: 14px; border-radius: 8px; align-items: center; justify-content: center }
 /* :hover lightens the button under the pointer (driven live by the windowed host). */
 .btn:hover { background: #585b70 }
 .hint { color: #6c7086; height: 18px }
 
 /* --- Footer pills/links --- */
 .footer { direction: row; gap: 12px; padding: 4px }
-.pill { background: #313244; color: #9399b2; padding: 12px; border-radius: 8px }
+.pill { background: #313244; color: #9399b2; padding: 12px; border-radius: 8px; align-items: center; justify-content: center }
 .pill:hover { background: #585b70 }
 /* GitHub pill text is blue; it shares `.pill` for the rounded surface + hover. */
 .pill-link { color: #89b4fa }

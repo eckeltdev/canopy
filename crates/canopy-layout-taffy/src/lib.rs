@@ -48,11 +48,7 @@ use taffy::{
     Rect as TaffyRect, Size as TaffySize, Style, TaffyTree,
 };
 
-/// Baked-font cell advance at scale 1, in pixels.
-const TEXT_ADVANCE: u32 = 8;
-/// Baked-font cell height the renderer rasterizes at scale 1.
-const TEXT_CELL: u32 = 8;
-/// Default text cell height when no [`HEIGHT`] is set.
+/// Default text size (px) when no [`HEIGHT`] is set.
 const TEXT_HEIGHT: u32 = 16;
 /// Default foreground ink (light gray) when no [`FG`] is set.
 const DEFAULT_FG: Color = Color {
@@ -99,10 +95,23 @@ fn style_radius(dom: &Dom, node: NodeId) -> f32 {
 /// renderer applies it against its own measured run width — so a centered text node
 /// renders its glyphs centered within the box Taffy laid out for it.
 fn style_text_align(dom: &Dom, node: NodeId) -> f32 {
-    match dom.style(node, TEXT_ALIGN) {
-        Some("center") => 0.5,
-        Some("right") => 1.0,
-        _ => 0.0,
+    // `text-align` INHERITS, like CSS: a text node with no `text-align` of its own takes
+    // its nearest ancestor's. This is what lets `.btn { text-align: center }` center a
+    // button's text even though that text is an internal, unclassed label child the
+    // author never named. Walk up until a node sets it (or we run out of ancestors).
+    let mut id = node;
+    loop {
+        if let Some(v) = dom.style(id, TEXT_ALIGN) {
+            return match v {
+                "center" => 0.5,
+                "right" => 1.0,
+                _ => 0.0,
+            };
+        }
+        match dom.node(id).and_then(|n| n.parent) {
+            Some(parent) if parent != ROOT => id = parent,
+            _ => return 0.0,
+        }
     }
 }
 
@@ -222,19 +231,24 @@ fn style_justify(dom: &Dom, id: NodeId) -> Option<JustifyContent> {
     }
 }
 
-/// Baked-font fixed pixel size for a text leaf: `scale = max(1, height_px / 8)`,
-/// `width = chars * 8 * scale`, `height = 8 * scale`. Integer math throughout —
-/// the same metrics `canopy-paint` uses, so the two engines agree on text size.
+/// Layout size of a text leaf: its **height is the requested font size in px**
+/// (`height` style, default [`TEXT_HEIGHT`]) — NOT snapped to the 8px baked cell, so a
+/// `height: 15` run renders at a real 15px on the capable (parley) tier instead of
+/// collapsing to 8px. The capable renderer rasterizes at exactly this size; the
+/// constrained baked renderer floors it to its nearest 8px scale internally.
+///
+/// Width is an estimate: a monospace advance proportional to the size (the bundled
+/// DejaVu Sans Mono advances ≈ `0.6 em`). It is only a layout slot — the renderer
+/// measures the real run, and `text-align` absorbs any slack between this box and the
+/// drawn glyphs — so an over/under estimate shifts neighbors slightly but never
+/// mis-centers the text.
 fn text_size(dom: &Dom, id: NodeId, text: &str) -> Size {
-    let requested_px = style_px(dom, id, HEIGHT).unwrap_or(TEXT_HEIGHT);
-    let scale = (requested_px / TEXT_CELL).max(1);
-    let h = TEXT_CELL * scale;
-    let advance = TEXT_ADVANCE * scale;
-    let w = style_px(dom, id, WIDTH).unwrap_or(text.chars().count() as u32 * advance);
-    Size {
-        w: w as f32,
-        h: h as f32,
-    }
+    let h = style_px(dom, id, HEIGHT).unwrap_or(TEXT_HEIGHT) as f32;
+    let advance = h * 0.6;
+    let w = style_px(dom, id, WIDTH)
+        .map(|w| w as f32)
+        .unwrap_or(text.chars().count() as f32 * advance);
+    Size { w, h }
 }
 
 /// Whether `rect` contains `point` (top/left inclusive, bottom/right exclusive).
@@ -775,15 +789,16 @@ mod tests {
         e.append(ROOT, col);
         let t = e.create_text("ab"); // 2 chars
         e.append(col, t);
-        e.set_inline_style(t, HEIGHT, "20"); // 20/8 = scale 2 -> 16px tall
+        e.set_inline_style(t, HEIGHT, "20"); // a real 20px run (no 8px snapping)
         e.set_inline_style(t, FG, "#ffd040");
 
         let dom = dom_from(e);
         let (scene, lay) = layout(&dom, Size { w: 100.0, h: 50.0 });
 
-        // Baked-font metrics: scale = 20/8 = 2 -> 2 chars * 8 * 2 = 32 wide, 16 tall.
+        // Height is the requested 20px exactly; width is the proportional estimate
+        // (2 chars * 20 * 0.6 = 24).
         let t_rect = lay.rects.iter().find(|(id, _)| *id == t).unwrap().1;
-        assert_eq!(t_rect.size, Size { w: 32.0, h: 16.0 });
+        assert_eq!(t_rect.size, Size { w: 24.0, h: 20.0 });
 
         // The text leaf emits a Text run carrying the content, foreground, and the
         // snapped cell height.
@@ -807,7 +822,7 @@ mod tests {
                 a: 255
             }
         );
-        assert_eq!(text_item.2, 16.0);
+        assert_eq!(text_item.2, 20.0, "the run's size is the requested 20px");
     }
 
     #[test]
