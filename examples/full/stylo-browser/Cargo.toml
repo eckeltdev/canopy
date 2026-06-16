@@ -9,16 +9,22 @@ default-run = "canopy-full-stylo-browser"
 
 # Standalone, excluded from the core workspace (it depends on the heavy, std-only
 # canopy-style-stylo). From this directory:
-#   cargo +nightly run                                       # the live window (hot-reloads page.html)
-#   cargo +nightly run --no-default-features --bin render    # a still -> PPM
+#   cargo +nightly run                                            # the live window (hot-reloads page.html)
+#   cargo +nightly run --no-default-features --bin render         # a still -> PPM (CPU)
+#   cargo +nightly run --features gpu --bin gpu_render            # a still -> PPM (GPU/Metal)
 
 [dependencies]
-# The full-tier StyleEngine: real Stylo HTML parse + cascade + layout + paint.
+# The full-tier StyleEngine: real Stylo HTML parse + cascade + layout + paint, plus
+# `StyloEngine::build_display_list` (the backend-neutral DisplayList the GPU path eats).
 canopy-style-stylo = { path = "../../../crates/canopy-style-stylo" }
 # The flat PAL types (Size/Color) that cross the engine boundary.
 canopy-traits = { path = "../../../crates/canopy-traits" }
 # The lite CPU software rasterizer whose Buffer the engine renders into.
 canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+# The GPU (wgpu -> Metal) rasterizer for the `gpu_render` bin: takes the same
+# DisplayList and rasterizes it offscreen, reading back RGBA. Optional (the CPU `render`
+# bin and the window do not need it), so the default build stays light.
+canopy-render-vello = { path = "../../../crates/canopy-render-vello", optional = true }
 
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
@@ -26,6 +32,8 @@ softbuffer = { version = "0.4", optional = true }
 [features]
 default = ["window"]
 window = ["dep:winit", "dep:softbuffer"]
+# The GPU render path: pulls in canopy-render-vello (wgpu) for the `gpu_render` bin.
+gpu = ["dep:canopy-render-vello"]
 
 [lib]
 path = "src/lib.rs"
@@ -38,6 +46,14 @@ path = "src/bin/render.rs"
 name = "canopy-full-stylo-browser"
 path = "src/bin/window.rs"
 required-features = ["window"]
+
+# The headless GPU still: build the Stylo page's DisplayList and rasterize it on the
+# GPU (Metal on this Mac) via canopy-render-vello, writing a PPM. Behind the `gpu`
+# feature so the default build never pulls wgpu.
+[[bin]]
+name = "gpu_render"
+path = "src/bin/gpu_render.rs"
+required-features = ["gpu"]
 
 # Pin the workspace boundary (standalone example; own lockfile).
 [workspace]

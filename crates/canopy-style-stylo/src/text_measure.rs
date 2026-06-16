@@ -84,8 +84,16 @@ static FONTS: Mutex<Option<FontSystem>> = Mutex::new(None);
 /// * `known_dimensions` — if `width` is `Some`, wrap to it (multi-line);
 ///   otherwise lay out a single un-wrapped line. A known `height` is returned
 ///   verbatim (the caller already decided it).
-/// * `available_space` — unused for the smoke path; a definite width arrives via
-///   `known_dimensions` from Taffy when the parent constrains the leaf.
+/// * `available_space` — intentionally NOT consulted to pick a wrap width. The
+///   CSS `min-/max-/fit-content` *keywords* are resolved up-front in the layout
+///   pass via [`intrinsic_width`], so this closure stays a faithful single-line
+///   measurer: wrapping is driven ONLY by an explicit `known_dimensions.width`.
+///   This matters because Taffy's own grid/flex auto-track sizing probes leaves
+///   with both `MinContent` and `MaxContent` available space and a `None` known
+///   width; honoring those here (e.g. wrapping to a definite available width, or
+///   collapsing to widest-word under `MinContent`) changes the measured height
+///   and regresses auto-track baseline/alignment reftests that depend on the
+///   single-line content contribution.
 ///
 /// Height is `line_height * line_count` with `line_height == font_size`, so a
 /// single line of Ahem text at 20px is exactly 20px tall.
@@ -141,6 +149,72 @@ pub fn measure_text(
     taffy::Size {
         width: known_dimensions.width.unwrap_or(width),
         height: known_dimensions.height.unwrap_or(height),
+    }
+}
+
+/// Shape `text` as a SINGLE un-wrapped line and return its advance width, in CSS
+/// pixels. The primitive both the intrinsic helpers and (indirectly) the measure
+/// closure build on. Standalone (no `available_space` branch) so callers from
+/// inside [`measure_text`] cannot recurse.
+fn single_line_width(text: &str, px: f32, family: &str) -> f32 {
+    if text.is_empty() || px <= 0.0 {
+        return 0.0;
+    }
+    let mut guard = FONTS.lock().expect("text-measure font system poisoned");
+    let font_system = guard.get_or_insert_with(build_font_system);
+
+    let metrics = Metrics::new(px, px);
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(font_system, None, None); // no wrap: one line
+
+    let fam = if family.is_empty() {
+        Family::Name(SANS_FAMILY)
+    } else {
+        Family::Name(family)
+    };
+    let attrs = Attrs::new().family(fam);
+    buffer.set_text(font_system, text, &attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+
+    let mut width = 0.0f32;
+    for run in buffer.layout_runs() {
+        width = width.max(run.line_w);
+    }
+    width
+}
+
+/// The widest unbreakable run (longest word) of `ctx.text`, in CSS pixels.
+///
+/// Soft-wrap opportunities in CSS are (at minimum) ASCII whitespace, so the
+/// widest unbreakable run is the widest whitespace-delimited word, each measured
+/// as its own un-wrapped line. This is the CSS **min-content** inline size.
+///
+/// We compute it by measuring words directly rather than asking cosmic-text to
+/// wrap to width 0.0 — a zero-width wrap breaks at every *glyph*, which both
+/// collapses the width to a single character and inflates the line count.
+fn widest_word_width(ctx: &MeasureContext) -> f32 {
+    let mut widest = 0.0f32;
+    for word in ctx.text.split_whitespace() {
+        widest = widest.max(single_line_width(word, ctx.font_size.max(0.0), &ctx.family));
+    }
+    widest
+}
+
+/// Pre-resolve the intrinsic content *width* of a text leaf, in CSS pixels.
+///
+/// Used by the layout pass to honor the CSS `min-content` / `max-content`
+/// keywords on the inline axis. Taffy 0.11 cannot represent these keywords, and a
+/// block child with an `auto` width is *stretched* to fill its container rather
+/// than sized to content — so the layout pass calls this to compute a definite
+/// width and pins it into the taffy style as a fixed length.
+///
+/// * `min_content == true`  -> widest unbreakable run (longest word).
+/// * `min_content == false` -> single un-wrapped line (max-content).
+pub fn intrinsic_width(ctx: &MeasureContext, min_content: bool) -> f32 {
+    if min_content {
+        widest_word_width(ctx)
+    } else {
+        single_line_width(&ctx.text, ctx.font_size.max(0.0), &ctx.family)
     }
 }
 
@@ -206,6 +280,38 @@ mod tests {
             (size.height - 20.0).abs() <= 2.0,
             "height should be ~20, got {}",
             size.height
+        );
+    }
+
+    /// max-content: "XX YY" at 20px Ahem is one un-wrapped line of 5 glyphs = 100px.
+    #[test]
+    fn max_content_single_line() {
+        let ctx = MeasureContext {
+            text: "XX YY".to_string(),
+            font_size: 20.0,
+            family: AHEM_FAMILY.to_string(),
+        };
+        let w = intrinsic_width(&ctx, false);
+        println!("max-content width = {w}");
+        assert!(
+            (w - 100.0).abs() <= 2.0,
+            "max-content should be ~100 (5 glyphs @ 20px), got {w}"
+        );
+    }
+
+    /// min-content: "XX YY" at 20px Ahem collapses to the widest word = 2 glyphs = 40px.
+    #[test]
+    fn min_content_widest_word() {
+        let ctx = MeasureContext {
+            text: "XX YY".to_string(),
+            font_size: 20.0,
+            family: AHEM_FAMILY.to_string(),
+        };
+        let w = intrinsic_width(&ctx, true);
+        println!("min-content width = {w}");
+        assert!(
+            (w - 40.0).abs() <= 2.0,
+            "min-content should be ~40 (widest word, 2 glyphs @ 20px), got {w}"
         );
     }
 

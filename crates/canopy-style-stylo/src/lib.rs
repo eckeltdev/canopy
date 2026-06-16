@@ -104,6 +104,9 @@ use style_dom::ElementState;
 use canopy_protocol::NodeId;
 use canopy_traits::{Color, ComputedStyle, Display, HostError, StyleEngine};
 
+/// Build a backend-neutral [`canopy_traits::DisplayList`] from the cascaded +
+/// laid-out tree (the GPU/retained-scene sibling of [`paint`]).
+pub mod display_list;
 /// Parse real HTML into the arena [`Document`] (html5ever -> arena).
 pub mod html;
 /// L3 paint: rasterize the cascaded + laid-out tree to pixels.
@@ -1450,6 +1453,25 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
     // straight f32 in [0,1]). Clamp defensively.
     let opacity = style.get_effects().opacity.clamp(0.0, 1.0);
 
+    // font-family: is the FIRST family "Ahem" (case-insensitive)? Ahem is the
+    // metrics-perfect WPT test font (every glyph is a solid 1em square). A renderer
+    // without a real Ahem face draws each char as a filled `font_size` square in the
+    // foreground color; this flag lets it do so without re-consulting Stylo. We read
+    // the same first `FamilyName` the layout's text-measure context uses, so paint
+    // and measurement agree on which elements are Ahem.
+    let is_ahem = style
+        .get_font()
+        .font_family
+        .families
+        .iter()
+        .find_map(|f| match f {
+            style::values::computed::font::SingleFontFamily::FamilyName(name) => {
+                Some(name.name.to_string())
+            }
+            _ => None,
+        })
+        .is_some_and(|name| name.eq_ignore_ascii_case(text_measure::AHEM_FAMILY));
+
     ComputedStyle {
         display,
         color,
@@ -1460,6 +1482,7 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
         border_color,
         border_radius,
         opacity,
+        is_ahem,
     }
 }
 
@@ -1603,6 +1626,39 @@ mod taffy_convert {
             // Anchor positioning is flagged off.
             stylo::Size::AnchorSizeFunction(_) => unreachable!(),
             stylo::Size::AnchorContainingCalcFunction(_) => unreachable!(),
+        }
+    }
+
+    /// A CSS intrinsic-sizing *keyword* requested on the inline (width) axis.
+    ///
+    /// Taffy 0.11's `Dimension` has no `min-/max-/fit-content` variant, so
+    /// [`dimension`] maps these keywords to `AUTO` — and a block child whose width
+    /// is `AUTO` is *stretched* to fill its container, never sized to content. To
+    /// honor the keyword we detect it here and let the layout pass pre-resolve the
+    /// box's content width (via the text measure-fn) into a fixed length, so Taffy
+    /// sees a definite width instead of stretching the leaf.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WidthKeyword {
+        /// Not an intrinsic keyword (a length/percentage/auto/stretch).
+        None,
+        /// `width: min-content` — size to the widest unbreakable run.
+        MinContent,
+        /// `width: max-content` — size to the single unwrapped line.
+        MaxContent,
+        /// `width: fit-content` — `max-content` clamped to the available width.
+        FitContent,
+    }
+
+    /// Classify the inline-axis (width) sizing keyword on a computed style.
+    #[inline]
+    pub fn width_keyword(style: &stylo::ComputedValues) -> WidthKeyword {
+        match style.get_position().width {
+            stylo::Size::MinContent => WidthKeyword::MinContent,
+            stylo::Size::MaxContent => WidthKeyword::MaxContent,
+            stylo::Size::FitContent | stylo::Size::FitContentFunction(_) => {
+                WidthKeyword::FitContent
+            }
+            _ => WidthKeyword::None,
         }
     }
 
@@ -2261,14 +2317,26 @@ impl StyloEngine {
         // also carries a measure context, so it sizes from its shaped text.
         for &slab in &order {
             let cv = self.computed_values_for(slab);
-            let style = cv
+            let mut style = cv
                 .as_ref()
                 .map(|cv| taffy_convert::to_taffy_style(cv))
                 .unwrap_or_default();
 
+            // The inline-axis intrinsic-sizing keyword (`min-/max-/fit-content`),
+            // if any. `to_taffy_style` maps these to `auto` (Taffy 0.11 has no
+            // keyword variant), so we recover the author's intent from the
+            // computed style to size the leaf to content below.
+            let width_kw = cv
+                .as_ref()
+                .map(|cv| taffy_convert::width_keyword(cv))
+                .unwrap_or(taffy_convert::WidthKeyword::None);
+
             let ctx = cv.as_ref().and_then(|cv| {
                 // Only auto-sized leaves measure text: if width or height is set
                 // explicitly, the box geometry is fixed and text never resizes it.
+                // An intrinsic width keyword (`min-/max-/fit-content`) maps to
+                // `auto` here yet still wants content sizing, so it does NOT
+                // disqualify the leaf.
                 if !style.size.width.is_auto() || !style.size.height.is_auto() {
                     return None;
                 }
@@ -2292,6 +2360,26 @@ impl StyloEngine {
                     family,
                 })
             });
+
+            // Honor a `width: min-/max-/fit-content` keyword on a text leaf. Taffy
+            // would otherwise STRETCH this auto-width block child to fill its
+            // container (its `known_dimensions.width` wins over the measured size),
+            // so we pre-resolve the intrinsic content width here and pin it as a
+            // fixed length. `fit-content` == `max-content` clamped to the available
+            // width; with no definite constraint here it collapses to `max-content`.
+            if let (Some(ctx), true) = (
+                ctx.as_ref(),
+                matches!(
+                    width_kw,
+                    taffy_convert::WidthKeyword::MinContent
+                        | taffy_convert::WidthKeyword::MaxContent
+                        | taffy_convert::WidthKeyword::FitContent
+                ),
+            ) {
+                let min_content = width_kw == taffy_convert::WidthKeyword::MinContent;
+                let w = text_measure::intrinsic_width(ctx, min_content);
+                style.size.width = taffy::Dimension::length(w);
+            }
 
             let node = tree
                 .new_leaf_with_context(style, ctx)
@@ -2979,6 +3067,117 @@ mod tests {
             near(b.size.w, 100.0),
             "grid child 1 w should be ~100, got {}",
             b.size.w
+        );
+    }
+
+    #[test]
+    fn layout_absolute_position_top_left() {
+        // A positioned parent (relative, 200x200) containing an absolutely
+        // positioned child `top:10px; left:20px; width:30px; height:30px`.
+        //
+        // Taffy lays out abspos children against the DIRECT parent's padding box
+        // (the area offset is the parent's border width; here zero). With LTR and
+        // a definite left/top, the child's border-box location relative to the
+        // parent's border-box is (left, top) = (20, 10), size 30x30. The parent is
+        // at (0,0), so the child's ABSOLUTE origin is (20, 10).
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:block; width:200px; height:200px");
+            let parent = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(parent, "position:relative; width:200px; height:200px");
+            let child = doc.add_element(parent, "div", None, &[]);
+            doc.set_inline_style(
+                child,
+                "position:absolute; top:10px; left:20px; width:30px; height:30px",
+            );
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 3, "html + relative parent + abspos child");
+
+        let child = rects[2];
+        println!("abspos child box = {child:?}");
+        assert!(
+            near(child.origin.x, 20.0),
+            "abspos child x should be ~20 (left), got {}",
+            child.origin.x
+        );
+        assert!(
+            near(child.origin.y, 10.0),
+            "abspos child y should be ~10 (top), got {}",
+            child.origin.y
+        );
+        assert!(
+            near(child.size.w, 30.0),
+            "abspos child w should be ~30, got {}",
+            child.size.w
+        );
+        assert!(
+            near(child.size.h, 30.0),
+            "abspos child h should be ~30, got {}",
+            child.size.h
+        );
+    }
+
+    #[test]
+    fn layout_max_content_sizes_to_single_line() {
+        // A div `font-family:Ahem; font-size:20px; width:max-content` with text
+        // "XX YY". max-content sizes the box to its single unwrapped line: 5 glyphs
+        // (X X space Y Y) at 20px = 100px wide, 20px tall. The width:max-content
+        // keyword leaves the leaf's width AUTO in the taffy style, so the measure
+        // closure is invoked with AvailableSpace::MaxContent and must return the
+        // unwrapped single-line width.
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            let leaf = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(leaf, "font-family:Ahem; font-size:20px; width:max-content");
+            doc.add_text(leaf, "XX YY");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 2, "html + leaf div");
+        let leaf = rects[1];
+        println!("max-content leaf box = {:?}", leaf.size);
+        assert!(
+            (leaf.size.w - 100.0).abs() <= 2.0,
+            "max-content width should be ~100 (5 Ahem glyphs @ 20px, one line), got {}",
+            leaf.size.w
+        );
+        assert!(
+            (leaf.size.h - 20.0).abs() <= 2.0,
+            "max-content height should be ~20 (one 20px Ahem line), got {}",
+            leaf.size.h
+        );
+    }
+
+    #[test]
+    fn layout_min_content_sizes_to_widest_word() {
+        // A div `font-family:Ahem; font-size:20px; width:min-content` with text
+        // "XX YY". min-content sizes the box to the widest unbreakable run: each
+        // word is 2 glyphs = 40px wide; the box wraps to two lines so it's 40px
+        // wide and 40px tall. The measure closure is invoked with
+        // AvailableSpace::MinContent and must return the longest-word width.
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            let leaf = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(leaf, "font-family:Ahem; font-size:20px; width:min-content");
+            doc.add_text(leaf, "XX YY");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 2, "html + leaf div");
+        let leaf = rects[1];
+        println!("min-content leaf box = {:?}", leaf.size);
+        assert!(
+            (leaf.size.w - 40.0).abs() <= 2.0,
+            "min-content width should be ~40 (widest word, 2 Ahem glyphs @ 20px), got {}",
+            leaf.size.w
         );
     }
 }

@@ -16,7 +16,7 @@
 
 use canopy_render_soft::Buffer;
 use canopy_style_stylo::StyloEngine;
-use canopy_traits::Size;
+use canopy_traits::{DisplayList, Size};
 
 /// Logical window width — the page lays out within this and reflows on resize.
 pub const VIEW_W: usize = 720;
@@ -55,6 +55,22 @@ pub fn build(html: &str) -> StyloEngine {
 #[must_use]
 pub fn render_to_buffer(engine: &mut StyloEngine, w: usize, h: usize) -> Buffer {
     engine.render(Size {
+        w: w.max(1) as f32,
+        h: h.max(1) as f32,
+    })
+}
+
+/// Lower `engine`'s cascaded + laid-out page to a backend-neutral
+/// [`DisplayList`] at a `w` × `h` viewport, via
+/// [`StyloEngine::build_display_list`].
+///
+/// This is the GPU-path counterpart of [`render_to_buffer`]: instead of painting on
+/// the CPU it produces the same [`DisplayList`] shape `canopy-layout-taffy` emits, so
+/// the `gpu_render` bin can hand it straight to the wgpu rasterizer in
+/// `canopy-render-vello`.
+#[must_use]
+pub fn build_display_list(engine: &mut StyloEngine, w: usize, h: usize) -> DisplayList {
+    engine.build_display_list(Size {
         w: w.max(1) as f32,
         h: h.max(1) as f32,
     })

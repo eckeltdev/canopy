@@ -14,12 +14,15 @@
 //!     BOTH test and ref to RGBA buffers (same renderer) and compare:
 //!     reject-blank -> exact-equality -> per-pixel max-channel diff at a threshold.
 //!
-//! Honesty over green: features the engine doesn't model yet (writing-mode,
-//! `position:absolute`, the `min-/max-/fit-content` intrinsic keywords) would
-//! spuriously fail, so we feature-gate those into SKIP buckets (see [`SkipReason`])
-//! — exactly the spirit of Blitz's feature flags. (Text *is* measured now, via the
-//! Ahem font in `canopy-style-stylo`'s `text_measure`, so Ahem tests are run.) The
-//! value is a working harness + an accurate baseline with a clear skip taxonomy.
+//! Honesty over green: only features the engine genuinely cannot model are
+//! feature-gated into SKIP buckets (see [`SkipReason`]) — exactly the spirit of
+//! Blitz's feature flags. Today that is `writing-mode` / vertical flow, which
+//! Taffy 0.11 has no property for (it cannot swap the inline/block axes — see
+//! [`detect_skip`]). Text *is* measured (via the Ahem font in
+//! `canopy-style-stylo`'s `text_measure`), `position:absolute` lays out via
+//! Taffy's abspos engine, and the `min-/max-/fit-content` inline-sizing keyword is
+//! honored for text leaves — so all three are now RUN, not skipped. The value is a
+//! working harness + an accurate baseline with a clear, honest skip taxonomy.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -53,28 +56,25 @@ enum SkipReason {
     NoSupportedAssertion,
     /// On the hand-maintained block list.
     Blocked,
-    /// Uses a CSS intrinsic-sizing keyword (`min-/max-/fit-content`) that sizes a
-    /// box from its contents in a way our Taffy leaf measure doesn't model. (Plain
-    /// Ahem/text sizing IS handled now — only these keywords are skipped.)
-    TextDependent,
-    /// Uses `writing-mode` / vertical flow — Taffy/our mapping doesn't do it.
+    /// Uses `writing-mode` / vertical flow — Taffy 0.11 has no writing-mode
+    /// property, so the inline/block axes cannot be swapped (see [`detect_skip`]).
     WritingMode,
-    /// Uses `position: absolute` / abspos flexbox children — not modeled here.
-    AbsolutePosition,
     /// Uses script beyond a single `checkLayout(...)` call (dynamic DOM/JS).
     Script,
     /// A multi-call `checkLayout` test (we only handle a single selector).
     MultiCheckLayout,
 }
+// NOTE: the former `AbsolutePosition` and `TextDependent` skip buckets were
+// RETIRED: `position:absolute` now lays out via Taffy, and the
+// `min-/max-/fit-content` keyword is honored for text-leaf inline sizing. Both
+// categories are RUN now (they pass/fail on their merits) rather than skipped.
 
 impl SkipReason {
     fn label(self) -> &'static str {
         match self {
             SkipReason::NoSupportedAssertion => "no supported assertion",
             SkipReason::Blocked => "blocked (crash/hang list)",
-            SkipReason::TextDependent => "intrinsic-content keyword (min/max/fit-content)",
             SkipReason::WritingMode => "writing-mode / vertical flow",
-            SkipReason::AbsolutePosition => "position:absolute",
             SkipReason::Script => "script beyond checkLayout",
             SkipReason::MultiCheckLayout => "multiple checkLayout() calls",
         }
@@ -163,7 +163,20 @@ fn collect_tests(suite_dir: &Path) -> Vec<PathBuf> {
 fn detect_skip(src: &str, is_attr: bool) -> Option<SkipReason> {
     let lower = src.to_ascii_lowercase();
 
-    // writing-mode / vertical flow — Taffy mapping doesn't model it.
+    // writing-mode / vertical flow — STILL SKIPPED, and deliberately so.
+    //
+    // Taffy 0.11 has NO `writing_mode` style property: `taffy::Style` only carries
+    // `direction` (LTR/RTL bidi on the inline axis), never a block-axis rotation.
+    // Taffy's own source confirms this is unimplemented — `geometry.rs` hard-codes
+    // `AbstractAxis::is_horizontal()` to always-true with the comment "will change
+    // if Taffy ever implements the writing_mode property", and the flexbox engine
+    // carries several "TODO if/when vertical writing modes are supported" markers.
+    // The `WritingMode` enum that exists only lives in Taffy's internal test
+    // harness, not the public API. So a `vertical-rl`/`vertical-lr` document cannot
+    // have its inline/block axes swapped: forcing a mapping would silently lay the
+    // content out HORIZONTALLY and report wrong geometry (a false pass or a noisy
+    // false fail). Honesty over green — we leave these skipped until the layout
+    // engine gains real writing-mode support.
     if lower.contains("writing-mode")
         || lower.contains("vertical-rl")
         || lower.contains("vertical-lr")
@@ -171,22 +184,30 @@ fn detect_skip(src: &str, is_attr: bool) -> Option<SkipReason> {
         return Some(SkipReason::WritingMode);
     }
 
-    // Absolute positioning — not modeled in our Taffy wiring.
-    if lower.contains("position:absolute") || lower.contains("position: absolute") {
-        return Some(SkipReason::AbsolutePosition);
-    }
+    // Absolute positioning is now RUN, not skipped. `taffy_convert` maps
+    // `position` (absolute/relative/static) and `inset` (top/left/right/bottom),
+    // and Taffy DOES implement abspos layout (`perform_absolute_layout_on_absolute_children`
+    // in both its block and flexbox engines). Verified by the
+    // `layout_absolute_position_top_left` unit test in canopy-style-stylo: a child
+    // `position:absolute; top:10px; left:20px; width:30px; height:30px` lands at
+    // (20,10) sized 30x30 against its parent's padding box. NOTE: Taffy resolves
+    // abspos against the DIRECT parent's padding box, not the nearest *positioned*
+    // ancestor (a known Taffy limitation, shared with Blitz), so deeply-nested
+    // containing-block tests may still FAIL on their merits — but they FAIL
+    // honestly now rather than hiding in a skip bucket.
 
-    // INTRINSIC-content sizing we still can't resolve. We DO measure text now
-    // (the Ahem font is loaded into the layout measure-fn — see canopy-style-stylo's
-    // text_measure module — so Ahem-based tests are run, not skipped), but the CSS
-    // intrinsic sizing *keywords* (`min-/max-/fit-content`) size a box from its
-    // contents in a way Taffy's leaf measure doesn't model here, so those stay skipped.
-    if lower.contains("max-content")
-        || lower.contains("min-content")
-        || lower.contains("fit-content")
-    {
-        return Some(SkipReason::TextDependent);
-    }
+    // INTRINSIC-content sizing is now RUN for the common case. The CSS keywords
+    // `min-content` / `max-content` / `fit-content` on the inline (width) axis of a
+    // TEXT leaf are honored: canopy-style-stylo's layout pass pre-resolves the
+    // content width via the Ahem text measure-fn (max-content = single unwrapped
+    // line; min-content = widest word) and pins it as a fixed length, because
+    // Taffy 0.11 has no intrinsic-keyword `Dimension` and would otherwise stretch
+    // the auto-width block child to fill its container. Verified by the
+    // `layout_max_content_sizes_to_single_line` / `layout_min_content_sizes_to_widest_word`
+    // unit tests. We no longer blanket-skip these: tests that use the keyword in a
+    // way we don't model yet (on `height`, in grid track sizing, on a non-text
+    // box, …) simply FAIL on their merits — which can only ADD passes/fails, never
+    // a regression — instead of being hidden.
 
     // Script beyond checkLayout. For ATTR tests we expect exactly the harness
     // scripts; flag tests that wire up extra behavior via inline event handlers

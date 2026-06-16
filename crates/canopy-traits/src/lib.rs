@@ -109,6 +109,15 @@ pub struct ComputedStyle {
     /// Element opacity in `[0.0, 1.0]`: a straight multiplier applied to every
     /// painted color's alpha. Defaults to `1.0` (fully opaque).
     pub opacity: f32,
+    /// Whether the element's first `font-family` is **Ahem** (case-insensitive).
+    ///
+    /// Ahem is the metrics-perfect WPT test font where every glyph is a solid 1em
+    /// square. A renderer that lacks a real Ahem face (e.g. the baked-bitmap CPU
+    /// path) can honor this flag by drawing each character as a filled `font_size`-
+    /// by-`font_size` square in the foreground `color`, so the painted geometry
+    /// matches what [`measure`](StyleEngine) /
+    /// [`TextEngine`](crate::TextEngine) sized the box to. Defaults to `false`.
+    pub is_ahem: bool,
 }
 
 impl Default for ComputedStyle {
@@ -125,6 +134,8 @@ impl Default for ComputedStyle {
             // Opacity must default to fully-opaque, not 0.0, so a style that
             // never sets it paints normally.
             opacity: 1.0,
+            // Default font-family is not Ahem.
+            is_ahem: false,
         }
     }
 }
