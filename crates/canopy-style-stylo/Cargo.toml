@@ -32,6 +32,9 @@ markup5ever = "0.39.0"                                        # html atoms (Loca
 app_units = "0.7"                                             # Au <-> px
 euclid = "0.22"                                               # viewport Size2D/Scale for the Device
 url = "2"                                                     # UrlExtraData's only public ctor is From<url::Url>
+# Real flex/block layout. We map Stylo's ComputedValues -> taffy::Style (vendored from
+# Blitz's stylo_taffy) and run Taffy, so layout matches a browser for what Taffy supports.
+taffy = { version = "0.11", default-features = false, features = ["std", "flexbox", "block_layout", "taffy_tree"] }
 
 # Pin the workspace boundary (standalone, excluded crate; own lockfile).
 [workspace]

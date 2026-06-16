@@ -22,12 +22,14 @@ use canopy_traits::{Color, ComputedStyle, Display, StyleEngine};
 pub const UA_CSS: &str =
     "div, p, section, header, footer, main, article, h1, h2, h3 { display: block }";
 
-/// A fixture element: a tag, optional id, classes, optional text, and element children.
+/// A fixture element: a tag, optional id, classes, optional inline `style`, optional
+/// text, and element children.
 #[derive(Clone)]
 pub struct El {
     pub tag: &'static str,
     pub id: Option<&'static str>,
     pub classes: Vec<&'static str>,
+    pub style: Option<&'static str>,
     pub text: Option<&'static str>,
     pub kids: Vec<El>,
 }
@@ -38,6 +40,7 @@ pub fn div(classes: &[&'static str], kids: Vec<El>) -> El {
         tag: "div",
         id: None,
         classes: classes.to_vec(),
+        style: None,
         text: None,
         kids,
     }
@@ -49,6 +52,7 @@ pub fn leaf(classes: &[&'static str], text: &'static str) -> El {
         tag: "div",
         id: None,
         classes: classes.to_vec(),
+        style: None,
         text: Some(text),
         kids: vec![],
     }
@@ -60,6 +64,7 @@ pub fn leaf_id(id: &'static str, classes: &[&'static str], text: &'static str) -
         tag: "div",
         id: Some(id),
         classes: classes.to_vec(),
+        style: None,
         text: Some(text),
         kids: vec![],
     }
@@ -71,8 +76,33 @@ pub fn div_id(id: &'static str, classes: &[&'static str], kids: Vec<El>) -> El {
         tag: "div",
         id: Some(id),
         classes: classes.to_vec(),
+        style: None,
         text: None,
         kids,
+    }
+}
+
+/// An inline-styled `<div>` container (for layout fixtures: explicit sizes/flex).
+pub fn bx(style: &'static str, kids: Vec<El>) -> El {
+    El {
+        tag: "div",
+        id: None,
+        classes: vec![],
+        style: Some(style),
+        text: None,
+        kids,
+    }
+}
+
+/// An inline-styled leaf `<div>` (no children).
+pub fn bx_leaf(style: &'static str) -> El {
+    El {
+        tag: "div",
+        id: None,
+        classes: vec![],
+        style: Some(style),
+        text: None,
+        kids: vec![],
     }
 }
 
@@ -87,22 +117,9 @@ pub fn dfs<'a>(root: &'a El, out: &mut Vec<&'a El>) {
 /// Build the fixture into a [`StyloEngine`] arena and resolve every element's
 /// [`ComputedStyle`] through the real Stylo cascade, returned in depth-first order.
 pub fn resolve_stylo(css: &str, root: &El) -> Vec<ComputedStyle> {
-    let full_css = format!("{UA_CSS}\n{css}");
-    let mut engine = StyloEngine::new(&full_css);
-
-    // Build the arena, recording each element's slab id in DFS order.
+    let mut engine = StyloEngine::new(&format!("{UA_CSS}\n{css}"));
     let mut ids: Vec<usize> = Vec::new();
-    fn build(doc: &mut canopy_style_stylo::Document, parent: usize, el: &El, ids: &mut Vec<usize>) {
-        let id = doc.add_element(parent, el.tag, el.id, &el.classes);
-        ids.push(id);
-        if let Some(t) = el.text {
-            doc.add_text(id, t);
-        }
-        for k in &el.kids {
-            build(doc, id, k, ids);
-        }
-    }
-    build(engine.document_mut(), 0, root, &mut ids);
+    build_arena(engine.document_mut(), 0, root, &mut ids);
 
     engine.resolve_styles();
     ids.iter()
@@ -114,37 +131,56 @@ pub fn resolve_stylo(css: &str, root: &El) -> Vec<ComputedStyle> {
         .collect()
 }
 
+/// Build the fixture into a [`StyloEngine`] arena, run real Stylo→Taffy **layout** at
+/// `viewport`, and return each element's absolute border box in DFS order (the same order
+/// [`resolve_stylo`] and the browser's `data-testid` use).
+pub fn resolve_layout_stylo(css: &str, root: &El, viewport: (u32, u32)) -> Vec<LayoutBox> {
+    let mut engine = StyloEngine::new(&format!("{UA_CSS}\n{css}"));
+    let mut ids: Vec<usize> = Vec::new();
+    build_arena(engine.document_mut(), 0, root, &mut ids);
+
+    let rects = engine.layout(canopy_traits::Size {
+        w: viewport.0 as f32,
+        h: viewport.1 as f32,
+    });
+    rects
+        .into_iter()
+        .map(|r| LayoutBox {
+            x: r.origin.x,
+            y: r.origin.y,
+            w: r.size.w,
+            h: r.size.h,
+        })
+        .collect()
+}
+
+/// Recursively build the `El` tree into the arena, recording each element's slab id in
+/// DFS (pre-order) order — the order both resolve + layout return values follow.
+fn build_arena(
+    doc: &mut canopy_style_stylo::Document,
+    parent: usize,
+    el: &El,
+    ids: &mut Vec<usize>,
+) {
+    let id = doc.add_element(parent, el.tag, el.id, &el.classes);
+    ids.push(id);
+    if let Some(s) = el.style {
+        doc.set_inline_style(id, s);
+    }
+    if let Some(t) = el.text {
+        doc.add_text(id, t);
+    }
+    for k in &el.kids {
+        build_arena(doc, id, k, ids);
+    }
+}
+
 /// Render the fixture as a standalone HTML page that, on load, computes
 /// `getComputedStyle` for every `data-testid` element and writes a JSON array (indexed by
 /// testid) into `document.body`'s `data-result` attribute — extractable via Chrome's
 /// `--dump-dom`.
 pub fn fixture_html(css: &str, root: &El) -> String {
-    let mut body = String::new();
-    let mut idx = 0usize;
-    fn emit(el: &El, idx: &mut usize, out: &mut String) {
-        let id_attr = el.id.map(|i| format!(" id=\"{i}\"")).unwrap_or_default();
-        let class_attr = if el.classes.is_empty() {
-            String::new()
-        } else {
-            format!(" class=\"{}\"", el.classes.join(" "))
-        };
-        let testid = *idx;
-        *idx += 1;
-        let _ = write!(
-            out,
-            "<{tag} data-testid=\"{testid}\"{id_attr}{class_attr}>",
-            tag = el.tag
-        );
-        if let Some(t) = el.text {
-            out.push_str(t);
-        }
-        for k in &el.kids {
-            emit(k, idx, out);
-        }
-        let _ = write!(out, "</{}>", el.tag);
-    }
-    emit(root, &mut idx, &mut body);
-
+    let body = render_body(root);
     // The reporter: collect getComputedStyle for each testid into an array, stash it.
     let reporter = r#"
     var nodes = Array.from(document.querySelectorAll('[data-testid]'));
@@ -160,6 +196,62 @@ pub fn fixture_html(css: &str, root: &El) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf8\"><style>{css}</style></head><body>{body}<script>{reporter}</script></body></html>"
     )
+}
+
+/// Like [`fixture_html`] but reports each element's **`getBoundingClientRect`** (border
+/// box, viewport coords). A margin/padding reset zeroes the body offset so the root
+/// content box starts at `(0, 0)`, matching our Taffy root's origin.
+pub fn fixture_html_layout(css: &str, root: &El) -> String {
+    let body = render_body(root);
+    let reporter = r#"
+    var nodes = Array.from(document.querySelectorAll('[data-testid]'));
+    var res = [];
+    nodes.forEach(function(n) {
+        var i = parseInt(n.getAttribute('data-testid'), 10);
+        var r = n.getBoundingClientRect();
+        res[i] = { x: r.x, y: r.y, w: r.width, h: r.height };
+    });
+    document.body.setAttribute('data-result', JSON.stringify(res));
+    "#;
+
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf8\"><style>html,body{{margin:0;padding:0;border:0}} {css}</style></head><body>{body}<script>{reporter}</script></body></html>"
+    )
+}
+
+/// Render the element tree to HTML with per-element `data-testid` (DFS order), used by
+/// both the cascade and layout pages.
+fn render_body(root: &El) -> String {
+    let mut body = String::new();
+    let mut idx = 0usize;
+    fn emit(el: &El, idx: &mut usize, out: &mut String) {
+        let id_attr = el.id.map(|i| format!(" id=\"{i}\"")).unwrap_or_default();
+        let class_attr = if el.classes.is_empty() {
+            String::new()
+        } else {
+            format!(" class=\"{}\"", el.classes.join(" "))
+        };
+        let style_attr = el
+            .style
+            .map(|s| format!(" style=\"{s}\""))
+            .unwrap_or_default();
+        let testid = *idx;
+        *idx += 1;
+        let _ = write!(
+            out,
+            "<{tag} data-testid=\"{testid}\"{id_attr}{class_attr}{style_attr}>",
+            tag = el.tag
+        );
+        if let Some(t) = el.text {
+            out.push_str(t);
+        }
+        for k in &el.kids {
+            emit(k, idx, out);
+        }
+        let _ = write!(out, "</{}>", el.tag);
+    }
+    emit(root, &mut idx, &mut body);
+    body
 }
 
 /// A browser-resolved style for one element (the subset we compare).
@@ -195,33 +287,7 @@ pub fn find_chrome() -> Option<String> {
 /// Render the fixture in headless Chrome and return each element's computed style (in
 /// `data-testid`/DFS order). `None` if Chrome isn't available or the run failed.
 pub fn resolve_browser(chrome: &str, css: &str, root: &El) -> Option<Vec<BrowserStyle>> {
-    let html = fixture_html(css, root);
-    // Write to a unique-ish temp file (no Date/rand in tests — use the html length + a salt).
-    let path = std::env::temp_dir().join(format!("canopy_oracle_{}.html", html.len()));
-    std::fs::write(&path, &html).ok()?;
-
-    let out = std::process::Command::new(chrome)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--hide-scrollbars",
-            "--force-device-scale-factor=1",
-            "--virtual-time-budget=4000",
-            "--dump-dom",
-        ])
-        .arg(format!("file://{}", path.display()))
-        .output()
-        .ok()?;
-    let dom = String::from_utf8_lossy(&out.stdout);
-
-    // Extract data-result="..." (the value is HTML-attribute-encoded: " -> &quot;).
-    let needle = "data-result=\"";
-    let start = dom.find(needle)? + needle.len();
-    let rest = &dom[start..];
-    let end = rest.find('"')?;
-    let encoded = &rest[..end];
-    let json = html_decode(encoded);
+    let json = chrome_json(chrome, &fixture_html(css, root), None)?;
 
     // Hand-parse the small JSON array. The values (rgb()/px/keywords) never contain `"`,
     // `{`, or `}`, so splitting objects on `},{` and reading `"key":"value"` is exact and
@@ -386,4 +452,151 @@ pub fn fixtures() -> Vec<(&'static str, &'static str, El)> {
             div(&["app"], vec![leaf(&["child"], "c")]),
         ),
     ]
+}
+
+// ===========================================================================
+// Layout oracle (L2): box geometry vs the browser's getBoundingClientRect.
+// ===========================================================================
+
+/// A laid-out border box (absolute, viewport coords) — how both our engine and the
+/// browser report a node's geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Lay the fixture out in headless Chrome and read each element's `getBoundingClientRect`
+/// (DFS order), at the given `viewport` window size. `None` if Chrome fails.
+pub fn resolve_browser_layout(
+    chrome: &str,
+    css: &str,
+    root: &El,
+    viewport: (u32, u32),
+) -> Option<Vec<LayoutBox>> {
+    let json = chrome_json(chrome, &fixture_html_layout(css, root), Some(viewport))?;
+    let mut boxes = Vec::new();
+    for obj in split_objects(&json) {
+        boxes.push(LayoutBox {
+            x: field_num(obj, "x")?,
+            y: field_num(obj, "y")?,
+            w: field_num(obj, "w")?,
+            h: field_num(obj, "h")?,
+        });
+    }
+    Some(boxes)
+}
+
+/// Compare two boxes within `tol` px; returns human-readable mismatches.
+pub fn diff_box(ours: LayoutBox, browser: LayoutBox, tol: f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, a, b) in [
+        ("x", ours.x, browser.x),
+        ("y", ours.y, browser.y),
+        ("w", ours.w, browser.w),
+        ("h", ours.h, browser.h),
+    ] {
+        if (a - b).abs() > tol {
+            out.push(format!("{name}: ours {a} vs browser {b}"));
+        }
+    }
+    out
+}
+
+/// Layout fixtures: explicit-size / flex trees (no text-content-dependent sizing, so the
+/// geometry is font-independent and comparable to the browser). `(name, css, tree,
+/// viewport)`.
+pub fn layout_fixtures() -> Vec<(&'static str, &'static str, El, (u32, u32))> {
+    vec![
+        (
+            "flex_row_grow",
+            "",
+            bx(
+                "display:flex; width:200px; height:100px",
+                vec![
+                    bx_leaf("flex:1 1 0; height:100px"),
+                    bx_leaf("flex:1 1 0; height:100px"),
+                ],
+            ),
+            (400, 300),
+        ),
+        (
+            "block_padding",
+            "",
+            bx(
+                "width:300px; padding:20px",
+                vec![bx_leaf("width:100px; height:40px")],
+            ),
+            (400, 300),
+        ),
+        (
+            "justify_center",
+            "",
+            bx(
+                "display:flex; justify-content:center; width:200px; height:50px",
+                vec![bx_leaf("width:40px; height:50px")],
+            ),
+            (400, 300),
+        ),
+        (
+            "margin_left",
+            "",
+            bx(
+                "width:300px; height:60px",
+                vec![bx_leaf("width:50px; height:30px; margin-left:30px")],
+            ),
+            (400, 300),
+        ),
+    ]
+}
+
+/// Run headless Chrome on `html`, returning the decoded JSON it stashed in
+/// `body[data-result]`. Optional `window` size in CSS px.
+fn chrome_json(chrome: &str, html: &str, window: Option<(u32, u32)>) -> Option<String> {
+    let path = html_path(html);
+    std::fs::write(&path, html).ok()?;
+    let mut cmd = std::process::Command::new(chrome);
+    cmd.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--hide-scrollbars",
+        "--force-device-scale-factor=1",
+        "--virtual-time-budget=4000",
+        "--dump-dom",
+    ]);
+    if let Some((w, h)) = window {
+        cmd.arg(format!("--window-size={w},{h}"));
+    }
+    let out = cmd
+        .arg(format!("file://{}", path.display()))
+        .output()
+        .ok()?;
+    let dom = String::from_utf8_lossy(&out.stdout);
+    // Extract data-result="..." (the value is HTML-attribute-encoded: " -> &quot;).
+    let needle = "data-result=\"";
+    let start = dom.find(needle)? + needle.len();
+    let rest = &dom[start..];
+    let end = rest.find('"')?;
+    Some(html_decode(&rest[..end]))
+}
+
+/// Content-addressed temp path, so parallel test threads never collide on the same file.
+fn html_path(html: &str) -> std::path::PathBuf {
+    let mut h: u64 = 5381;
+    for b in html.bytes() {
+        h = h.wrapping_mul(33) ^ b as u64;
+    }
+    std::env::temp_dir().join(format!("canopy_oracle_{h:016x}.html"))
+}
+
+/// Read a numeric field `"key":<number>` out of one object substring.
+fn field_num(obj: &str, key: &str) -> Option<f32> {
+    let pat = format!("\"{key}\":");
+    let start = obj.find(&pat)? + pat.len();
+    let rest = &obj[start..];
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim().parse::<f32>().ok()
 }

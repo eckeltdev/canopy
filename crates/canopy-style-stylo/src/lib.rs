@@ -9,6 +9,12 @@
 //! specificity, no tree inheritance); both satisfy the same trait, which is exactly the
 //! tiered `StyleEngine` design the core documents.
 //!
+//! It also runs real **layout**: [`StyloEngine::layout`] maps each element's resolved
+//! `ComputedValues` to a [`taffy::Style`] (the [`taffy_convert`] module, vendored from
+//! Blitz's `stylo_taffy`) and runs Taffy's flex/block engine, so box geometry matches a
+//! browser for what Taffy supports. (The crate's tests check both the cascade and the
+//! layout against a real browser — `getComputedStyle` and `getBoundingClientRect`.)
+//!
 //! ## How it works
 //!
 //! Stylo's cascade matches selectors against a DOM that implements Stylo's own traits
@@ -1372,6 +1378,534 @@ impl StyleEngine for StyloEngine {
 }
 
 // ===========================================================================
+// taffy_convert: Stylo `ComputedValues` -> `taffy::Style`.
+//
+// Adapted from Blitz's `packages/stylo_taffy/src/convert.rs` (public entry
+// `to_taffy_style`). Blitz targets taffy `0.11.0-experimental-cache-fix.3`;
+// stable taffy 0.11.0 ships a structurally identical `Style<S>` so the port is
+// nearly verbatim. Differences from Blitz:
+//   * `stylo::` alias -> `style::` (the crate is renamed `style` here).
+//   * We use the DEFAULT `taffy::Style` (custom-ident = String) instead of
+//     `Style<Atom>`, because GRID is omitted (no NamedLine/NamedSpan), so no
+//     Atom generic is needed anywhere.
+//   * GRID + FLOAT properties are omitted entirely (those taffy features are
+//     off). FLEX + BLOCK + the full box-model subset are ported thoroughly.
+//   * `text_align` is set to the taffy default (`Auto`); we don't read stylo's
+//     `text_align` because none of our flex/block geometry tests depend on it
+//     and the accessor mapping isn't needed for the subset under test.
+// ===========================================================================
+
+mod taffy_convert {
+    //! Conversion from Stylo computed style to `taffy::Style` (flex + block).
+
+    /// Stylo type aliases (Blitz names these `stylo::*`; the crate is `style`).
+    mod stylo {
+        pub(crate) use style::properties::generated::longhands::box_sizing::computed_value::T as BoxSizing;
+        pub(crate) use style::properties::longhands::aspect_ratio::computed_value::T as AspectRatio;
+        pub(crate) use style::properties::longhands::position::computed_value::T as Position;
+        pub(crate) use style::properties::ComputedValues;
+        pub(crate) use style::values::computed::length_percentage::Unpacked as UnpackedLengthPercentage;
+        pub(crate) use style::values::computed::{BorderSideWidth, LengthPercentage, Percentage};
+        pub(crate) use style::values::generics::length::{
+            GenericLengthPercentageOrNormal, GenericMargin, GenericMaxSize, GenericSize,
+        };
+        pub(crate) use style::values::generics::position::{Inset as GenericInset, PreferredRatio};
+        pub(crate) use style::values::generics::NonNegative;
+        pub(crate) use style::values::specified::align::{AlignFlags, ContentDistribution};
+        pub(crate) use style::values::specified::border::BorderStyle;
+        pub(crate) use style::values::specified::box_::{
+            Display, DisplayInside, DisplayOutside, Overflow,
+        };
+
+        pub(crate) type MarginVal = GenericMargin<LengthPercentage>;
+        pub(crate) type InsetVal = GenericInset<Percentage, LengthPercentage>;
+        pub(crate) type Size = GenericSize<NonNegative<LengthPercentage>>;
+        pub(crate) type MaxSize = GenericMaxSize<NonNegative<LengthPercentage>>;
+        pub(crate) type Gap = GenericLengthPercentageOrNormal<NonNegative<LengthPercentage>>;
+
+        // direction longhand
+        pub(crate) use style::properties::generated::longhands::direction::computed_value::T as Direction;
+
+        // flexbox
+        pub(crate) use style::computed_values::{
+            flex_direction::T as FlexDirection, flex_wrap::T as FlexWrap,
+        };
+        pub(crate) use style::values::generics::flex::GenericFlexBasis;
+        pub(crate) type FlexBasis = GenericFlexBasis<Size>;
+    }
+
+    use taffy::style_helpers::*;
+
+    #[inline]
+    pub fn length_percentage(val: &stylo::LengthPercentage) -> taffy::LengthPercentage {
+        match val.unpack() {
+            // Blitz forwards stylo's calc pointer into taffy via
+            // `CompactLength::calc` + `LengthPercentage::from_raw`, which require
+            // taffy's non-default `calc` feature. We don't enable it (no
+            // `calc()` in the flex/block subset under test), so calc collapses to
+            // zero. Enable `taffy/calc` and restore the pointer path to support
+            // `calc()`.
+            stylo::UnpackedLengthPercentage::Calc(_calc_ptr) => zero(),
+            stylo::UnpackedLengthPercentage::Length(len) => length(len.px()),
+            stylo::UnpackedLengthPercentage::Percentage(percentage) => percent(percentage.0),
+        }
+    }
+
+    #[inline]
+    pub fn dimension(val: &stylo::Size) -> taffy::Dimension {
+        match val {
+            stylo::Size::LengthPercentage(val) => length_percentage(&val.0).into(),
+            stylo::Size::Auto => taffy::Dimension::AUTO,
+
+            // TODO: implement other values in Taffy
+            stylo::Size::MaxContent => taffy::Dimension::AUTO,
+            stylo::Size::MinContent => taffy::Dimension::AUTO,
+            stylo::Size::FitContent => taffy::Dimension::AUTO,
+            stylo::Size::FitContentFunction(_) => taffy::Dimension::AUTO,
+            stylo::Size::Stretch => taffy::Dimension::AUTO,
+            stylo::Size::WebkitFillAvailable => taffy::Dimension::AUTO,
+
+            // Anchor positioning is flagged off.
+            stylo::Size::AnchorSizeFunction(_) => unreachable!(),
+            stylo::Size::AnchorContainingCalcFunction(_) => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn max_size_dimension(val: &stylo::MaxSize) -> taffy::Dimension {
+        match val {
+            stylo::MaxSize::LengthPercentage(val) => length_percentage(&val.0).into(),
+            stylo::MaxSize::None => taffy::Dimension::AUTO,
+
+            stylo::MaxSize::MaxContent => taffy::Dimension::AUTO,
+            stylo::MaxSize::MinContent => taffy::Dimension::AUTO,
+            stylo::MaxSize::FitContent => taffy::Dimension::AUTO,
+            stylo::MaxSize::FitContentFunction(_) => taffy::Dimension::AUTO,
+            stylo::MaxSize::Stretch => taffy::Dimension::AUTO,
+            stylo::MaxSize::WebkitFillAvailable => taffy::Dimension::AUTO,
+
+            stylo::MaxSize::AnchorSizeFunction(_) => unreachable!(),
+            stylo::MaxSize::AnchorContainingCalcFunction(_) => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn margin(val: &stylo::MarginVal) -> taffy::LengthPercentageAuto {
+        match val {
+            stylo::MarginVal::Auto => taffy::LengthPercentageAuto::AUTO,
+            stylo::MarginVal::LengthPercentage(val) => length_percentage(val).into(),
+
+            stylo::MarginVal::AnchorSizeFunction(_) => unreachable!(),
+            stylo::MarginVal::AnchorContainingCalcFunction(_) => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn border(
+        width: &stylo::BorderSideWidth,
+        style: stylo::BorderStyle,
+    ) -> taffy::LengthPercentage {
+        if style.none_or_hidden() {
+            return taffy::style_helpers::zero();
+        }
+        taffy::style_helpers::length(width.0.to_f32_px())
+    }
+
+    #[inline]
+    pub fn inset(val: &stylo::InsetVal) -> taffy::LengthPercentageAuto {
+        match val {
+            stylo::InsetVal::Auto => taffy::LengthPercentageAuto::AUTO,
+            stylo::InsetVal::LengthPercentage(val) => length_percentage(val).into(),
+
+            stylo::InsetVal::AnchorSizeFunction(_) => unreachable!(),
+            stylo::InsetVal::AnchorFunction(_) => unreachable!(),
+            stylo::InsetVal::AnchorContainingCalcFunction(_) => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn display(input: stylo::Display) -> taffy::Display {
+        let mut display = match input.inside() {
+            stylo::DisplayInside::None => taffy::Display::None,
+            stylo::DisplayInside::Flex => taffy::Display::Flex,
+            stylo::DisplayInside::Flow => taffy::Display::Block,
+            stylo::DisplayInside::FlowRoot => taffy::Display::Block,
+            stylo::DisplayInside::TableCell => taffy::Display::Block,
+            _ => taffy::Display::DEFAULT,
+        };
+
+        match input.outside() {
+            stylo::DisplayOutside::None => display = taffy::Display::None,
+            stylo::DisplayOutside::Inline => {}
+            stylo::DisplayOutside::Block => {}
+            stylo::DisplayOutside::TableCaption => {}
+            stylo::DisplayOutside::InternalTable => {}
+        };
+
+        display
+    }
+
+    #[inline]
+    pub fn box_sizing(input: stylo::BoxSizing) -> taffy::BoxSizing {
+        match input {
+            stylo::BoxSizing::BorderBox => taffy::BoxSizing::BorderBox,
+            stylo::BoxSizing::ContentBox => taffy::BoxSizing::ContentBox,
+        }
+    }
+
+    #[inline]
+    pub fn position(input: stylo::Position) -> taffy::Position {
+        match input {
+            stylo::Position::Relative => taffy::Position::Relative,
+            stylo::Position::Static => taffy::Position::Relative,
+            stylo::Position::Absolute => taffy::Position::Absolute,
+            stylo::Position::Fixed => taffy::Position::Absolute,
+            stylo::Position::Sticky => taffy::Position::Relative,
+        }
+    }
+
+    #[inline]
+    pub fn overflow(input: stylo::Overflow) -> taffy::Overflow {
+        match input {
+            stylo::Overflow::Visible => taffy::Overflow::Visible,
+            stylo::Overflow::Clip => taffy::Overflow::Clip,
+            stylo::Overflow::Hidden => taffy::Overflow::Hidden,
+            stylo::Overflow::Scroll => taffy::Overflow::Scroll,
+            // TODO: Support Overflow::Auto in Taffy
+            stylo::Overflow::Auto => taffy::Overflow::Scroll,
+        }
+    }
+
+    #[inline]
+    pub fn direction(input: stylo::Direction) -> taffy::Direction {
+        match input {
+            stylo::Direction::Ltr => taffy::Direction::Ltr,
+            stylo::Direction::Rtl => taffy::Direction::Rtl,
+        }
+    }
+
+    #[inline]
+    pub fn aspect_ratio(input: stylo::AspectRatio) -> Option<f32> {
+        match input.ratio {
+            stylo::PreferredRatio::None => None,
+            stylo::PreferredRatio::Ratio(val) => Some(val.0 .0 / val.1 .0),
+        }
+    }
+
+    // NOTE: stable taffy 0.11.0 models `AlignItems`/`AlignContent` as STRUCTS
+    // with associated SCREAMING_CASE consts (`AlignItems::FLEX_START`), not the
+    // enum variants (`AlignItems::FlexStart`) of Blitz's experimental fork. The
+    // mapping is mechanical; the variant set is identical.
+    #[inline]
+    pub fn content_alignment(input: stylo::ContentDistribution) -> Option<taffy::AlignContent> {
+        match input.primary().value() {
+            stylo::AlignFlags::NORMAL => None,
+            stylo::AlignFlags::AUTO => None,
+            stylo::AlignFlags::START => Some(taffy::AlignContent::START),
+            stylo::AlignFlags::END => Some(taffy::AlignContent::END),
+            stylo::AlignFlags::LEFT => Some(taffy::AlignContent::START),
+            stylo::AlignFlags::RIGHT => Some(taffy::AlignContent::END),
+            stylo::AlignFlags::FLEX_START => Some(taffy::AlignContent::FLEX_START),
+            stylo::AlignFlags::STRETCH => Some(taffy::AlignContent::STRETCH),
+            stylo::AlignFlags::FLEX_END => Some(taffy::AlignContent::FLEX_END),
+            stylo::AlignFlags::CENTER => Some(taffy::AlignContent::CENTER),
+            stylo::AlignFlags::SPACE_BETWEEN => Some(taffy::AlignContent::SPACE_BETWEEN),
+            stylo::AlignFlags::SPACE_AROUND => Some(taffy::AlignContent::SPACE_AROUND),
+            stylo::AlignFlags::SPACE_EVENLY => Some(taffy::AlignContent::SPACE_EVENLY),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn item_alignment(input: stylo::AlignFlags) -> Option<taffy::AlignItems> {
+        match input.value() {
+            stylo::AlignFlags::AUTO => None,
+            stylo::AlignFlags::NORMAL => Some(taffy::AlignItems::STRETCH),
+            stylo::AlignFlags::STRETCH => Some(taffy::AlignItems::STRETCH),
+            stylo::AlignFlags::FLEX_START => Some(taffy::AlignItems::FLEX_START),
+            stylo::AlignFlags::FLEX_END => Some(taffy::AlignItems::FLEX_END),
+            stylo::AlignFlags::SELF_START => Some(taffy::AlignItems::START),
+            stylo::AlignFlags::SELF_END => Some(taffy::AlignItems::END),
+            stylo::AlignFlags::START => Some(taffy::AlignItems::START),
+            stylo::AlignFlags::END => Some(taffy::AlignItems::END),
+            stylo::AlignFlags::LEFT => Some(taffy::AlignItems::START),
+            stylo::AlignFlags::RIGHT => Some(taffy::AlignItems::END),
+            stylo::AlignFlags::CENTER => Some(taffy::AlignItems::CENTER),
+            stylo::AlignFlags::BASELINE => Some(taffy::AlignItems::BASELINE),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn gap(input: &stylo::Gap) -> taffy::LengthPercentage {
+        match input {
+            stylo::Gap::Normal => taffy::LengthPercentage::ZERO,
+            stylo::Gap::LengthPercentage(val) => length_percentage(&val.0),
+        }
+    }
+
+    #[inline]
+    pub fn flex_basis(input: &stylo::FlexBasis) -> taffy::Dimension {
+        // TODO: Support flex-basis: content in Taffy
+        match input {
+            stylo::FlexBasis::Content => taffy::Dimension::AUTO,
+            stylo::FlexBasis::Size(size) => dimension(size),
+        }
+    }
+
+    #[inline]
+    pub fn flex_direction(input: stylo::FlexDirection) -> taffy::FlexDirection {
+        match input {
+            stylo::FlexDirection::Row => taffy::FlexDirection::Row,
+            stylo::FlexDirection::RowReverse => taffy::FlexDirection::RowReverse,
+            stylo::FlexDirection::Column => taffy::FlexDirection::Column,
+            stylo::FlexDirection::ColumnReverse => taffy::FlexDirection::ColumnReverse,
+        }
+    }
+
+    #[inline]
+    pub fn flex_wrap(input: stylo::FlexWrap) -> taffy::FlexWrap {
+        match input {
+            stylo::FlexWrap::Wrap => taffy::FlexWrap::Wrap,
+            stylo::FlexWrap::WrapReverse => taffy::FlexWrap::WrapReverse,
+            stylo::FlexWrap::Nowrap => taffy::FlexWrap::NoWrap,
+        }
+    }
+
+    /// Eagerly convert an entire `ComputedValues` into a `taffy::Style`
+    /// (flex + block + box-model subset; grid/float omitted).
+    pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style {
+        let display = style.clone_display();
+        let pos = style.get_position();
+        let margin = style.get_margin();
+        let padding = style.get_padding();
+        let border = style.get_border();
+
+        taffy::Style {
+            dummy: core::marker::PhantomData,
+            display: self::display(display),
+            box_sizing: self::box_sizing(style.clone_box_sizing()),
+            item_is_table: display.inside() == stylo::DisplayInside::Table,
+            item_is_replaced: false,
+            position: self::position(style.clone_position()),
+            overflow: taffy::Point {
+                x: self::overflow(style.clone_overflow_x()),
+                y: self::overflow(style.clone_overflow_y()),
+            },
+            direction: self::direction(style.clone_direction()),
+            scrollbar_width: 0.0,
+
+            size: taffy::Size {
+                width: self::dimension(&pos.width),
+                height: self::dimension(&pos.height),
+            },
+            min_size: taffy::Size {
+                width: self::dimension(&pos.min_width),
+                height: self::dimension(&pos.min_height),
+            },
+            max_size: taffy::Size {
+                width: self::max_size_dimension(&pos.max_width),
+                height: self::max_size_dimension(&pos.max_height),
+            },
+            aspect_ratio: self::aspect_ratio(pos.aspect_ratio),
+
+            inset: taffy::Rect {
+                left: self::inset(&pos.left),
+                right: self::inset(&pos.right),
+                top: self::inset(&pos.top),
+                bottom: self::inset(&pos.bottom),
+            },
+            margin: taffy::Rect {
+                left: self::margin(&margin.margin_left),
+                right: self::margin(&margin.margin_right),
+                top: self::margin(&margin.margin_top),
+                bottom: self::margin(&margin.margin_bottom),
+            },
+            padding: taffy::Rect {
+                left: self::length_percentage(&padding.padding_left.0),
+                right: self::length_percentage(&padding.padding_right.0),
+                top: self::length_percentage(&padding.padding_top.0),
+                bottom: self::length_percentage(&padding.padding_bottom.0),
+            },
+            border: taffy::Rect {
+                left: self::border(&border.border_left_width, border.border_left_style),
+                right: self::border(&border.border_right_width, border.border_right_style),
+                top: self::border(&border.border_top_width, border.border_top_style),
+                bottom: self::border(&border.border_bottom_width, border.border_bottom_style),
+            },
+
+            // Gap
+            gap: taffy::Size {
+                width: self::gap(&pos.column_gap),
+                height: self::gap(&pos.row_gap),
+            },
+
+            // Alignment
+            align_content: self::content_alignment(pos.align_content),
+            justify_content: self::content_alignment(pos.justify_content),
+            align_items: self::item_alignment(pos.align_items.0),
+            align_self: self::item_alignment(pos.align_self.0),
+
+            // Block container: keep taffy default (Auto). Not read from stylo
+            // because no flex/block geometry test depends on text-align.
+            text_align: taffy::TextAlign::Auto,
+
+            // Flexbox
+            flex_direction: self::flex_direction(pos.flex_direction),
+            flex_wrap: self::flex_wrap(pos.flex_wrap),
+            flex_grow: pos.flex_grow.0,
+            flex_shrink: pos.flex_shrink.0,
+            flex_basis: self::flex_basis(&pos.flex_basis),
+        }
+    }
+}
+
+// ===========================================================================
+// Layout pass: build a taffy tree mirroring the arena's ELEMENT tree, run
+// taffy, and return absolute border-box rects in cascade DFS order.
+// ===========================================================================
+
+impl StyloEngine {
+    /// Return the slab ids of the document's elements in the SAME DFS order the
+    /// cascade visits them (pre-order from the root element). Text nodes skipped.
+    fn element_dfs_order(&self) -> Vec<usize> {
+        let mut order = Vec::new();
+        // root = first element child of node 0 (matches `resolve_styles`).
+        let root = self.doc.nodes[0]
+            .children
+            .iter()
+            .copied()
+            .find(|&id| self.doc.nodes[id].is_element());
+        if let Some(root) = root {
+            let mut stack = vec![root];
+            // We want pre-order DFS with children in document order, so push in
+            // reverse onto the stack.
+            while let Some(id) = stack.pop() {
+                order.push(id);
+                let kids: Vec<usize> = self.doc.nodes[id]
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| self.doc.nodes[c].is_element())
+                    .collect();
+                for &c in kids.iter().rev() {
+                    stack.push(c);
+                }
+            }
+        }
+        order
+    }
+
+    /// Compute layout for the whole element tree.
+    ///
+    /// Builds a [`taffy::TaffyTree`] with one node per element (text nodes are
+    /// skipped — leaves get their size purely from their `Style`, NO text
+    /// measurement), runs flex/block layout against `viewport`, then walks the
+    /// tree accumulating each node's parent-relative `location` into an ABSOLUTE
+    /// border-box [`Rect`]. The returned vec is in the SAME DFS element order as
+    /// the cascade's resolve order, so callers can zip cascade styles and layout
+    /// boxes by index.
+    pub fn layout(&mut self, viewport: canopy_traits::Size) -> Vec<canopy_traits::Rect> {
+        use canopy_traits::{Point, Rect, Size};
+
+        self.resolve_styles();
+
+        let order = self.element_dfs_order();
+        if order.is_empty() {
+            return Vec::new();
+        }
+
+        // Map: slab id -> index into `order` (its position in DFS order).
+        let mut slab_to_idx = std::collections::HashMap::new();
+        for (i, &slab) in order.iter().enumerate() {
+            slab_to_idx.insert(slab, i);
+        }
+
+        let mut tree: taffy::TaffyTree<()> = taffy::TaffyTree::new();
+        // taffy node handle per element index.
+        let mut taffy_nodes: Vec<taffy::NodeId> = Vec::with_capacity(order.len());
+
+        // First pass: create a leaf taffy node for each element with its style.
+        for &slab in &order {
+            let style = self
+                .computed_values_for(slab)
+                .map(|cv| taffy_convert::to_taffy_style(&cv))
+                .unwrap_or_default();
+            let node = tree.new_leaf(style).expect("taffy new_leaf");
+            taffy_nodes.push(node);
+        }
+
+        // Second pass: wire children (element children only, in document order).
+        for (i, &slab) in order.iter().enumerate() {
+            let child_handles: Vec<taffy::NodeId> = self.doc.nodes[slab]
+                .children
+                .iter()
+                .copied()
+                .filter(|c| self.doc.nodes[*c].is_element())
+                .map(|c| taffy_nodes[slab_to_idx[&c]])
+                .collect();
+            if !child_handles.is_empty() {
+                tree.set_children(taffy_nodes[i], &child_handles)
+                    .expect("taffy set_children");
+            }
+        }
+
+        let root = taffy_nodes[0];
+        tree.compute_layout(
+            root,
+            taffy::Size {
+                width: taffy::AvailableSpace::Definite(viewport.w),
+                height: taffy::AvailableSpace::Definite(viewport.h),
+            },
+        )
+        .expect("taffy compute_layout");
+
+        // Walk the taffy tree, accumulating absolute origins. Each node's
+        // `location` is relative to its parent's content box origin... taffy's
+        // `Layout::location` is relative to the parent's border-box origin, so
+        // absolute = parent_absolute + location.
+        let mut rects = vec![Rect::default(); order.len()];
+        // Stack of (element index, parent absolute origin).
+        let mut stack = vec![(0usize, 0.0f32, 0.0f32)];
+        while let Some((idx, px, py)) = stack.pop() {
+            let l = tree.layout(taffy_nodes[idx]).expect("taffy layout");
+            let ax = px + l.location.x;
+            let ay = py + l.location.y;
+            rects[idx] = Rect {
+                origin: Point { x: ax, y: ay },
+                size: Size {
+                    w: l.size.width,
+                    h: l.size.height,
+                },
+            };
+            // Push element children with this node's absolute origin as their base.
+            let slab = order[idx];
+            for c in self.doc.nodes[slab]
+                .children
+                .iter()
+                .copied()
+                .filter(|c| self.doc.nodes[*c].is_element())
+            {
+                stack.push((slab_to_idx[&c], ax, ay));
+            }
+        }
+
+        rects
+    }
+
+    /// Borrow the primary `ComputedValues` for an element slab id (post-resolve).
+    fn computed_values_for(&self, node_id: usize) -> Option<servo_arc::Arc<ComputedValues>> {
+        let node = self.doc.nodes.get(node_id)?;
+        if !node.is_element() {
+            return None;
+        }
+        let data = node.stylo_element_data.get()?;
+        let styles = data.styles.get_primary()?;
+        Some(styles.clone())
+    }
+}
+
+// ===========================================================================
 // Tests.
 // ===========================================================================
 
@@ -1507,5 +2041,165 @@ mod tests {
             style.padding
         );
         assert_eq!(style.display, Display::Flex, "display should be Flex");
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout smoke tests (Stylo cascade -> taffy_convert -> taffy layout).
+    //
+    // All geometry is driven by EXPLICIT sizes / flex ratios, never text
+    // content. Boxes are returned in cascade DFS element order, so index 0 is
+    // always the root <html>, index 1 the first element child, etc. We assert
+    // within +/-1px.
+    // -----------------------------------------------------------------------
+
+    use canopy_traits::Size as TSize;
+
+    /// Approximate-equality helper for f32 geometry (+/-1px).
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1.0
+    }
+
+    #[test]
+    fn layout_flex_row_two_children() {
+        // display:flex; width:200; height:100 container, two `flex:1 1 0`
+        // children -> each 100x100, at (0,0) and (100,0); container 200x100 @ (0,0).
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:flex; width:200px; height:100px");
+            let a = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(a, "flex-grow:1; flex-shrink:1; flex-basis:0");
+            let b = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(b, "flex-grow:1; flex-shrink:1; flex-basis:0");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 3, "html + 2 children");
+
+        // index 0 = html container
+        let c = rects[0];
+        assert!(
+            near(c.origin.x, 0.0) && near(c.origin.y, 0.0),
+            "container origin {:?}",
+            c.origin
+        );
+        assert!(
+            near(c.size.w, 200.0) && near(c.size.h, 100.0),
+            "container size {:?}",
+            c.size
+        );
+
+        // index 1 = first child
+        let a = rects[1];
+        assert!(
+            near(a.origin.x, 0.0) && near(a.origin.y, 0.0),
+            "child A origin {:?}",
+            a.origin
+        );
+        assert!(
+            near(a.size.w, 100.0) && near(a.size.h, 100.0),
+            "child A size {:?}",
+            a.size
+        );
+
+        // index 2 = second child
+        let b = rects[2];
+        assert!(
+            near(b.origin.x, 100.0) && near(b.origin.y, 0.0),
+            "child B origin {:?}",
+            b.origin
+        );
+        assert!(
+            near(b.size.w, 100.0) && near(b.size.h, 100.0),
+            "child B size {:?}",
+            b.size
+        );
+    }
+
+    #[test]
+    fn layout_block_padding_child() {
+        // block width:300; padding:20 containing child width:100 height:40.
+        // child border-box origin = (20,20), size 100x40 (absolute).
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:block; width:300px; padding:20px");
+            let child = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(child, "display:block; width:100px; height:40px");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 2);
+
+        let child = rects[1];
+        assert!(
+            near(child.origin.x, 20.0),
+            "child x should be 20 (padding-left), got {}",
+            child.origin.x
+        );
+        assert!(
+            near(child.origin.y, 20.0),
+            "child y should be 20 (padding-top), got {}",
+            child.origin.y
+        );
+        assert!(near(child.size.w, 100.0), "child w {}", child.size.w);
+        assert!(near(child.size.h, 40.0), "child h {}", child.size.h);
+    }
+
+    #[test]
+    fn layout_justify_content_center() {
+        // justify-content:center on a 200-wide row with one 40-wide child:
+        // free space = 160, child x ~= 80.
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(
+                html,
+                "display:flex; width:200px; height:100px; justify-content:center",
+            );
+            let child = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(child, "width:40px; height:20px; flex-shrink:0");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 2);
+
+        let child = rects[1];
+        assert!(
+            near(child.origin.x, 80.0),
+            "centered child x should be ~80, got {}",
+            child.origin.x
+        );
+        assert!(near(child.size.w, 40.0), "child w {}", child.size.w);
+    }
+
+    #[test]
+    fn layout_margin_left() {
+        // child with margin-left:30 inside a block -> child x ~= 30.
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:block; width:300px; height:200px");
+            let child = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(
+                child,
+                "display:block; width:100px; height:40px; margin-left:30px",
+            );
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 2);
+
+        let child = rects[1];
+        assert!(
+            near(child.origin.x, 30.0),
+            "child x should be ~30 (margin-left), got {}",
+            child.origin.x
+        );
+        assert!(near(child.size.w, 100.0), "child w {}", child.size.w);
     }
 }
