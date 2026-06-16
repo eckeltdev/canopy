@@ -34,7 +34,7 @@
 use canopy_dom::Dom;
 use canopy_render_soft::Buffer;
 use canopy_text_parley::TextEngine;
-use canopy_traits::{Color, DisplayItem, DisplayList, HostError, Point, Rect, Renderer, Size};
+use canopy_traits::{Color, DisplayItem, DisplayList, HostError, Point, Renderer, Size};
 
 /// Composite a straight-alpha coverage mask onto `buffer` in `ink`, with its
 /// top-left at `origin`.
@@ -101,16 +101,12 @@ pub fn composite_coverage(
                     a: blend(255, dst[3], a),
                 }
             };
-            buffer.fill_rect(
-                Rect {
-                    origin: Point {
-                        x: px as f32,
-                        y: py as f32,
-                    },
-                    size: Size { w: 1.0, h: 1.0 },
-                },
-                out,
-            );
+            // We have already composited `out` against the destination above, so we
+            // store it straight — never back through `fill_rect`, which now alpha-
+            // blends (a 1×1 blended write would double-apply the composite over a
+            // non-opaque destination). `set_pixel` is the straight-store counterpart
+            // of the `pixel` read we did.
+            buffer.set_pixel(px, py, [out.r, out.g, out.b, out.a]);
         }
     }
 }
@@ -264,6 +260,7 @@ mod tests {
     use canopy_dom::ROOT;
     use canopy_protocol::{ElementTag, PropId};
     use canopy_traits::OpSink;
+    use canopy_traits::Rect;
 
     // PropIds from canopy-paint (mirrored here to avoid a dep just for consts).
     const FG: PropId = PropId::new(2);
@@ -330,6 +327,37 @@ mod tests {
     // Tiny helper so the call above reads naturally.
     fn buf_mut(b: &mut Buffer) -> &mut Buffer {
         b
+    }
+
+    /// Faded ink (a translucent ink color) fades the text: the ink's own alpha folds
+    /// into the per-pixel coverage, so a full-coverage pixel of half-alpha white over
+    /// black lands at the half-mix, not full ink. This is what carries an OPACITY-
+    /// faded text run through to the pixels.
+    #[test]
+    fn translucent_ink_fades_full_coverage_text() {
+        let bg = color(0, 0, 0);
+        // White ink at alpha 128: even full glyph coverage is only ~half-strength.
+        let ink = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 128,
+        };
+        let mut buf = Buffer::new(1, 1);
+        buf.clear(bg);
+        composite_coverage(&mut buf, Point { x: 0.0, y: 0.0 }, &[255], 1, 1, ink);
+        // Effective alpha = 255 (coverage) * 128 (ink.a) / 255 = 128.
+        // RGB: blend(255, 0, 128) = (255*128 + 0*127 + 127)/255 = 128.
+        // A : blend(255, 255, 128) = (255*128 + 255*127 + 127)/255 = 255 (opaque bg
+        //     stays opaque under "over").
+        let px = buf.pixel(0, 0);
+        assert_eq!(
+            px,
+            [128, 128, 128, 255],
+            "half-alpha ink over opaque black is the half-mix color over an opaque dst"
+        );
+        // And it must be strictly dimmer than opaque ink would be.
+        assert!(px[0] < 255, "faded ink must not reach full ink");
     }
 
     /// The headline guarantee: rendering real text produces antialiased

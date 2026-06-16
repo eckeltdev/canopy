@@ -59,7 +59,9 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use canopy_paint::{BG, DIRECTION, FG, GAP, HEIGHT, PADDING, RADIUS, WIDTH};
+use canopy_paint::{
+    BG, DIRECTION, FG, GAP, HEIGHT, OPACITY, PADDING, RADIUS, TRANSLATE_X, TRANSLATE_Y, WIDTH,
+};
 use canopy_protocol::{NodeId, PropId};
 use canopy_view::App;
 
@@ -374,14 +376,34 @@ fn map_property(name: &str) -> Option<PropId> {
         "padding" => Some(PADDING),
         "border-radius" | "radius" => Some(RADIUS),
         "direction" | "flex-direction" => Some(DIRECTION),
+        // Animation paint props. `opacity` is unitless; the two translates are
+        // signed px lengths. Their values are normalized in `normalize_value`.
+        "opacity" => Some(OPACITY),
+        "translate-x" => Some(TRANSLATE_X),
+        "translate-y" => Some(TRANSLATE_Y),
         _ => None,
     }
 }
 
-/// Normalize a value for `prop`: strip a trailing `px` from sizes (keeping the
-/// integer), and pass colors and directions through verbatim.
+/// Normalize a value for `prop`: strip a trailing `px` from length values (keeping
+/// the number), and pass colors, directions, and unitless values through verbatim.
+///
+/// The two translate props are lengths too, so they go through the same `px` strip —
+/// but unlike the box-model sizes their numbers may be **negative** and
+/// **fractional** (`-24px`, `12.5px`); we only remove the unit and never touch the
+/// sign or decimal point, so the scene builder's signed-float reader sees the raw
+/// number. [`OPACITY`] is deliberately excluded: it is a unitless float in `[0, 1]`,
+/// so a stray `px` is *not* stripped (an authoring slip like `opacity: 0.5px` is left
+/// intact to fail the float parse rather than silently becoming `0.5`).
 fn normalize_value(prop: PropId, value: &str) -> String {
-    if prop == WIDTH || prop == HEIGHT || prop == GAP || prop == PADDING || prop == RADIUS {
+    let is_length = prop == WIDTH
+        || prop == HEIGHT
+        || prop == GAP
+        || prop == PADDING
+        || prop == RADIUS
+        || prop == TRANSLATE_X
+        || prop == TRANSLATE_Y;
+    if is_length {
         if let Some(num) = value.strip_suffix("px") {
             return num.trim().to_string();
         }
@@ -415,8 +437,10 @@ mod tests {
 
     #[test]
     fn unknown_property_is_ignored() {
-        let sheet = parse(".x { background: #fff; opacity: 0.5; border: 1px }");
-        // Only `background` maps; `opacity` and `border` are skipped.
+        let sheet = parse(".x { background: #fff; border: 1px; outline: none }");
+        // Only `background` maps; `border` and `outline` are outside this subset and
+        // skipped. (`opacity`, once unknown, is now a mapped prop — see
+        // `opacity_parses_as_a_unitless_float`.)
         assert_eq!(sheet.declarations("x"), &[(BG, "#fff".to_string())]);
     }
 
@@ -451,6 +475,49 @@ mod tests {
         let b = parse(".pill { radius: 16 }");
         assert_eq!(a.declarations("card"), &[(RADIUS, "8".to_string())]);
         assert_eq!(b.declarations("pill"), &[(RADIUS, "16".to_string())]);
+    }
+
+    #[test]
+    fn opacity_parses_as_a_unitless_float() {
+        // `opacity` maps to OPACITY and its value is passed through verbatim — no
+        // `px` strip, since it is a unitless ratio in [0, 1].
+        let sheet = parse(".fade { opacity: 0.5 }");
+        assert_eq!(sheet.declarations("fade"), &[(OPACITY, "0.5".to_string())]);
+    }
+
+    #[test]
+    fn opacity_does_not_strip_a_stray_px() {
+        // Unlike the length props, `opacity` is unitless: a bogus `px` is left on so
+        // it fails the downstream float parse instead of silently becoming `0.5`.
+        let sheet = parse(".x { opacity: 0.5px }");
+        assert_eq!(sheet.declarations("x"), &[(OPACITY, "0.5px".to_string())]);
+    }
+
+    #[test]
+    fn translate_x_y_parse_with_px_stripped_keeping_sign_and_decimal() {
+        // Both translates are px lengths: the unit is stripped but the sign and the
+        // decimal point survive, so a negative/fractional shift round-trips.
+        let sheet = parse(".slide { translate-x: -24px; translate-y: 12.5px }");
+        assert_eq!(
+            sheet.declarations("slide"),
+            &[
+                (TRANSLATE_X, "-24".to_string()),
+                (TRANSLATE_Y, "12.5".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn translate_without_px_is_kept_verbatim() {
+        // A bare number (no unit) is already in the form the scene builder reads.
+        let sheet = parse(".t { translate-x: -8; translate-y: 4 }");
+        assert_eq!(
+            sheet.declarations("t"),
+            &[
+                (TRANSLATE_X, "-8".to_string()),
+                (TRANSLATE_Y, "4".to_string()),
+            ]
+        );
     }
 
     #[test]

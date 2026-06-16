@@ -53,6 +53,20 @@ pub const PADDING: PropId = PropId::new(6);
 pub const DIRECTION: PropId = PropId::new(7);
 /// Corner radius for an element's background rect, in integer pixels (`0` = square).
 pub const RADIUS: PropId = PropId::new(8);
+/// Subtree opacity as a unitless float in `[0, 1]` (`1.0` = fully opaque, the
+/// default). Multiplies down the tree — like a CSS `opacity` — so setting it on a
+/// container fades the whole subtree. This is a **paint-only** property: it scales
+/// the alpha of every primitive a node and its descendants emit without touching
+/// layout or hit-testing.
+pub const OPACITY: PropId = PropId::new(9);
+/// Horizontal paint translation in logical px, signed and fractional (e.g.
+/// `-24px`, `12.5px`). Like a CSS `transform: translateX`, it shifts a node's
+/// painted position **and** its hit-test rect by this amount and accumulates down
+/// the subtree, with **no reflow** — siblings keep their original boxes.
+pub const TRANSLATE_X: PropId = PropId::new(10);
+/// Vertical paint translation in logical px, signed and fractional (e.g. `-24px`,
+/// `12.5px`). The Y-axis counterpart of [`TRANSLATE_X`]; see it for the semantics.
+pub const TRANSLATE_Y: PropId = PropId::new(11);
 
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;
@@ -341,6 +355,34 @@ mod tests {
     use canopy_dom::Dom;
     use canopy_protocol::ElementTag;
     use canopy_traits::OpSink;
+
+    #[test]
+    fn animation_prop_ids_are_the_next_free_distinct_slots() {
+        // OPACITY/TRANSLATE_X/TRANSLATE_Y are the three ids after RADIUS=8. Guard
+        // their concrete values (the CSS map and the scene builders key off these)
+        // and that they don't collide with the existing layout/paint props.
+        assert_eq!(OPACITY.raw(), 9);
+        assert_eq!(TRANSLATE_X.raw(), 10);
+        assert_eq!(TRANSLATE_Y.raw(), 11);
+        let all = [
+            BG,
+            FG,
+            WIDTH,
+            HEIGHT,
+            GAP,
+            PADDING,
+            DIRECTION,
+            RADIUS,
+            OPACITY,
+            TRANSLATE_X,
+            TRANSLATE_Y,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.raw(), b.raw(), "PropId ids must be unique");
+            }
+        }
+    }
 
     fn dom_from(e: Emitter) -> Dom {
         let mut e = e;

@@ -22,6 +22,31 @@ use alloc::vec::Vec;
 use canopy_text_baked::{glyph, CELL_H, CELL_W};
 use canopy_traits::{Color, DisplayItem, DisplayList, HostError, Point, Rect, Renderer, Size};
 
+/// Composite `src` (straight-alpha RGBA) **over** the destination pixel `dst`
+/// (`[r, g, b, a]`) in place, the classic Porter–Duff "source over".
+///
+/// Each color channel becomes `src·a + dst·(1 − a)` with `a = src.a/255`, evaluated
+/// in pure integer math as `(src·a + dst·(255 − a) + 127) / 255` — the `+127` gives
+/// round-to-nearest so a half-alpha blend lands on the true midpoint instead of
+/// drifting dark. This is the same rounding the text compositor uses, kept here so a
+/// reduced-alpha fill fades over the background rather than overwriting it. No float,
+/// no `f32::round`, no `unsafe` — `no_std`-clean.
+///
+/// The destination alpha is composited the same way against a notionally opaque
+/// source coverage (`255`), so stacking translucent fills keeps the buffer's alpha
+/// channel sensible (it trends toward opaque), which matters when the surface is
+/// later alpha-composited onto another (e.g. a plugin panel into the frame).
+fn blend_over(dst: &mut [u8], src: Color) {
+    let a = u32::from(src.a);
+    let inv = 255 - a;
+    let mix = |s: u8, d: u8| -> u8 { ((u32::from(s) * a + u32::from(d) * inv + 127) / 255) as u8 };
+    dst[0] = mix(src.r, dst[0]);
+    dst[1] = mix(src.g, dst[1]);
+    dst[2] = mix(src.b, dst[2]);
+    // Resulting coverage: a + dst·(1 − a), i.e. `mix(255, dst.a)`.
+    dst[3] = ((255 * a + u32::from(dst[3]) * inv + 127) / 255) as u8;
+}
+
 /// An RGBA8888 pixel buffer, row-major, 4 bytes per pixel.
 pub struct Buffer {
     width: usize,
@@ -68,6 +93,22 @@ impl Buffer {
         ]
     }
 
+    /// Overwrite one pixel with `[r, g, b, a]` (a **straight store**, no blending),
+    /// clipped to the buffer.
+    ///
+    /// This is the write counterpart to [`pixel`](Buffer::pixel): a caller that has
+    /// already done its own compositing (it read the destination, blended, and holds
+    /// the final value) writes the result back here so [`fill_rect`](Buffer::fill_rect)'s
+    /// alpha blend does not double-apply. The text compositor in `canopy-render-text`
+    /// uses exactly this pairing.
+    pub fn set_pixel(&mut self, x: usize, y: usize, rgba: [u8; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let i = (y * self.width + x) * 4;
+        self.data[i..i + 4].copy_from_slice(&rgba);
+    }
+
     /// Fill the whole buffer with one color.
     pub fn clear(&mut self, c: Color) {
         for px in self.data.chunks_exact_mut(4) {
@@ -75,18 +116,30 @@ impl Buffer {
         }
     }
 
-    /// Fill `rect` with an opaque color, clipped to the buffer. `f32 as usize`
-    /// saturates negatives to 0, so off-screen origins clip cleanly.
+    /// Fill `rect` with `c`, **src-over alpha-blended** over whatever is already in
+    /// the buffer, clipped to the buffer. `f32 as usize` saturates negatives to 0, so
+    /// off-screen origins clip cleanly.
+    ///
+    /// When `c.a == 255` (the common opaque case) the span is a straight overwrite,
+    /// exactly the original behavior. For a translucent `c` each destination pixel
+    /// becomes `src·a + dst·(1 − a)` per channel (see [`blend_over`]), so a
+    /// reduced-alpha fill — the kind a faded-in element emits — composites over the
+    /// background instead of punching through it.
     pub fn fill_rect(&mut self, rect: Rect, c: Color) {
         let x0 = (rect.origin.x as usize).min(self.width);
         let y0 = (rect.origin.y as usize).min(self.height);
         let x1 = ((rect.origin.x + rect.size.w) as usize).min(self.width);
         let y1 = ((rect.origin.y + rect.size.h) as usize).min(self.height);
+        let opaque = c.a == 255;
         for y in y0..y1 {
             let start = (y * self.width + x0) * 4;
             let end = (y * self.width + x1) * 4;
             for px in self.data[start..end].chunks_exact_mut(4) {
-                px.copy_from_slice(&[c.r, c.g, c.b, c.a]);
+                if opaque {
+                    px.copy_from_slice(&[c.r, c.g, c.b, c.a]);
+                } else {
+                    blend_over(px, c);
+                }
             }
         }
     }
@@ -107,6 +160,12 @@ impl Buffer {
     /// overflowing. A non-positive radius falls through to a square
     /// [`fill_rect`](Buffer::fill_rect), so callers can pass the display item's
     /// radius unconditionally.
+    ///
+    /// Like [`fill_rect`](Buffer::fill_rect), the body is **src-over alpha-blended**:
+    /// an opaque `c` overwrites (the original behavior) while a translucent `c` blends
+    /// over the destination, so a faded rounded card composites correctly. Only the
+    /// pixels *inside* the quarter-circle corners are written — the carved-away corner
+    /// pixels keep whatever was behind them.
     pub fn fill_round_rect(&mut self, rect: Rect, c: Color, radius: f32) {
         // Clamp to half the shorter side; a non-positive radius is just a square.
         let max_r = 0.5 * rect.size.w.min(rect.size.h);
@@ -116,6 +175,7 @@ impl Buffer {
             return;
         }
         let r2 = r * r;
+        let opaque = c.a == 255;
 
         // Pixel-space bounds (saturating `f32 as usize` clips off-screen origins).
         let x0 = (rect.origin.x as usize).min(self.width);
@@ -163,7 +223,11 @@ impl Buffer {
                         }
                     }
                 }
-                px.copy_from_slice(&[c.r, c.g, c.b, c.a]);
+                if opaque {
+                    px.copy_from_slice(&[c.r, c.g, c.b, c.a]);
+                } else {
+                    blend_over(px, c);
+                }
             }
         }
     }
@@ -312,6 +376,146 @@ mod tests {
         assert_eq!(b.pixel(9, 9), [1, 2, 3, 255]);
         assert_eq!(b.pixel(0, 0), [0, 0, 0, 0]);
         assert_eq!(b.pixel(50, 50), [0, 0, 0, 0]); // out of bounds -> zeros
+    }
+
+    #[test]
+    fn half_alpha_fill_blends_over_opaque_background() {
+        // THE alpha-compositing proof: a 50%-alpha white fill over a known opaque
+        // background yields the channel-wise midpoint (src·a + dst·(1−a)), not a
+        // straight overwrite. This is what makes a faded-in element actually fade.
+        let mut b = Buffer::new(4, 4);
+        let bg = Color {
+            r: 0,
+            g: 100,
+            b: 200,
+            a: 255,
+        };
+        b.clear(bg);
+        // White at alpha 128 (~0.502).
+        let src = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 128,
+        };
+        b.fill_rect(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { w: 4.0, h: 4.0 },
+            },
+            src,
+        );
+        // mix(s, d) = (s*128 + d*127 + 127) / 255.
+        // r: (255*128 + 0*127 + 127)/255 = 128
+        // g: (255*128 + 100*127 + 127)/255 = 178
+        // b: (255*128 + 200*127 + 127)/255 = 228
+        // a: (255*128 + 255*127 + 127)/255 = 255
+        assert_eq!(b.pixel(0, 0), [128, 178, 228, 255]);
+        // Every covered pixel got the same blend.
+        assert_eq!(b.pixel(3, 3), [128, 178, 228, 255]);
+    }
+
+    #[test]
+    fn opaque_fill_still_overwrites_exactly() {
+        // The fast path (a == 255) must remain a byte-exact overwrite, so opaque
+        // scenes are unchanged by the new blend path.
+        let mut b = Buffer::new(2, 2);
+        b.clear(Color {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 255,
+        });
+        let src = Color {
+            r: 200,
+            g: 150,
+            b: 100,
+            a: 255,
+        };
+        b.fill_rect(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { w: 2.0, h: 2.0 },
+            },
+            src,
+        );
+        assert_eq!(
+            b.pixel(0, 0),
+            [200, 150, 100, 255],
+            "opaque overwrites exactly"
+        );
+        assert_eq!(b.pixel(1, 1), [200, 150, 100, 255]);
+    }
+
+    #[test]
+    fn zero_alpha_fill_leaves_the_background() {
+        // A fully transparent fill is a no-op on the color channels (the limit of the
+        // blend as a -> 0).
+        let mut b = Buffer::new(2, 2);
+        let bg = Color {
+            r: 5,
+            g: 6,
+            b: 7,
+            a: 255,
+        };
+        b.clear(bg);
+        b.fill_rect(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { w: 2.0, h: 2.0 },
+            },
+            Color {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 0,
+            },
+        );
+        assert_eq!(
+            b.pixel(0, 0),
+            [5, 6, 7, 255],
+            "alpha 0 leaves the background"
+        );
+    }
+
+    #[test]
+    fn half_alpha_round_rect_blends_center_keeps_carved_corner() {
+        // The rounded fill blends like the square one: the center is the half-mix,
+        // while a carved-away corner is untouched (keeps the background).
+        let mut b = Buffer::new(40, 40);
+        let bg = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        b.clear(bg);
+        let src = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 128,
+        };
+        b.fill_round_rect(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { w: 40.0, h: 40.0 },
+            },
+            src,
+            12.0,
+        );
+        // Center: white@128 over black -> (255*128 + 0*127 + 127)/255 = 128 per RGB.
+        assert_eq!(
+            b.pixel(20, 20),
+            [128, 128, 128, 255],
+            "center is the half-mix"
+        );
+        // Extreme corner is carved away: stays the black background.
+        assert_eq!(
+            b.pixel(0, 0),
+            [0, 0, 0, 255],
+            "carved corner keeps background"
+        );
     }
 
     #[test]

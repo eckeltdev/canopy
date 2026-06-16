@@ -368,8 +368,14 @@ impl GpuRenderer {
 }
 
 /// Build the colored-quad pipeline (rects): instanced, alpha-blended, sourcing
-/// `quad.wgsl`. Mirrors the original opaque pipeline but kept here so the two
-/// pipelines are built side by side.
+/// `quad.wgsl`. Kept beside the glyph pipeline so the two are built side by side.
+///
+/// The color target uses [`wgpu::BlendState::ALPHA_BLENDING`] — straight (non-
+/// premultiplied) source-over — so a [`DisplayItem::Rect`] whose color alpha is
+/// `< 255` blends over whatever is already in the target instead of overwriting it.
+/// That is what lets a faded-in (reduced-opacity) rect composite over its background
+/// on the GPU, matching the CPU `fill_rect` blend. An `alpha == 1.0` rect is fully
+/// opaque, so the blend resolves to a plain overwrite (the original behavior).
 fn build_rect_pipeline(
     device: &wgpu::Device,
     viewport_layout: &wgpu::BindGroupLayout,
@@ -1471,6 +1477,68 @@ mod tests {
             at(w - 1, h - 1),
             fill_px,
             "square keeps its bottom-right corner"
+        );
+    }
+
+    /// THE FADED-RECT GPU TEST: a translucent rect (alpha < 255) over an opaque
+    /// background must **blend**, not overwrite. We paint a half-alpha white rect over
+    /// an opaque blue clear and assert the covered pixel is strictly between the two —
+    /// brighter than the blue on every channel, but not full white. This proves the
+    /// rect pipeline's `ALPHA_BLENDING` is doing source-over for reduced-opacity fills
+    /// (the GPU half of the fade-in story). Skips cleanly without an adapter.
+    #[test]
+    fn translucent_rect_blends_over_background_on_gpu() {
+        let bg = Color {
+            r: 0,
+            g: 0,
+            b: 200,
+            a: 255,
+        };
+        let fill = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 128, // ~50% — a faded rect
+        };
+        let size = Size { w: 24.0, h: 24.0 };
+        let scene = DisplayList {
+            items: vec![DisplayItem::Rect {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size,
+                },
+                color: fill,
+                radius: 0.0,
+            }],
+        };
+        let Some(px) = try_render_to_rgba(&scene, size, bg) else {
+            eprintln!("no GPU adapter; skipping GPU assertion");
+            return;
+        };
+        let w = size.w as usize;
+        let i = ((size.h as usize / 2) * w + w / 2) * 4;
+        let [r, g, b, _a] = [px[i], px[i + 1], px[i + 2], px[i + 3]];
+
+        // The half-alpha white lifts R and G off the blue floor (they were 0) but
+        // does not reach full white, and pulls B down from 200 toward white's 255 is
+        // not relevant — what matters is the pixel is a genuine blend, not either
+        // endpoint. Blending happens in linear space (sRGB target), so we assert
+        // ranges, not exact bytes.
+        assert!(
+            r > 40 && r < 255,
+            "red channel must be a blend (lifted off 0, below full), got {r}"
+        );
+        assert!(g > 40 && g < 255, "green channel must be a blend, got {g}");
+        // Not the untouched background and not the opaque fill.
+        assert_ne!(
+            [r, g, b],
+            [bg.r, bg.g, bg.b],
+            "must not be the bare background"
+        );
+        assert_ne!(
+            [r, g, b],
+            [fill.r, fill.g, fill.b],
+            "must not overwrite to full fill"
         );
     }
 
