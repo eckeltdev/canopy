@@ -65,6 +65,14 @@
         font-size: 16px;
         padding: 10px;
       }
+
+      /* Interactivity: pointer hover drives a live Stylo restyle. Moving the
+         cursor over the button hit-tests it, sets the :hover element state, and
+         forces a re-cascade — so this brighter green visibly replaces the resting
+         green under the pointer. */
+      #apply:hover {
+        background: #2ea043;
+      }
     </style>
   </head>
   <body>

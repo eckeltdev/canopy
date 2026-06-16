@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use canopy_full_stylo_browser::{build, load_html, render_to_buffer, VIEW_H, VIEW_W};
 use canopy_style_stylo::StyloEngine;
-use canopy_traits::Size;
+use canopy_traits::{Point, Size};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -31,6 +31,9 @@ struct BrowserApp {
     engine: StyloEngine,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    /// Arena slab of the element the pointer is currently over (the `:hover`
+    /// target), so a `CursorMoved` only restyles when the hovered element changes.
+    hover: Option<usize>,
 }
 
 impl BrowserApp {
@@ -39,6 +42,7 @@ impl BrowserApp {
             engine: build(&load_html()),
             window: None,
             surface: None,
+            hover: None,
         }
     }
 
@@ -110,10 +114,31 @@ impl ApplicationHandler for BrowserApp {
                     window.request_redraw();
                 }
             }
+            // Pointer movement drives `:hover`: map the cursor to a canopy Point,
+            // hit-test the deepest element under it, and — when that element
+            // changes — move the HOVER state to it (which forces a restyle) and
+            // redraw, so a `:hover` rule visibly repaints live.
+            WindowEvent::CursorMoved { position, .. } => {
+                let viewport = self.viewport();
+                let point = Point {
+                    x: position.x as f32,
+                    y: position.y as f32,
+                };
+                let hit = self.engine.hit_test(point, viewport);
+                if hit != self.hover {
+                    self.hover = hit;
+                    self.engine.set_hover(hit);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
             // Press any key / click to hot-reload page.html: re-parse the whole
             // document (markup + CSS), re-run the full Stylo cascade, and redraw.
             WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } => {
                 self.engine = build(&load_html());
+                // The rebuilt engine starts with no hover state.
+                self.hover = None;
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }

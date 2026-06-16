@@ -102,7 +102,9 @@ use style::CaseSensitivityExt;
 use style_dom::ElementState;
 
 use canopy_protocol::NodeId;
-use canopy_traits::{Color, ComputedStyle, Display, HostError, StyleEngine};
+use canopy_traits::{
+    BoxShadow, Color, ComputedStyle, Display, GradientAxis, HostError, LinearGradient, StyleEngine,
+};
 
 /// Build a backend-neutral [`canopy_traits::DisplayList`] from the cascaded +
 /// laid-out tree (the GPU/retained-scene sibling of [`paint`]).
@@ -1116,6 +1118,26 @@ pub struct Document {
     pub nodes: Vec<Node>,
 }
 
+/// A plain-`String` view of one arena element's identity, for selector matching.
+///
+/// Returned by [`Document::element_infos`]. Carries the element's slab id, its
+/// parent slab id (if any), tag name, optional `id`, and class list — everything a
+/// small CSS selector matcher (tag / `.class` / `#id` / descendant combinator)
+/// needs, without depending on the interned-`Atom` types the arena stores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementInfo {
+    /// Arena slab id of the element.
+    pub slab: usize,
+    /// Parent slab id, if any.
+    pub parent: Option<usize>,
+    /// Local tag name (lowercased HTML), e.g. `"div"`.
+    pub tag: String,
+    /// The `id` attribute, if present.
+    pub id: Option<String>,
+    /// The class tokens, in document order.
+    pub classes: Vec<String>,
+}
+
 impl Default for Document {
     fn default() -> Self {
         Self::new()
@@ -1178,6 +1200,35 @@ impl Document {
         {
             *style_attribute = Some(StyleArc::new(locked));
         }
+    }
+
+    /// Per-element descriptor (tag / id / classes / parent), as plain `String`s.
+    ///
+    /// The arena stores tag/id/classes as interned `markup5ever`/`style` `Atom`s,
+    /// which a downstream crate (e.g. the WPT runner) can't name without depending
+    /// on those crates. This accessor surfaces the same data as `String`s so a
+    /// caller can run a small CSS-selector matcher over the tree (tag / `.class` /
+    /// `#id` / descendant combinator) without re-implementing the arena. Returned
+    /// in slab-id order; non-element nodes (the document root, text) are skipped.
+    pub fn element_infos(&self) -> Vec<ElementInfo> {
+        self.nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Element {
+                    name,
+                    id_attr,
+                    classes,
+                    ..
+                } => Some(ElementInfo {
+                    slab: n.id,
+                    parent: n.parent,
+                    tag: name.local.to_string(),
+                    id: id_attr.as_ref().map(|a| a.to_string()),
+                    classes: classes.iter().map(|c| c.to_string()).collect(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Finalize the tree: wire every node's `tree` raw pointer to the slab.
@@ -1370,6 +1421,87 @@ body { margin: 8px }
         self.resolved = true;
     }
 
+    /// Hit-test a viewport-space point against the laid-out tree: return the
+    /// **deepest** element whose absolute border-box contains `point`, as its
+    /// arena slab id (`None` if the point is outside every box).
+    ///
+    /// Runs [`element_layout`](StyloEngine::element_layout) (which resolves +
+    /// lays out the tree), then scans every element box. Because that vec is in
+    /// pre-order DFS — parent **before** child — the last containing box found in
+    /// the scan is the deepest one under the cursor, so a hover lands on the most
+    /// specific element (a button rather than the page behind it). This is the
+    /// hit-test that drives pointer `:hover` in the windowed browser.
+    pub fn hit_test(
+        &mut self,
+        point: canopy_traits::Point,
+        viewport: canopy_traits::Size,
+    ) -> Option<usize> {
+        let boxes = self.element_layout(viewport);
+        let mut hit = None;
+        for (slab, rect) in boxes {
+            let x0 = rect.origin.x;
+            let y0 = rect.origin.y;
+            let x1 = x0 + rect.size.w;
+            let y1 = y0 + rect.size.h;
+            if point.x >= x0 && point.x < x1 && point.y >= y0 && point.y < y1 {
+                // DFS is parent-before-child, so a later match is strictly deeper.
+                hit = Some(slab);
+            }
+        }
+        hit
+    }
+
+    /// Move the `:hover` element state to `slab` (or clear it entirely when
+    /// `None`), then **force a full restyle** so the cascade re-runs and any
+    /// `:hover` rules re-apply on the next resolve / layout / render.
+    ///
+    /// The cascade is one-shot and idempotent ([`resolve_styles`] early-returns
+    /// once `resolved` is set, and every element caches its `ComputedValues` in
+    /// `stylo_element_data`). Simply flipping the [`ElementState::HOVER`] bit
+    /// would therefore change nothing visible: the cached styles are stale and
+    /// nothing recomputes them. This DOM also carries no Stylo *snapshots*
+    /// (`has_snapshot` is always false), so Stylo's normal state-change
+    /// invalidation can't notice the `:hover` flip on its own.
+    ///
+    /// So we force the recascade by hand: clear `resolved`, and **clear every
+    /// element's cached Stylo data**. With all data gone, the next
+    /// [`resolve_styles`] re-runs the whole-tree traversal exactly as the very
+    /// first resolve did (`element_needs_traversal` returns true for any element
+    /// whose data has no styles, so the root and every descendant are visited
+    /// and re-cascaded against the new element state).
+    pub fn set_hover(&mut self, slab: Option<usize>) {
+        // Clear HOVER wherever it currently sits, then set it on the target.
+        for node in &mut self.doc.nodes {
+            if node.is_element() {
+                node.element_state.remove(ElementState::HOVER);
+            }
+        }
+        if let Some(id) = slab {
+            if let Some(node) = self.doc.nodes.get_mut(id) {
+                if node.is_element() {
+                    node.element_state.insert(ElementState::HOVER);
+                }
+            }
+        }
+
+        // Force the next resolve to re-run the full cascade: drop the resolved
+        // flag AND every element's cached Stylo `ElementData`, so the traversal
+        // re-cascades the whole tree against the updated element state.
+        //
+        // SAFETY: we hold `&mut self`, so there are no outstanding borrows of any
+        // node's `stylo_element_data` (no traversal is in flight), satisfying
+        // `StyloData::clear`'s contract.
+        for node in &self.doc.nodes {
+            if node.is_element() {
+                unsafe { node.stylo_element_data.clear() };
+            }
+            node.selector_flags.set(ElementSelectorFlags::empty());
+            node.unset_dirty_descendants();
+            node.snapshot_handled.store(false, Ordering::SeqCst);
+        }
+        self.resolved = false;
+    }
+
     /// Read the computed style for a node by slab id (after resolving).
     fn computed_style_for(&self, node_id: usize) -> Option<ComputedStyle> {
         let node = self.doc.nodes.get(node_id)?;
@@ -1472,6 +1604,15 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
         })
         .is_some_and(|name| name.eq_ignore_ascii_case(text_measure::AHEM_FAMILY));
 
+    // gradient: a two-stop linear-gradient background, if the first background
+    // layer is one. Maps the FIRST `background-image` layer's `linear-gradient`
+    // (the topmost paint) to the seam's reduced two-stop form. Returns `None` for
+    // `none`/url()/radial/conic images.
+    let gradient = map_gradient(style);
+
+    // box-shadow: the FIRST outset (non-inset) shadow, reduced to offset+blur+color.
+    let box_shadow = map_box_shadow(style);
+
     ComputedStyle {
         display,
         color,
@@ -1483,7 +1624,106 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
         border_radius,
         opacity,
         is_ahem,
+        gradient,
+        box_shadow,
     }
+}
+
+/// Map the first `background-image` layer to a reduced two-stop [`LinearGradient`],
+/// if it is a `linear-gradient`. Returns `None` for `none`, `url()`, image-set,
+/// radial/conic gradients, or a gradient with no color stops.
+///
+/// The reduction: take the gradient's first and last color stops (resolved against
+/// `currentColor`) as the two seam stops, and snap the line direction to the nearer
+/// of vertical/horizontal — a `to bottom` (the CSS default) stays vertical, `to
+/// right`/`to left` is horizontal, an angle picks the axis its sin/cos leans toward,
+/// and a corner snaps to whichever of width/height it spans more of. The endpoint
+/// colors are an exact match; only multi-stop interpolation detail and diagonal
+/// angle are approximated.
+fn map_gradient(style: &ComputedValues) -> Option<LinearGradient> {
+    use style::values::computed::image::{Image, LineDirection};
+    use style::values::computed::{Color as ComputedColor, LengthPercentage};
+    use style::values::generics::image::{GenericGradient, GenericGradientItem};
+    use style::values::specified::position::{HorizontalPositionKeyword, VerticalPositionKeyword};
+
+    let images = &style.get_background().background_image.0;
+    let first = images.first()?;
+    let Image::Gradient(gradient) = first else {
+        return None;
+    };
+
+    // Only linear gradients are reduced; radial/conic fall back to the flat bg.
+    let GenericGradient::Linear {
+        direction, items, ..
+    } = gradient.as_ref()
+    else {
+        return None;
+    };
+
+    // First and last *color* stops (skip bare interpolation hints).
+    let cur = style.clone_color();
+    let stop_color =
+        |item: &GenericGradientItem<ComputedColor, LengthPercentage>| -> Option<Color> {
+            match item {
+                GenericGradientItem::SimpleColorStop(c) => {
+                    Some(absolute_to_color(c.clone().resolve_to_absolute(&cur)))
+                }
+                GenericGradientItem::ComplexColorStop { color, .. } => {
+                    Some(absolute_to_color(color.clone().resolve_to_absolute(&cur)))
+                }
+                GenericGradientItem::InterpolationHint(_) => None,
+            }
+        };
+    let start = items.iter().find_map(stop_color)?;
+    let end = items.iter().rev().find_map(stop_color).unwrap_or(start);
+
+    // Snap the line direction to the nearer orthogonal axis.
+    let axis = match direction {
+        LineDirection::Vertical(_) => GradientAxis::Vertical,
+        LineDirection::Horizontal(_) => GradientAxis::Horizontal,
+        LineDirection::Corner(_h, _v) => {
+            // A corner spans both axes equally for a square box; default to vertical
+            // (the common "to bottom right" reads top→bottom on a typical box).
+            GradientAxis::Vertical
+        }
+        LineDirection::Angle(angle) => {
+            // CSS angle: 0deg = to top, 90deg = to right. Pick the axis the line
+            // leans toward more (|sin| vs |cos|).
+            let rad = angle.radians();
+            if rad.sin().abs() > rad.cos().abs() {
+                GradientAxis::Horizontal
+            } else {
+                GradientAxis::Vertical
+            }
+        }
+    };
+
+    // Flip start/end so `start` is always the top (vertical) / left (horizontal)
+    // edge, matching the seam's axis contract.
+    let (start, end) = match direction {
+        LineDirection::Horizontal(HorizontalPositionKeyword::Left) => (end, start),
+        LineDirection::Vertical(VerticalPositionKeyword::Top) => (end, start),
+        _ => (start, end),
+    };
+
+    Some(LinearGradient { start, end, axis })
+}
+
+/// Map the first **outset** (non-`inset`) `box-shadow` to the seam's reduced
+/// [`BoxShadow`] (offset + blur + color). Returns `None` if the list is empty or
+/// holds only inset shadows. Spread and any shadow past the first outset are
+/// dropped (the seam carries one soft drop shadow).
+fn map_box_shadow(style: &ComputedValues) -> Option<BoxShadow> {
+    let shadows = &style.get_effects().box_shadow.0;
+    let shadow = shadows.iter().find(|s| !s.inset)?;
+    let cur = style.clone_color();
+    let color = absolute_to_color(shadow.base.color.clone().resolve_to_absolute(&cur));
+    Some(BoxShadow {
+        dx: shadow.base.horizontal.px(),
+        dy: shadow.base.vertical.px(),
+        blur: shadow.base.blur.px().max(0.0),
+        color,
+    })
 }
 
 /// Convert a Stylo `AbsoluteColor` into a canopy straight-alpha `Color`.
@@ -1525,8 +1765,9 @@ impl StyleEngine for StyloEngine {
 //     `String` custom-ident (its `LayoutGridContainer` impl declares
 //     `type CustomIdent = DefaultCheapStr`). So named grid lines/areas are
 //     interned to `String` here; fixed/fr/named grids are otherwise identical.
-//   * FLOAT properties are omitted (that taffy feature is off). FLEX + BLOCK +
-//     GRID + the box-model subset (incl. `calc()`) are ported.
+//   * FLOAT + CLEAR are mapped (taffy's `float_layout` feature is enabled in
+//     Cargo.toml). FLEX + BLOCK + GRID + the box-model subset (incl. `calc()`)
+//     are ported.
 //   * `text_align` is set to the taffy default (`Auto`); we don't read stylo's
 //     `text_align` because none of our flex/block geometry tests depend on it
 //     and the accessor mapping isn't needed for the subset under test.
@@ -1554,7 +1795,7 @@ mod taffy_convert {
         pub(crate) use style::values::specified::align::{AlignFlags, ContentDistribution};
         pub(crate) use style::values::specified::border::BorderStyle;
         pub(crate) use style::values::specified::box_::{
-            Display, DisplayInside, DisplayOutside, Overflow,
+            Clear, Display, DisplayInside, DisplayOutside, Float, Overflow,
         };
 
         pub(crate) type MarginVal = GenericMargin<LengthPercentage>;
@@ -1775,6 +2016,43 @@ mod taffy_convert {
         match input {
             stylo::Direction::Ltr => taffy::Direction::Ltr,
             stylo::Direction::Rtl => taffy::Direction::Rtl,
+        }
+    }
+
+    /// Map stylo's computed `float` keyword to taffy's `Float`.
+    ///
+    /// `float` only applies to children of a block formatting context; taffy
+    /// positions a `Float::Left`/`Right` box at the start/end of the current line
+    /// and flows following in-flow content beside it (the `float_layout` feature).
+    /// The CSS-logical `inline-start`/`inline-end` keywords are physicalised to
+    /// `left`/`right` for our LTR-only test surface (stylo's adjuster does NOT
+    /// resolve them by writing-mode for `float`, so they can survive into computed
+    /// values — see the float gotcha in the layout pass).
+    #[inline]
+    pub fn float(input: stylo::Float) -> taffy::Float {
+        match input {
+            stylo::Float::None => taffy::Float::None,
+            stylo::Float::Left => taffy::Float::Left,
+            stylo::Float::Right => taffy::Float::Right,
+            // Logical -> physical (LTR). RTL would swap, but our tests are LTR.
+            stylo::Float::InlineStart => taffy::Float::Left,
+            stylo::Float::InlineEnd => taffy::Float::Right,
+        }
+    }
+
+    /// Map stylo's computed `clear` keyword to taffy's `Clear`.
+    ///
+    /// `clear` moves the box below any preceding floats on the named side(s).
+    /// Logical `inline-start`/`inline-end` physicalise to `left`/`right` (LTR).
+    #[inline]
+    pub fn clear(input: stylo::Clear) -> taffy::Clear {
+        match input {
+            stylo::Clear::None => taffy::Clear::None,
+            stylo::Clear::Left => taffy::Clear::Left,
+            stylo::Clear::Right => taffy::Clear::Right,
+            stylo::Clear::Both => taffy::Clear::Both,
+            stylo::Clear::InlineStart => taffy::Clear::Left,
+            stylo::Clear::InlineEnd => taffy::Clear::Right,
         }
     }
 
@@ -2079,7 +2357,7 @@ mod taffy_convert {
     }
 
     /// Eagerly convert an entire `ComputedValues` into a `taffy::Style`
-    /// (flex + block + grid + box-model subset; float omitted).
+    /// (flex + block + grid + float/clear + box-model subset).
     ///
     /// Returns the DEFAULT `taffy::Style` (custom-ident = `String`) rather than
     /// Blitz's `Style<Atom>`: taffy's `TaffyTree` (which `StyloEngine::layout`
@@ -2108,6 +2386,13 @@ mod taffy_convert {
             },
             direction: self::direction(style.clone_direction()),
             scrollbar_width: 0.0,
+
+            // Floats (gated behind taffy's `float_layout` feature, enabled in
+            // Cargo.toml). A `float:left` box is taken out of flow and placed at
+            // the line start; following in-flow content wraps beside it. `clear`
+            // pushes a box below preceding floats. Both come from the `box` struct.
+            float: self::float(style.get_box().clone_float()),
+            clear: self::clear(style.get_box().clone_clear()),
 
             size: taffy::Size {
                 width: self::dimension(&pos.width),
@@ -2247,6 +2532,11 @@ pub struct ElementLayoutDetail {
     pub border: Edges,
     /// Margin edge widths.
     pub margin: Edges,
+    /// Whether the element's computed `position` is anything other than `static`
+    /// (`relative` / `absolute` / `fixed` / `sticky`). An element is a CSS
+    /// **offset parent** for its descendants iff this is true (or it's the body).
+    /// Lets a caller resolve `offsetParent`-relative offsets without re-cascading.
+    pub is_positioned: bool,
 }
 
 impl StyloEngine {
@@ -2555,6 +2845,7 @@ impl StyloEngine {
                 padding: Edges::default(),
                 border: Edges::default(),
                 margin: Edges::default(),
+                is_positioned: false,
             };
             order.len()
         ];
@@ -2563,6 +2854,15 @@ impl StyloEngine {
             let l = tree.layout(taffy_nodes[idx]).expect("taffy layout");
             let ax = px + l.location.x;
             let ay = py + l.location.y;
+            // `position != static` (computed) marks this element as an offset
+            // parent for its descendants. Read the cascaded `position` directly.
+            let is_positioned = self
+                .computed_values_for(order[idx])
+                .map(|cv| {
+                    cv.clone_position()
+                        != style::properties::longhands::position::computed_value::T::Static
+                })
+                .unwrap_or(false);
             details[idx] = ElementLayoutDetail {
                 slab: order[idx],
                 rect: Rect {
@@ -2575,6 +2875,7 @@ impl StyloEngine {
                 padding: Edges::from_taffy(l.padding),
                 border: Edges::from_taffy(l.border),
                 margin: Edges::from_taffy(l.margin),
+                is_positioned,
             };
             let slab = order[idx];
             for c in self.doc.nodes[slab]
@@ -2764,6 +3065,98 @@ mod tests {
             style.padding
         );
         assert_eq!(style.display, Display::Flex, "display should be Flex");
+    }
+
+    #[test]
+    fn hover_restyle_toggles_background() {
+        // `.btn { background:#000000 } .btn:hover { background:#ff0000 }` on a
+        // single `.btn` element. With no hover the cascade resolves black; setting
+        // hover on the element and re-resolving must re-run the cascade so the
+        // `:hover` rule wins and background flips to red; clearing hover restores
+        // black. This is the whole interactivity seam: pointer hover -> element
+        // state -> forced restyle -> visible change.
+        let black = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+
+        let mut engine =
+            StyloEngine::new(".btn { background:#000000 } .btn:hover { background:#ff0000 }");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let btn = doc.add_element(html, "div", None, &["btn"]);
+
+        // No hover: black.
+        let style = resolve(&mut engine, btn);
+        assert_eq!(
+            style.background, black,
+            "without hover the .btn background should be black"
+        );
+
+        // Hover on: the forced restyle must re-cascade so `:hover` wins -> red.
+        engine.set_hover(Some(btn));
+        let style = resolve(&mut engine, btn);
+        assert_eq!(
+            style.background, red,
+            "hovering the .btn should restyle its background to red"
+        );
+
+        // Hover off: back to black.
+        engine.set_hover(None);
+        let style = resolve(&mut engine, btn);
+        assert_eq!(
+            style.background, black,
+            "clearing hover should restyle the .btn background back to black"
+        );
+    }
+
+    #[test]
+    fn hit_test_picks_deepest_element() {
+        // A page box with a nested button. A point inside the button must hit the
+        // button (the deepest element), not the page behind it; a point inside the
+        // page but outside the button hits the page; a point outside both misses.
+        let mut engine = StyloEngine::new(
+            ".page { width:200px; height:200px } \
+             .btn { width:50px; height:20px }",
+        );
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let page = doc.add_element(html, "div", None, &["page"]);
+        let btn = doc.add_element(page, "div", None, &["btn"]);
+
+        let vp = TSize { w: 300.0, h: 300.0 };
+        // The button sits at the page's content origin (top-left). A point well
+        // inside it lands on the button.
+        let inside_btn = canopy_traits::Point { x: 12.0, y: 8.0 };
+        assert_eq!(
+            engine.hit_test(inside_btn, vp),
+            Some(btn),
+            "a point inside the nested button should hit the button (deepest)"
+        );
+
+        // A point inside the page but below the 20px-tall button hits the page.
+        let inside_page = canopy_traits::Point { x: 100.0, y: 150.0 };
+        assert_eq!(
+            engine.hit_test(inside_page, vp),
+            Some(page),
+            "a point inside the page but outside the button should hit the page"
+        );
+
+        // A point outside the whole page misses everything.
+        let outside = canopy_traits::Point { x: 999.0, y: 999.0 };
+        assert_eq!(
+            engine.hit_test(outside, vp),
+            None,
+            "a point outside the page should hit nothing"
+        );
     }
 
     #[test]
@@ -3178,6 +3571,87 @@ mod tests {
             (leaf.size.w - 40.0).abs() <= 2.0,
             "min-content width should be ~40 (widest word, 2 Ahem glyphs @ 20px), got {}",
             leaf.size.w
+        );
+    }
+
+    #[test]
+    fn layout_float_left_content_flows_beside() {
+        // A `float:left` box (50x50) followed by a sibling that establishes its own
+        // block formatting context (`overflow:hidden`). With taffy's `float_layout`
+        // feature ON and `taffy_convert` mapping `float`/`clear`, the float is taken
+        // out of flow at the line start (origin 0,0) and the BFC sibling flows
+        // BESIDE it into the content slot to the float's right (x >= ~50), on the
+        // same line (y ~ 0). Without float support the sibling would start at the
+        // container origin (x == 0), overlapping the float — this is exactly the
+        // before/after of enabling the float feature + mapping.
+        //
+        // NB: a *plain* block sibling's border box is NOT shifted by a float in CSS
+        // (only its inline/line content wraps); a box must establish a new BFC
+        // (overflow!=visible / display:flow-root / inline-block) to sit beside the
+        // float as a block. Taffy models this via `is_in_same_bfc` — see the gotcha.
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:block; width:400px; height:200px");
+            let floated = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(floated, "float:left; width:50px; height:50px");
+            let beside = doc.add_element(html, "div", None, &[]);
+            // A new-BFC in-flow sibling (overflow:hidden) sits beside the float.
+            doc.set_inline_style(beside, "overflow:hidden; width:50px; height:50px");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 3, "html + float + sibling");
+        let floated = rects[1];
+        let beside = rects[2];
+        println!("float box = {floated:?}; sibling box = {beside:?}");
+
+        // The float sits at the top-left of its container.
+        assert!(
+            near(floated.origin.x, 0.0) && near(floated.origin.y, 0.0),
+            "float should be at (0,0), got {:?}",
+            floated.origin
+        );
+        // The sibling flows BESIDE the float: its left edge is at/after the float's
+        // right edge (x >= ~50), and it stays on the same line (top, y ~ 0).
+        assert!(
+            beside.origin.x >= 50.0 - 1.0,
+            "sibling should flow to the RIGHT of the float (x >= ~50), got x={}",
+            beside.origin.x
+        );
+        assert!(
+            near(beside.origin.y, 0.0),
+            "sibling should stay on the same line as the float (y ~ 0), got y={}",
+            beside.origin.y
+        );
+    }
+
+    #[test]
+    fn layout_clear_left_drops_below_float() {
+        // A `float:left` box (50x50) followed by a `clear:left` sibling. `clear:left`
+        // moves the box BELOW any preceding left-floated box, so the sibling's top
+        // edge is at/after the float's bottom (y >= ~50), flowing at x ~ 0. This
+        // exercises the `clear` mapping (the complement of the float-flow test).
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:block; width:400px; height:200px");
+            let floated = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(floated, "float:left; width:50px; height:50px");
+            let cleared = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(cleared, "clear:left; width:50px; height:50px");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 3, "html + float + cleared sibling");
+        let cleared = rects[2];
+        println!("cleared sibling box = {cleared:?}");
+        assert!(
+            cleared.origin.y >= 50.0 - 1.0,
+            "clear:left sibling should drop BELOW the float (y >= ~50), got y={}",
+            cleared.origin.y
         );
     }
 }

@@ -18,8 +18,9 @@
 //! element's resolved foreground `color` and `font_size`.
 
 use canopy_render_soft::Buffer;
-use canopy_traits::{Color, Point, Rect, Size};
+use canopy_traits::{BoxShadow, Color, GradientAxis, LinearGradient, Point, Rect, Size};
 
+use crate::text_measure::{self, RasterizedRun};
 use crate::{NodeKind, StyloEngine};
 
 /// Scale a color's alpha by `opacity` (clamped to `[0,1]`), leaving RGB intact.
@@ -89,6 +90,224 @@ fn paint_ahem_text(buffer: &mut Buffer, origin: Point, text: &str, color: Color,
     }
 }
 
+/// `src` over `dst` with straight alpha `a` (0..=255), rounded.
+///
+/// `out = src·a + dst·(255−a)`, all integer, with `+127` for round-to-nearest so
+/// the blend is symmetric. The same primitive `canopy_render_text::composite_coverage`
+/// uses, copied here (this crate doesn't depend on that one).
+#[inline]
+fn blend(src: u8, dst: u8, a: u32) -> u8 {
+    let inv = 255 - a;
+    let v = (u32::from(src) * a + u32::from(dst) * inv + 127) / 255;
+    v as u8
+}
+
+/// Composite a straight-alpha coverage mask onto `buffer` in `ink`, top-left at
+/// `origin`.
+///
+/// `coverage` is row-major, one byte per pixel, exactly `width * height` bytes (the
+/// [`RasterizedRun`] layout). Each byte is the fractional ink coverage: `0` leaves
+/// the destination untouched, `255` overwrites it with `ink`, anything between
+/// blends `ink` over the existing pixel (`out = ink·a + dst·(1 − a)`). The ink's own
+/// alpha folds into the coverage, so an opacity-faded text run stays faded. This is a
+/// port of `canopy_render_text::composite_coverage` — the antialiasing the 1-bit
+/// baked font can't express comes from these partial-coverage edge pixels.
+fn composite_coverage(
+    buffer: &mut Buffer,
+    origin: Point,
+    coverage: &[u8],
+    width: u32,
+    height: u32,
+    ink: Color,
+) {
+    let ox = origin.x.max(0.0) as usize;
+    let oy = origin.y.max(0.0) as usize;
+    let w = width as usize;
+    let h = height as usize;
+
+    for row in 0..h {
+        let py = oy + row;
+        if py >= buffer.height() {
+            break;
+        }
+        let row_base = row * w;
+        for col in 0..w {
+            let px = ox + col;
+            if px >= buffer.width() {
+                break;
+            }
+            let cov = coverage[row_base + col];
+            if cov == 0 {
+                continue; // fully transparent: leave the destination as-is.
+            }
+            // Fold the ink's own alpha into the coverage.
+            let a = (u32::from(cov) * u32::from(ink.a)) / 255;
+            if a == 0 {
+                continue;
+            }
+            let out = if a >= 255 {
+                [ink.r, ink.g, ink.b, 255]
+            } else {
+                let dst = buffer.pixel(px, py);
+                [
+                    blend(ink.r, dst[0], a),
+                    blend(ink.g, dst[1], a),
+                    blend(ink.b, dst[2], a),
+                    blend(255, dst[3], a),
+                ]
+            };
+            // We already composited against the destination, so store straight
+            // (never back through `fill_rect`, which would alpha-blend again).
+            buffer.set_pixel(px, py, out);
+        }
+    }
+}
+
+/// Linearly interpolate between two straight-alpha colors at `t` in `[0, 1]`.
+#[inline]
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color {
+        r: mix(a.r, b.r),
+        g: mix(a.g, b.g),
+        b: mix(a.b, b.b),
+        a: mix(a.a, b.a),
+    }
+}
+
+/// Fill `rect` with a two-stop [`LinearGradient`], one scanline (vertical) or one
+/// column-strip (horizontal) at a time.
+///
+/// Each strip is a flat [`Buffer::fill_rect`] in the interpolated stop color, so the
+/// gradient composites over whatever is behind it (alpha-blended). The interpolation
+/// parameter runs `0 → 1` from the axis start edge to the end edge. `opacity` fades
+/// every strip's alpha uniformly (the element-opacity model).
+fn fill_linear_gradient(buffer: &mut Buffer, rect: Rect, grad: LinearGradient, opacity: f32) {
+    let w = rect.size.w.max(0.0);
+    let h = rect.size.h.max(0.0);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    match grad.axis {
+        GradientAxis::Vertical => {
+            let rows = h.ceil() as usize;
+            let denom = (rows.max(1) as f32 - 1.0).max(1.0);
+            for row in 0..rows {
+                let t = row as f32 / denom;
+                let c = with_opacity(lerp_color(grad.start, grad.end, t), opacity);
+                buffer.fill_rect(
+                    Rect {
+                        origin: Point {
+                            x: rect.origin.x,
+                            y: rect.origin.y + row as f32,
+                        },
+                        size: Size { w, h: 1.0 },
+                    },
+                    c,
+                );
+            }
+        }
+        GradientAxis::Horizontal => {
+            let cols = w.ceil() as usize;
+            let denom = (cols.max(1) as f32 - 1.0).max(1.0);
+            for col in 0..cols {
+                let t = col as f32 / denom;
+                let c = with_opacity(lerp_color(grad.start, grad.end, t), opacity);
+                buffer.fill_rect(
+                    Rect {
+                        origin: Point {
+                            x: rect.origin.x + col as f32,
+                            y: rect.origin.y,
+                        },
+                        size: Size { w: 1.0, h },
+                    },
+                    c,
+                );
+            }
+        }
+    }
+}
+
+/// Paint a soft outset [`BoxShadow`] behind `box_rect`.
+///
+/// The shadow is a rect the size of the element's border-box, translated by the
+/// shadow's `(dx, dy)`, with a `blur`-wide feathered falloff on every side. We
+/// approximate the Gaussian blur with a cheap distance ramp: the solid shadow core
+/// is the offset border-box inset by the blur, and a `blur`-px border around it
+/// fades the shadow alpha linearly to 0 — enough to read as a soft drop shadow on a
+/// CPU buffer without a real separable blur. `opacity` fades the whole shadow.
+fn paint_box_shadow(buffer: &mut Buffer, box_rect: Rect, shadow: BoxShadow, opacity: f32) {
+    if shadow.color.a == 0 {
+        return;
+    }
+    let blur = shadow.blur.max(0.0);
+    // The shadow's outer bounds: the border-box, offset, then inflated by `blur`.
+    let ox = box_rect.origin.x + shadow.dx;
+    let oy = box_rect.origin.y + shadow.dy;
+    let bw = box_rect.size.w;
+    let bh = box_rect.size.h;
+
+    let x0 = (ox - blur).floor();
+    let y0 = (oy - blur).floor();
+    let x1 = (ox + bw + blur).ceil();
+    let y1 = (oy + bh + blur).ceil();
+
+    let base = with_opacity(shadow.color, opacity);
+    if base.a == 0 {
+        return;
+    }
+
+    // The solid (inner) rect where the shadow is at full strength.
+    let core_x0 = ox;
+    let core_y0 = oy;
+    let core_x1 = ox + bw;
+    let core_y1 = oy + bh;
+
+    let px_start_x = x0.max(0.0) as usize;
+    let px_start_y = y0.max(0.0) as usize;
+    let px_end_x = (x1.max(0.0) as usize).min(buffer.width());
+    let px_end_y = (y1.max(0.0) as usize).min(buffer.height());
+
+    for py in px_start_y..px_end_y {
+        for px in px_start_x..px_end_x {
+            let fx = px as f32 + 0.5;
+            let fy = py as f32 + 0.5;
+            // Distance OUTSIDE the solid core (0 inside, grows toward the blur edge).
+            let dx = (core_x0 - fx).max(fx - core_x1).max(0.0);
+            let dy = (core_y0 - fy).max(fy - core_y1).max(0.0);
+            let dist = (dx * dx + dy * dy).sqrt();
+            // Inside the core => full alpha; within `blur` => linear falloff; beyond
+            // => nothing.
+            let falloff = if blur <= 0.0 {
+                if dist <= 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                (1.0 - dist / blur).clamp(0.0, 1.0)
+            };
+            if falloff <= 0.0 {
+                continue;
+            }
+            let a = (u32::from(base.a) as f32 * falloff).round() as u32;
+            if a == 0 {
+                continue;
+            }
+            let a = a.min(255);
+            let dst = buffer.pixel(px, py);
+            let out = [
+                blend(base.r, dst[0], a),
+                blend(base.g, dst[1], a),
+                blend(base.b, dst[2], a),
+                blend(255, dst[3], a),
+            ];
+            buffer.set_pixel(px, py, out);
+        }
+    }
+}
+
 impl StyloEngine {
     /// Render the cascaded + laid-out tree into an RGBA8 [`Buffer`] of size
     /// `viewport`.
@@ -126,6 +345,13 @@ impl StyloEngine {
             let has_border = bw > 0.0 && style.border_color.a > 0;
             let radius = style.border_radius.max(0.0);
 
+            // Box-shadow first: a soft outset shadow sits BEHIND the box, so paint it
+            // before the border/background fill (which then draws over the shadow's
+            // core under the box).
+            if let Some(shadow) = style.box_shadow {
+                paint_box_shadow(&mut buffer, rect, shadow, style.opacity);
+            }
+
             // Border + background. The border is a *frame*: fill the full border-box
             // in the border color (rounded to `radius`), then fill the inset
             // content/padding box in the background — so the border color survives
@@ -157,6 +383,19 @@ impl StyloEngine {
                 buffer.fill_round_rect(rect, with_opacity(style.background, style.opacity), radius);
             }
 
+            // Gradient background: a two-stop `linear-gradient` paints OVER the flat
+            // background color (it's the more specific paint), filling the content
+            // box (inset inside a border) or the whole border-box. Square corners
+            // only — the strip fill doesn't carve the rounded corner.
+            if let Some(grad) = style.gradient {
+                let fill_rect = if has_border {
+                    inset_rect(rect, bw)
+                } else {
+                    rect
+                };
+                fill_linear_gradient(&mut buffer, fill_rect, grad, style.opacity);
+            }
+
             // Text: only a *text-bearing leaf* (an element whose children are all
             // Text — never a container that also has element children) renders text,
             // at the box origin in the element's foreground color + font size, faded
@@ -177,7 +416,33 @@ impl StyloEngine {
                     // (so paint and layout agree, and Ahem reftests match).
                     paint_ahem_text(&mut buffer, rect.origin, &text, fg, style.font_size);
                 } else {
-                    buffer.blit_text(rect.origin, &text, fg, style.font_size);
+                    // Non-Ahem text: shape + rasterize REAL antialiased glyphs via
+                    // cosmic-text/swash (the same shared FontSystem the measure path
+                    // uses), then alpha-over composite the coverage mask in the
+                    // foreground color — gray feathered edges, not a 1-bit baked
+                    // blit. Family `""` selects the bundled sans fallback, the face
+                    // every non-Ahem request resolves to in our deterministic font
+                    // set. The rasterized run is the tight INK bbox; the measure path
+                    // sizes the line box at `font_size`, so center the ink within
+                    // that line box (vertical shift) the way `canopy-render-text`
+                    // does, keeping the glyphs from riding the box's top edge.
+                    let run: RasterizedRun =
+                        text_measure::rasterize_run(&text, style.font_size, "");
+                    if run.width > 0 && run.height > 0 {
+                        let vshift = ((style.font_size - run.height as f32) * 0.5).max(0.0);
+                        let origin = Point {
+                            x: rect.origin.x,
+                            y: rect.origin.y + vshift,
+                        };
+                        composite_coverage(
+                            &mut buffer,
+                            origin,
+                            &run.coverage,
+                            run.width,
+                            run.height,
+                            fg,
+                        );
+                    }
                 }
             }
         }
@@ -450,5 +715,239 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PART 1 (real glyphs) — non-Ahem text renders REAL antialiased glyphs.
+    ///
+    /// Black text on the white clear background: every glyph edge feathers through
+    /// the gray midtones. The headline assertion is that *intermediate* pixels
+    /// (strictly between pure black ink and pure white background, on all channels)
+    /// exist — a 1-bit baked font can never produce those. This is the proof the CPU
+    /// text path now rasterizes cosmic-text/swash coverage, not blocky cells.
+    #[test]
+    fn non_ahem_text_renders_antialiased_glyphs() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        // No font-family => the bundled sans fallback (NOT Ahem). Big size for plenty
+        // of curved/slanted edges. Black on white so AA edges are gray.
+        let boxed = doc.add_element(html, "div", None, &[]);
+        engine
+            .document_mut()
+            .set_inline_style(boxed, "font-size:32px; color:#000000");
+        engine.document_mut().add_text(boxed, "Ag");
+
+        let buffer = engine.render(Size { w: 160.0, h: 64.0 });
+        let data = buffer.data();
+        let (w, h) = (160usize, 64usize);
+
+        let (mut full_ink, mut pure_bg, mut intermediate) = (0usize, 0usize, 0usize);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let (r, g, b) = (data[i], data[i + 1], data[i + 2]);
+                if r == 255 && g == 255 && b == 255 {
+                    pure_bg += 1;
+                } else if r == 0 && g == 0 && b == 0 {
+                    full_ink += 1;
+                } else {
+                    intermediate += 1;
+                }
+            }
+        }
+        println!(
+            "non-Ahem 'Ag'@32: full_ink={full_ink}, intermediate(AA)={intermediate}, bg={pure_bg}"
+        );
+
+        assert!(full_ink > 0, "expected fully-inked black glyph cores");
+        assert!(pure_bg > 0, "expected untouched white background");
+        // THE antialiasing assertion: gray edge pixels a 1-bit font cannot make.
+        assert!(
+            intermediate > 0,
+            "expected antialiased intermediate-gray edge pixels; got 0 (blocky/baked?)"
+        );
+    }
+
+    /// PART 1 (real glyphs) — antialiased glyph edges feather over a PAINTED
+    /// background, not just the clear color.
+    ///
+    /// White text over a solid mid-gray box: a real composite reads the destination
+    /// (the gray box) under each edge, so some edge pixel lands strictly between the
+    /// box gray (64) and full white ink (255). That's only possible if the coverage
+    /// mask blends over what was already painted, exactly the `composite_coverage`
+    /// contract.
+    #[test]
+    fn non_ahem_text_feathers_over_painted_background() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let boxed = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            boxed,
+            "width:160px;height:64px;background:#404040;font-size:32px;color:#ffffff",
+        );
+        engine.document_mut().add_text(boxed, "Ag");
+
+        let buffer = engine.render(Size { w: 160.0, h: 64.0 });
+        let data = buffer.data();
+        let (w, h) = (160usize, 64usize);
+
+        // Some pixel strictly between the box gray (0x40 = 64) and full ink (255):
+        // an AA edge blended over the box, not the white clear color.
+        let mut feathered = false;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let r = data[i];
+                if r > 64 && r < 255 {
+                    feathered = true;
+                }
+            }
+        }
+        assert!(
+            feathered,
+            "an AA glyph edge must blend over the painted gray box (64 < r < 255)"
+        );
+    }
+
+    /// PART 2 (gradient) — a `linear-gradient(to bottom, red, blue)` background
+    /// fills the box with a vertical red→blue ramp.
+    ///
+    /// The top rows are dominated by red, the bottom rows by blue, and a mid row is a
+    /// genuine blend (both channels present) — proving the two-stop gradient
+    /// interpolates down the box rather than painting a flat fill.
+    #[test]
+    fn vertical_linear_gradient_ramps_red_to_blue() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let boxed = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            boxed,
+            "width:80px;height:80px;background:linear-gradient(to bottom, #ff0000, #0000ff)",
+        );
+
+        let buffer = engine.render(Size { w: 100.0, h: 100.0 });
+        let data = buffer.data();
+        let w = 100usize;
+        let px = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            (data[i], data[i + 1], data[i + 2])
+        };
+
+        let (tr, _tg, tb) = px(40, 2); // near top
+        let (mr, _mg, mb) = px(40, 40); // middle
+        let (br, _bg, bb) = px(40, 78); // near bottom
+
+        // Top is red-dominant, bottom is blue-dominant.
+        assert!(
+            tr > tb + 100,
+            "top should be red-dominant, got r={tr} b={tb}"
+        );
+        assert!(
+            bb > br + 100,
+            "bottom should be blue-dominant, got r={br} b={bb}"
+        );
+        // The middle is a real blend (both red and blue meaningfully present, and
+        // the red is between the endpoints).
+        assert!(
+            mr > 40 && mb > 40 && mr < tr && mb < bb,
+            "middle should blend red+blue, got r={mr} b={mb}"
+        );
+    }
+
+    /// PART 2 (gradient) — a `linear-gradient(to right, …)` ramps horizontally.
+    ///
+    /// Same proof on the other axis: left edge red-dominant, right edge blue-dominant.
+    #[test]
+    fn horizontal_linear_gradient_ramps_left_to_right() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let boxed = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            boxed,
+            "width:80px;height:80px;background:linear-gradient(to right, #ff0000, #0000ff)",
+        );
+
+        let buffer = engine.render(Size { w: 100.0, h: 100.0 });
+        let data = buffer.data();
+        let w = 100usize;
+        let px = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            (data[i], data[i + 1], data[i + 2])
+        };
+
+        let (lr, _lg, lb) = px(2, 40); // near left
+        let (rr, _rg, rb) = px(78, 40); // near right
+        assert!(
+            lr > lb + 100,
+            "left should be red-dominant, got r={lr} b={lb}"
+        );
+        assert!(
+            rb > rr + 100,
+            "right should be blue-dominant, got r={rr} b={rb}"
+        );
+    }
+
+    /// PART 2 (shadow) — a `box-shadow` paints a soft dark halo OUTSIDE the box.
+    ///
+    /// A small box with a blurred, offset shadow over a white background: just
+    /// beyond the box's bottom-right corner (where the positive offset pushes the
+    /// shadow) the pixels must be darkened below pure white — and the falloff must
+    /// fade (an inner shadow pixel is darker than one farther out). Proves the soft
+    /// outset shadow renders behind/around the box.
+    #[test]
+    fn box_shadow_paints_soft_halo_outside_box() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let boxed = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            boxed,
+            "width:40px;height:40px;background:#ffffff;box-shadow:6px 6px 6px #000000",
+        );
+
+        let buffer = engine.render(Size { w: 120.0, h: 120.0 });
+        let data = buffer.data();
+        let w = 120usize;
+
+        // Find the box origin (it carries a UA body margin of 8px).
+        let rects = engine.layout(Size { w: 120.0, h: 120.0 });
+        let order = engine.element_dfs_order();
+        let mut box_rect = None;
+        for (&slab, &rect) in order.iter().zip(rects.iter()) {
+            if let NodeKind::Element { name, .. } = &engine.doc.nodes[slab].kind {
+                if name.local.as_ref() == "div" {
+                    box_rect = Some(rect);
+                }
+            }
+        }
+        let rect = box_rect.expect("the div should be laid out");
+        let (rx, ry) = (rect.origin.x as usize, rect.origin.y as usize);
+        let (rw, rh) = (rect.size.w as usize, rect.size.h as usize);
+
+        let lum = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            data[i] as u32 + data[i + 1] as u32 + data[i + 2] as u32
+        };
+
+        // A pixel just past the bottom-right corner, inside the shadow's offset core,
+        // must be darkened below pure white (765 = 255*3).
+        let inner = lum(rx + rw + 2, ry + rh + 2);
+        assert!(
+            inner < 765,
+            "shadow should darken just past the box's bottom-right, got luminance {inner}"
+        );
+        // And the shadow fades outward: a pixel farther out is lighter (closer to
+        // white) than the inner one.
+        let outer = lum(rx + rw + 11, ry + rh + 11);
+        assert!(
+            outer > inner,
+            "shadow must fade with distance: inner {inner} should be darker than outer {outer}"
+        );
+        // The white background far from the box is untouched.
+        let far = lum(rx + rw + 40, ry + rh + 40);
+        assert_eq!(far, 765, "background far from the shadow stays white");
     }
 }

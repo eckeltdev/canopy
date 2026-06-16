@@ -62,6 +62,58 @@ pub struct Color {
     pub a: u8,
 }
 
+/// The axis a simple two-stop [`LinearGradient`] runs along.
+///
+/// The seam carries only the two common orthogonal directions a basic CSS
+/// `linear-gradient(to bottom, …)` / `linear-gradient(to right, …)` produces;
+/// any other angle (or a diagonal "to corner") is mapped to the nearer axis when
+/// flattening, so a renderer only ever has to fill along one of these two.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GradientAxis {
+    /// Top → bottom (`to bottom`): `start` at the top edge, `end` at the bottom.
+    #[default]
+    Vertical,
+    /// Left → right (`to right`): `start` at the left edge, `end` at the right.
+    Horizontal,
+}
+
+/// A reduced **two-stop linear gradient** background.
+///
+/// This is the seam's small, `Copy` stand-in for a CSS `linear-gradient`: the
+/// first and last color stop plus the [`axis`](Self::axis) it runs along. A
+/// renderer fills the box by interpolating `start` → `end` across that axis. CSS
+/// gradients with more than two stops collapse to their first and last stop here
+/// (a faithful endpoint match); non-axis-aligned angles snap to the nearer of the
+/// two [`GradientAxis`] directions.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct LinearGradient {
+    /// Color at the start of the axis (top for vertical, left for horizontal).
+    pub start: Color,
+    /// Color at the end of the axis (bottom for vertical, right for horizontal).
+    pub end: Color,
+    /// The axis the gradient runs along.
+    pub axis: GradientAxis,
+}
+
+/// A reduced **outset box-shadow**: an offset, a blur radius, and a color.
+///
+/// The seam's `Copy` stand-in for a CSS `box-shadow`: the shadow is drawn as a
+/// soft rectangle the same size as the element's border-box, translated by
+/// (`dx`, `dy`) and feathered by `blur` logical px, in `color`. Only the first
+/// **outset** (non-`inset`) shadow of a `box-shadow` list is carried; spread and
+/// inset shadows are dropped.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct BoxShadow {
+    /// Horizontal offset in logical px (positive = right).
+    pub dx: f32,
+    /// Vertical offset in logical px (positive = down).
+    pub dy: f32,
+    /// Blur radius in logical px (`0.0` = a hard-edged offset rect).
+    pub blur: f32,
+    /// Shadow color (already resolved against `currentColor`).
+    pub color: Color,
+}
+
 /// How a node lays its children out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Display {
@@ -118,6 +170,18 @@ pub struct ComputedStyle {
     /// matches what [`measure`](StyleEngine) /
     /// [`TextEngine`](crate::TextEngine) sized the box to. Defaults to `false`.
     pub is_ahem: bool,
+    /// A reduced two-stop `linear-gradient` background, if the element has one.
+    ///
+    /// When `Some`, a renderer fills the box with this gradient *instead of* the
+    /// flat [`background`](Self::background) color (the gradient is the more
+    /// specific paint). `None` (the default) means there is no gradient and the
+    /// flat background applies.
+    pub gradient: Option<LinearGradient>,
+    /// A reduced outset `box-shadow`, if the element has one.
+    ///
+    /// When `Some`, a renderer draws a soft shadow rect behind the element's box.
+    /// `None` (the default) means no shadow.
+    pub box_shadow: Option<BoxShadow>,
 }
 
 impl Default for ComputedStyle {
@@ -136,6 +200,9 @@ impl Default for ComputedStyle {
             opacity: 1.0,
             // Default font-family is not Ahem.
             is_ahem: false,
+            // No gradient / shadow by default.
+            gradient: None,
+            box_shadow: None,
         }
     }
 }

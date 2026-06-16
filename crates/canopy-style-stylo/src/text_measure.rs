@@ -38,7 +38,9 @@
 
 use std::sync::Mutex;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use cosmic_text::{
+    Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache,
+};
 
 /// Where the Ahem test font lives. Ahem is a metrics-perfect font: every glyph
 /// is a 1em square, so `"XXXXX"` at 20px is exactly 100x20 — deterministic, and
@@ -54,6 +56,14 @@ pub const AHEM_FAMILY: &str = "Ahem";
 /// `canopy-text-parley` engine already ships in-tree.
 const SANS_BYTES: &[u8] = include_bytes!("../../canopy-text-parley/fonts/DejaVuSansMono.ttf");
 const SANS_FAMILY: &str = "Canopy Fallback Sans";
+
+/// The **real** internal family name of [`SANS_BYTES`] (the bundled DejaVu Sans
+/// Mono face). [`SANS_FAMILY`] above is only a *generic* mapping name wired via
+/// `set_sans_serif_family`; a `Family::Name` lookup must use the face's actual
+/// name or cosmic-text falls back to the first loaded font (Ahem — every glyph a
+/// solid square). The rasterization path therefore selects the fallback face by
+/// THIS name so non-Ahem text shapes against real glyphs, not Ahem squares.
+const SANS_REAL_FAMILY: &str = "DejaVu Sans Mono";
 
 /// Per-element measurement context attached to a Taffy leaf node.
 ///
@@ -78,6 +88,31 @@ pub struct MeasureContext {
 /// single-threaded within one `compute_layout` call, so contention is nil; the
 /// `Mutex` only guards the lazy init and satisfies `Sync`.
 static FONTS: Mutex<Option<FontSystem>> = Mutex::new(None);
+
+/// A shared, lazily-initialized [`SwashCache`] — the rasterized-glyph cache that
+/// turns a shaped glyph into an 8-bit alpha-coverage bitmap.
+///
+/// Paired with [`FONTS`]: the L3 paint stage shapes a non-Ahem text run against the
+/// shared [`FontSystem`] and rasterizes each glyph through this cache, exactly as
+/// [`canopy_text_parley::TextEngine`](https://docs.rs/canopy-text-parley) does for
+/// the capable-tier renderer. Behind its own `Mutex` for the same single-threaded
+/// reason as `FONTS` (cosmic-text rasterization needs `&mut`).
+static SWASH: Mutex<Option<SwashCache>> = Mutex::new(None);
+
+/// A rasterized text run: the tight ink bounding box plus an 8-bit alpha-coverage
+/// mask (row-major, one byte per pixel, `width * height` bytes; `0` = transparent,
+/// `255` = full ink). This is the same coverage-mask contract
+/// [`canopy_text_parley::Glyphs`](https://docs.rs/canopy-text-parley) hands back —
+/// composite it over a surface in any ink color (alpha = coverage).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RasterizedRun {
+    /// Tight ink-bbox width in pixels.
+    pub width: u32,
+    /// Tight ink-bbox height in pixels.
+    pub height: u32,
+    /// Row-major 8-bit alpha coverage, `width * height` bytes.
+    pub coverage: Vec<u8>,
+}
 
 /// Shape `ctx.text` and return its intrinsic pixel [`taffy::Size`].
 ///
@@ -218,6 +253,114 @@ pub fn intrinsic_width(ctx: &MeasureContext, min_content: bool) -> f32 {
     }
 }
 
+/// Shape `text` at `px` pixels in `family` and **rasterize** it into an
+/// antialiased 8-bit coverage mask (the L3 paint stage's real-glyph path).
+///
+/// Mirrors [`canopy_text_parley::TextEngine::rasterize`](https://docs.rs/canopy-text-parley):
+/// it shapes a single un-wrapped line against the shared [`FONTS`] font system,
+/// rasterizes each placed glyph through the shared [`SWASH`] cache, and accumulates
+/// the per-pixel coverage into a tight ink-bbox bitmap. The returned
+/// [`RasterizedRun`]'s `width`/`height` are the run's **ink bounding box** (leading
+/// and top blank trimmed), so the caller composites it at the box origin and the
+/// glyphs sit where their ink falls.
+///
+/// An empty / all-whitespace run (or a non-positive `px`) returns an empty
+/// (zero-area) mask — there is nothing to composite. `family` is the cascaded first
+/// `font-family` (empty -> the bundled sans fallback), the same selector the
+/// measure path uses, so paint and layout shape against the same face.
+pub fn rasterize_run(text: &str, px: f32, family: &str) -> RasterizedRun {
+    if text.trim().is_empty() || px <= 0.0 {
+        return RasterizedRun::default();
+    }
+
+    let mut font_guard = FONTS.lock().expect("text-measure font system poisoned");
+    let font_system = font_guard.get_or_insert_with(build_font_system);
+    let mut swash_guard = SWASH.lock().expect("text-measure swash cache poisoned");
+    let swash = swash_guard.get_or_insert_with(SwashCache::new);
+
+    // Line height == font size (mirrors the measure path): one tight line.
+    let metrics = Metrics::new(px, px);
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(font_system, None, None); // no wrap: a single line
+
+    // Empty family => the bundled DejaVu fallback by its REAL face name (NOT the
+    // generic `SANS_FAMILY` mapping, which a `Family::Name` lookup won't resolve —
+    // it would silently fall back to Ahem's solid squares). A non-Ahem author
+    // family is requested by name and resolves through the same fallback.
+    let fam = if family.is_empty() {
+        Family::Name(SANS_REAL_FAMILY)
+    } else {
+        Family::Name(family)
+    };
+    let attrs = Attrs::new().family(fam);
+    buffer.set_text(font_system, text, &attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+
+    // First pass: collect every placed glyph pixel and the run's ink bounds. A
+    // glyph's swash image is positioned relative to the glyph pen origin via its
+    // `placement`, which `physical()`/`with_pixels` already fold into the (x, y).
+    struct Px {
+        x: i32,
+        y: i32,
+        a: u8,
+    }
+    let mut pixels: Vec<Px> = Vec::new();
+    let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
+    let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
+
+    let runs: Vec<Vec<_>> = buffer
+        .layout_runs()
+        .map(|run| {
+            run.glyphs
+                .iter()
+                .map(|g| g.physical((0.0, run.line_y), 1.0))
+                .collect()
+        })
+        .collect();
+
+    for run_glyphs in &runs {
+        for pg in run_glyphs {
+            let base = CtColor::rgba(255, 255, 255, 255);
+            swash.with_pixels(font_system, pg.cache_key, base, |ox, oy, c| {
+                let a = c.a();
+                if a == 0 {
+                    return;
+                }
+                let x = pg.x + ox;
+                let y = pg.y + oy;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                pixels.push(Px { x, y, a });
+            });
+        }
+    }
+
+    // No ink (e.g. the run shaped to only blank glyphs): nothing to composite.
+    if pixels.is_empty() {
+        return RasterizedRun::default();
+    }
+
+    let width = (max_x - min_x + 1) as u32;
+    let height = (max_y - min_y + 1) as u32;
+    let mut coverage = vec![0u8; (width as usize) * (height as usize)];
+    for p in &pixels {
+        let lx = (p.x - min_x) as u32;
+        let ly = (p.y - min_y) as u32;
+        let idx = (ly * width + lx) as usize;
+        // Glyphs don't overlap here, but `max` is safe if they ever do.
+        let slot = &mut coverage[idx];
+        *slot = (*slot).max(p.a);
+    }
+
+    RasterizedRun {
+        width,
+        height,
+        coverage,
+    }
+}
+
 /// Build the measurement [`FontSystem`]: load Ahem under [`AHEM_FAMILY`] and a
 /// bundled DejaVu face as the sans/default fallback, with an empty platform
 /// fallback so results never depend on the host's installed fonts.
@@ -250,6 +393,45 @@ fn build_font_system() -> FontSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rasterize_run` produces a tight, antialiased coverage mask for non-Ahem
+    /// text: real partial-coverage edge pixels (the AA a 1-bit font can't make), and
+    /// it must NOT be the all-255 solid block Ahem would yield (the bug where a
+    /// `Family::Name` lookup silently fell through to Ahem's squares).
+    #[test]
+    fn rasterize_run_is_antialiased_not_ahem_squares() {
+        let run = rasterize_run("Ag", 32.0, "");
+        assert!(run.width > 0 && run.height > 0, "must have ink area");
+        assert_eq!(
+            run.coverage.len(),
+            (run.width as usize) * (run.height as usize),
+            "coverage must be width*height bytes"
+        );
+        let ink = run.coverage.iter().filter(|&&c| c != 0).count();
+        let partial = run.coverage.iter().filter(|&&c| c > 0 && c < 255).count();
+        let total = run.coverage.len();
+        println!(
+            "rasterize_run('Ag',32) -> {}x{}: ink={ink} partial(AA)={partial} of {total}",
+            run.width, run.height
+        );
+        assert!(ink > 0, "expected ink pixels");
+        assert!(
+            ink < total,
+            "a solid all-ink block means Ahem squares leaked in (got {ink}/{total})"
+        );
+        assert!(
+            partial > 0,
+            "expected antialiased partial-coverage pixels, got 0"
+        );
+    }
+
+    /// An all-whitespace or empty run rasterizes to an empty mask (nothing to paint).
+    #[test]
+    fn rasterize_run_empty_for_blank() {
+        assert_eq!(rasterize_run("", 16.0, ""), RasterizedRun::default());
+        assert_eq!(rasterize_run("   ", 16.0, ""), RasterizedRun::default());
+        assert_eq!(rasterize_run("x", 0.0, ""), RasterizedRun::default());
+    }
 
     /// Ahem is metrics-perfect: `"XXXXX"` at 20px is exactly 100x20.
     #[test]
