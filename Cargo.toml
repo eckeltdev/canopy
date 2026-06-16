@@ -19,6 +19,7 @@ exclude = [
     "examples/full/demo",
     "examples/full/stylo",
     "examples/full/stylo-browser",
+    "examples/full/capable-tier",
     "examples/full/plugin-counter",
     "examples/full/component-guest",
 ]

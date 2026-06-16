@@ -1,0 +1,38 @@
+[package]
+name = "canopy-full-capable-tier"
+description = "The tiered StyleEngine, proven end to end: ONE Canopy UI tree, authored once with the `Ui` layer, rendered two ways. The lite tier (`canopy-style-css`) expands class rules to inline styles author-side — flat, no combinators. The capable tier carries the tree's real element identity (tag/class/id) to the host, which runs the full Servo-Stylo cascade (`canopy-style-stylo`) over the *actual* retained `canopy_dom` via `StyloEngine::from_dom`. The headline: a `.card .title` descendant rule the lite language cannot represent makes the nested title gold under Stylo and plain under lite. Writes two PPMs and prints the cascade contrast."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone, excluded from the core workspace (it pulls the heavy, std-only
+# canopy-style-stylo). From this directory:
+#   cargo run            # writes capable-lite.ppm + capable-stylo.ppm, prints the contrast
+
+[dependencies]
+# Author the tree ONCE with the batteries-included layer; `Ui::with_css` drives the lite
+# tier, `Ui::capable` carries identity to the host for a real cascade.
+canopy-ui = { path = "../../../crates/canopy-ui" }
+# The retained tree both tiers apply their op-batch into (capable cascades over it).
+canopy-dom = { path = "../../../crates/canopy-dom" }
+# The paint PropId consts (BG/FG/PADDING) the lite class engine writes inline styles to,
+# read back here to synthesize a ComputedStyle for the lite render.
+canopy-paint = { path = "../../../crates/canopy-paint" }
+# The capable-tier StyleEngine: real Stylo cascade over the real Dom.
+canopy-style-stylo = { path = "../../../crates/canopy-style-stylo" }
+# The flat style PAL (ComputedStyle/Color + the StyleEngine trait + OpSink) and NodeId.
+canopy-traits = { path = "../../../crates/canopy-traits" }
+canopy-protocol = { path = "../../../crates/canopy-protocol" }
+# One CPU rasterizer draws BOTH tiers, so the only variable is the ComputedStyle source.
+canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+
+[[bin]]
+name = "canopy-full-capable-tier"
+path = "src/main.rs"
+
+# Pin the workspace boundary (standalone example; own lockfile, like the other Stylo demos).
+[workspace]
+
+[profile.dev.package."*"]
+opt-level = 3
