@@ -1253,6 +1253,11 @@ pub struct StyloEngine {
     stylist: Stylist,
     snapshots: SnapshotMap,
     resolved: bool,
+    /// For the [`from_dom`](StyloEngine::from_dom) (capable-tier) path: maps a real
+    /// `canopy_dom` node handle (`NodeId.raw()`) to its overlay slab id, so
+    /// [`StyleEngine::resolve`] can answer for the real tree's nodes. Empty for the
+    /// HTML/manual paths (which build the overlay with slab == handle).
+    node_map: std::collections::HashMap<u64, usize>,
 }
 
 impl StyloEngine {
@@ -1315,7 +1320,26 @@ body { margin: 8px }
             stylist,
             snapshots: SnapshotMap::new(),
             resolved: false,
+            node_map: std::collections::HashMap::new(),
         }
+    }
+
+    /// Build an engine that cascades the **real** `canopy_dom` retained tree — the
+    /// capable-tier path. Each element's CSS identity (tag name, id, classes) is read
+    /// straight off the Dom (a capable-tier `Ui` carried it there via the op-stream),
+    /// and `css` is the author stylesheet (e.g. `Ui::css_source()`).
+    ///
+    /// This is the production seam: a desktop/SBC host builds its `canopy_dom::Dom` from
+    /// the op-stream, then `StyloEngine::from_dom(&dom, css)` gives it a real CSS cascade
+    /// over that exact tree. [`StyleEngine::resolve`] answers for a `canopy_dom` node by
+    /// mapping its handle to the overlay built here. Elements with no declared tag name
+    /// default to `"div"` (class/id selectors carry the selectivity for app CSS).
+    pub fn from_dom(dom: &canopy_dom::Dom, css: &str) -> Self {
+        let mut engine = Self::new(css);
+        let mut node_map = std::collections::HashMap::new();
+        build_overlay(dom, canopy_dom::ROOT, 0, &mut engine.doc, &mut node_map);
+        engine.node_map = node_map;
+        engine
     }
 
     /// Build an engine from an already-parsed [`Document`] plus its author CSS.
@@ -1745,8 +1769,41 @@ impl StyleEngine for StyloEngine {
         _parent: Option<&ComputedStyle>,
     ) -> Result<ComputedStyle, HostError> {
         self.resolve_styles();
-        let id = node.raw() as usize;
+        // Capable-tier (`from_dom`): map the real Dom handle to its overlay slab.
+        // HTML/manual paths leave `node_map` empty and use slab == handle.
+        let id = self
+            .node_map
+            .get(&node.raw())
+            .copied()
+            .unwrap_or(node.raw() as usize);
         self.computed_style_for(id).ok_or(HostError::BadHandle)
+    }
+}
+
+/// Recursively mirror the `canopy_dom` subtree under `parent_canopy` into the Stylo
+/// overlay [`Document`] under `parent_slab`, reading each element's CSS identity
+/// (tag-name / id / classes) off the real Dom and recording the handle->slab mapping.
+fn build_overlay(
+    dom: &canopy_dom::Dom,
+    parent_canopy: NodeId,
+    parent_slab: usize,
+    doc: &mut Document,
+    node_map: &mut std::collections::HashMap<u64, usize>,
+) {
+    for &child in dom.children(parent_canopy) {
+        let Some(n) = dom.node(child) else { continue };
+        if n.tag.is_some() {
+            // Element: tag-name (default "div"), id, and classes from the real Dom.
+            let tag = dom.tag_name(child).unwrap_or("div");
+            let id = dom.id(child);
+            let classes: Vec<&str> = dom.classes(child).iter().map(String::as_str).collect();
+            let slab = doc.add_element(parent_slab, tag, id, &classes);
+            node_map.insert(child.raw(), slab);
+            build_overlay(dom, child, slab, doc, node_map);
+        } else if n.text.is_some() {
+            let slab = doc.add_text(parent_slab, dom.text_of(child).unwrap_or(""));
+            node_map.insert(child.raw(), slab);
+        }
     }
 }
 
@@ -2941,6 +2998,58 @@ mod tests {
         engine
             .resolve(NodeId::new(id as u64), None)
             .expect("resolve failed")
+    }
+
+    #[test]
+    fn from_dom_cascades_the_real_canopy_tree() {
+        // THE productization proof: a REAL canopy_dom tree (built from the op-stream, as
+        // a capable-tier Ui produces) is cascaded by Stylo — including a descendant
+        // selector and inherited color — over that exact retained tree.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::ElementTag;
+        use canopy_traits::OpSink;
+
+        // A `.card` containing a `.title`, with the identity a capable-tier Ui carries.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_tag_name(card, "div");
+        e.set_class(card, "card");
+        let title = e.create_element(ElementTag::new(1));
+        e.append(card, title);
+        e.set_tag_name(title, "div");
+        e.set_class(title, "title");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        // Cascade the real Dom with real CSS: a class rule + a descendant selector.
+        let css = ".card { background:#112233 } .card .title { color:#00ff00 }";
+        let mut engine = StyloEngine::from_dom(&dom, css);
+
+        let card_style = engine.resolve(card, None).unwrap();
+        let title_style = engine.resolve(title, None).unwrap();
+
+        assert_eq!(
+            card_style.background,
+            Color {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+                a: 255
+            },
+            ".card background applied over the real Dom"
+        );
+        assert_eq!(
+            title_style.color,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "`.card .title` descendant selector resolved over the real Dom"
+        );
     }
 
     #[test]

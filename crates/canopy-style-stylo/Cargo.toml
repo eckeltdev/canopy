@@ -21,6 +21,7 @@ publish = false
 # `Display`/`HostError` we resolve into, and `NodeId`. (std crate may depend on no_std.)
 canopy-traits = { path = "../canopy-traits" }
 canopy-protocol = { path = "../canopy-protocol" }
+canopy-dom = { path = "../canopy-dom" }
 # The CPU software rasterizer — the L3 paint stage (cascade + Taffy boxes -> pixels).
 canopy-render-soft = { path = "../canopy-render-soft" }
 
@@ -50,3 +51,6 @@ cosmic-text = "0.14"
 
 # Pin the workspace boundary (standalone, excluded crate; own lockfile).
 [workspace]
+
+[dev-dependencies]
+canopy-core = { path = "../canopy-core" }
