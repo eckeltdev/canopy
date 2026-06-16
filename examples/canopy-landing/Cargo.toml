@@ -46,3 +46,12 @@ required-features = ["window"]
 
 # Pin the workspace boundary (standalone example; see canopy-welcome for the why).
 [workspace]
+
+# Optimize DEPENDENCIES even in a dev (`cargo run`) build, while keeping this crate
+# itself unoptimized for fast incremental builds. The per-frame cost lives almost
+# entirely in the software rasterizer + cosmic-text (dependencies), so an unoptimized
+# debug build of them is ~50x slower (≈25 ms/frame vs ≈0.5 ms) and the window feels
+# laggy. This is the standard fix for real-time/graphics dev: `cargo run` stays smooth,
+# `cargo run --release` is still fastest.
+[profile.dev.package."*"]
+opt-level = 3

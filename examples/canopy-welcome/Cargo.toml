@@ -64,3 +64,9 @@ required-features = ["window"]
 # empty `[workspace]` table pins the boundary here so `cargo build`/`run` works from
 # this directory in every layout.
 [workspace]
+
+# Optimize dependencies even in a dev (`cargo run`) build so the software rasterizer +
+# cosmic-text run at full speed while this crate stays fast to rebuild. Without it an
+# unoptimized debug build of the renderer is ~50x slower and the window feels laggy.
+[profile.dev.package."*"]
+opt-level = 3

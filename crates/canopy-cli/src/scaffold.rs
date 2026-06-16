@@ -266,7 +266,14 @@ fn cargo_toml(name: &str, crates_root: Option<&Path>) -> String {
          # Pin the workspace boundary here. A scaffolded app is standalone, but if it is\n\
          # created *inside* another Cargo workspace's tree, this empty table stops Cargo\n\
          # from walking up and binding the app to a workspace it isn't a member of.\n\
-         [workspace]\n"
+         [workspace]\n\
+         \n\
+         # Optimize dependencies even in a dev (`cargo run`) build so the software\n\
+         # rasterizer renders at full speed while your own code stays fast to rebuild.\n\
+         # Without this, an unoptimized debug build of the renderer is ~50x slower and\n\
+         # the window feels laggy. (`cargo run --release` is fastest of all.)\n\
+         [profile.dev.package.\"*\"]\n\
+         opt-level = 3\n"
     )
 }
 
