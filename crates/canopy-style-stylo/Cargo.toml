@@ -21,20 +21,28 @@ publish = false
 # `Display`/`HostError` we resolve into, and `NodeId`. (std crate may depend on no_std.)
 canopy-traits = { path = "../canopy-traits" }
 canopy-protocol = { path = "../canopy-protocol" }
+# The CPU software rasterizer — the L3 paint stage (cascade + Taffy boxes -> pixels).
+canopy-render-soft = { path = "../canopy-render-soft" }
 
 # Servo's Stylo, in `servo` mode (the default feature) — the library target is named
 # `style`. Version set pinned to a known link-compatible combination (matches Blitz's).
 style = { package = "stylo", version = "0.18.0" }
 style_dom = { package = "stylo_dom", version = "0.18.0" }     # ElementState
+# Same pinned 0.18.0 already in stylo's graph (shared, not a second copy). Needed to
+# flip the runtime `layout.grid.enabled` pref ON: in `servo` mode stylo gates `display:grid`
+# + the `grid-template-*`/`grid-auto-*` longhands behind this pref (default false).
+static_prefs = { package = "stylo_static_prefs", version = "0.18.0" }
 selectors = "0.38.0"                                          # the Element/SelectorImpl traits
 servo_arc = "0.4.3"                                           # the Arc Stylo cascades into
 markup5ever = "0.39.0"                                        # html atoms (LocalName/Namespace/QualName); matches stylo's web_atoms 0.2
+html5ever = "0.39.0"                                          # real HTML5 parser (parse_html -> Document); matches markup5ever 0.39
+markup5ever_rcdom = "0.39.0"                                  # RcDom: the reference sink we walk into Document
 app_units = "0.7"                                             # Au <-> px
 euclid = "0.22"                                               # viewport Size2D/Scale for the Device
 url = "2"                                                     # UrlExtraData's only public ctor is From<url::Url>
 # Real flex/block layout. We map Stylo's ComputedValues -> taffy::Style (vendored from
 # Blitz's stylo_taffy) and run Taffy, so layout matches a browser for what Taffy supports.
-taffy = { version = "0.11", default-features = false, features = ["std", "flexbox", "block_layout", "taffy_tree"] }
+taffy = { version = "0.11", default-features = false, features = ["std", "flexbox", "block_layout", "grid", "calc", "taffy_tree"] }
 
 # Pin the workspace boundary (standalone, excluded crate; own lockfile).
 [workspace]

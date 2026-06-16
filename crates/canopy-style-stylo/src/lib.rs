@@ -104,6 +104,11 @@ use style_dom::ElementState;
 use canopy_protocol::NodeId;
 use canopy_traits::{Color, ComputedStyle, Display, HostError, StyleEngine};
 
+/// Parse real HTML into the arena [`Document`] (html5ever -> arena).
+pub mod html;
+/// L3 paint: rasterize the cascaded + laid-out tree to pixels.
+pub mod paint;
+
 // ===========================================================================
 // StyloData: interior-mutable slot for Stylo's ElementData.
 // (Copied from /tmp/blitz/.../node/stylo_data.rs, with ALL_DAMAGE replaced by
@@ -1197,6 +1202,12 @@ impl StyloEngine {
     /// Build an engine with the given author CSS. The DOM is then built via
     /// [`Document`] mutators on [`StyloEngine::document_mut`].
     pub fn new(css: &str) -> Self {
+        // Stylo (in `servo` mode) gates `display: grid` parsing AND the
+        // `grid-template-*` / `grid-auto-*` longhands behind the runtime pref
+        // `layout.grid.enabled`, which defaults to false. Flip it on (process-
+        // global atomic; idempotent) so the cascade keeps grid declarations.
+        static_prefs::set_pref!("layout.grid.enabled", true);
+
         let device = Self::make_device();
         let mut stylist = Stylist::new(device, QuirksMode::NoQuirks);
 
@@ -1386,17 +1397,23 @@ impl StyleEngine for StyloEngine {
 // nearly verbatim. Differences from Blitz:
 //   * `stylo::` alias -> `style::` (the crate is renamed `style` here).
 //   * We use the DEFAULT `taffy::Style` (custom-ident = String) instead of
-//     `Style<Atom>`, because GRID is omitted (no NamedLine/NamedSpan), so no
-//     Atom generic is needed anywhere.
-//   * GRID + FLOAT properties are omitted entirely (those taffy features are
-//     off). FLEX + BLOCK + the full box-model subset are ported thoroughly.
+//     Blitz's `Style<Atom>`. Blitz's `Atom` generic is only reachable via its
+//     own `TaffyStyloStyle` trait wrapper; `StyloEngine::layout` instead uses
+//     taffy's `TaffyTree`, whose node `Style` is hard-wired to the default
+//     `String` custom-ident (its `LayoutGridContainer` impl declares
+//     `type CustomIdent = DefaultCheapStr`). So named grid lines/areas are
+//     interned to `String` here; fixed/fr/named grids are otherwise identical.
+//   * FLOAT properties are omitted (that taffy feature is off). FLEX + BLOCK +
+//     GRID + the box-model subset (incl. `calc()`) are ported.
 //   * `text_align` is set to the taffy default (`Auto`); we don't read stylo's
 //     `text_align` because none of our flex/block geometry tests depend on it
 //     and the accessor mapping isn't needed for the subset under test.
+//   * Grid sub-features NOT supported (match Blitz / taffy 0.11 limits):
+//     subgrid and masonry convert to empty/None.
 // ===========================================================================
 
 mod taffy_convert {
-    //! Conversion from Stylo computed style to `taffy::Style` (flex + block).
+    //! Conversion from Stylo computed style to `taffy::Style` (flex + block + grid + calc).
 
     /// Stylo type aliases (Blitz names these `stylo::*`; the crate is `style`).
     mod stylo {
@@ -1404,6 +1421,7 @@ mod taffy_convert {
         pub(crate) use style::properties::longhands::aspect_ratio::computed_value::T as AspectRatio;
         pub(crate) use style::properties::longhands::position::computed_value::T as Position;
         pub(crate) use style::properties::ComputedValues;
+        pub(crate) use style::values::computed::length_percentage::CalcLengthPercentage;
         pub(crate) use style::values::computed::length_percentage::Unpacked as UnpackedLengthPercentage;
         pub(crate) use style::values::computed::{BorderSideWidth, LengthPercentage, Percentage};
         pub(crate) use style::values::generics::length::{
@@ -1432,20 +1450,38 @@ mod taffy_convert {
         };
         pub(crate) use style::values::generics::flex::GenericFlexBasis;
         pub(crate) type FlexBasis = GenericFlexBasis<Size>;
+
+        // grid
+        pub(crate) use style::computed_values::grid_auto_flow::T as GridAutoFlow;
+        pub(crate) use style::values::computed::{
+            GridLine, GridTemplateComponent, ImplicitGridTracks,
+        };
+        pub(crate) use style::values::generics::grid::{
+            RepeatCount, TrackBreadth, TrackListValue, TrackSize,
+        };
+        pub(crate) use style::values::specified::position::{GridTemplateAreas, NamedArea};
+        pub(crate) use style::values::specified::GenericGridTemplateComponent;
     }
 
     use taffy::style_helpers::*;
+    use taffy::CompactLength;
 
     #[inline]
     pub fn length_percentage(val: &stylo::LengthPercentage) -> taffy::LengthPercentage {
         match val.unpack() {
-            // Blitz forwards stylo's calc pointer into taffy via
-            // `CompactLength::calc` + `LengthPercentage::from_raw`, which require
-            // taffy's non-default `calc` feature. We don't enable it (no
-            // `calc()` in the flex/block subset under test), so calc collapses to
-            // zero. Enable `taffy/calc` and restore the pointer path to support
-            // `calc()`.
-            stylo::UnpackedLengthPercentage::Calc(_calc_ptr) => zero(),
+            // Forward stylo's `calc()` pointer into taffy (Blitz's path): build a
+            // `CompactLength::calc` from the opaque stylo `CalcLengthPercentage`
+            // pointer and wrap it as a taffy `LengthPercentage`. Requires taffy's
+            // non-default `calc` feature (enabled in Cargo.toml). Taffy treats the
+            // pointer as an opaque handle and resolves it via stylo's own calc
+            // representation at layout time.
+            stylo::UnpackedLengthPercentage::Calc(calc_ptr) => {
+                let val = CompactLength::calc(
+                    calc_ptr as *const stylo::CalcLengthPercentage as *const (),
+                );
+                // SAFETY: `calc` is a valid `CompactLength` for a `LengthPercentage`.
+                unsafe { taffy::LengthPercentage::from_raw(val) }
+            }
             stylo::UnpackedLengthPercentage::Length(len) => length(len.px()),
             stylo::UnpackedLengthPercentage::Percentage(percentage) => percent(percentage.0),
         }
@@ -1528,9 +1564,12 @@ mod taffy_convert {
         let mut display = match input.inside() {
             stylo::DisplayInside::None => taffy::Display::None,
             stylo::DisplayInside::Flex => taffy::Display::Flex,
+            stylo::DisplayInside::Grid => taffy::Display::Grid,
             stylo::DisplayInside::Flow => taffy::Display::Block,
             stylo::DisplayInside::FlowRoot => taffy::Display::Block,
             stylo::DisplayInside::TableCell => taffy::Display::Block,
+            // taffy has no table layout; approximate with grid (matches Blitz).
+            stylo::DisplayInside::Table => taffy::Display::Grid,
             _ => taffy::Display::DEFAULT,
         };
 
@@ -1672,8 +1711,228 @@ mod taffy_convert {
         }
     }
 
+    // CSS Grid styles
+    // ===============
+    //
+    // Ported from Blitz's `convert.rs` (struct-literal `to_taffy_style`). Taffy's
+    // grid types are generic over the custom-ident string type `S`; we thread
+    // stylo's interned `Atom` through as `S` so named grid lines/areas are
+    // preserved. Subgrid and masonry are not supported (taffy doesn't implement
+    // them); they convert to empty/None as Blitz does.
+
+    #[inline]
+    pub fn grid_auto_flow(input: stylo::GridAutoFlow) -> taffy::GridAutoFlow {
+        let is_row = input.contains(stylo::GridAutoFlow::ROW);
+        let is_dense = input.contains(stylo::GridAutoFlow::DENSE);
+
+        match (is_row, is_dense) {
+            (true, false) => taffy::GridAutoFlow::Row,
+            (true, true) => taffy::GridAutoFlow::RowDense,
+            (false, false) => taffy::GridAutoFlow::Column,
+            (false, true) => taffy::GridAutoFlow::ColumnDense,
+        }
+    }
+
+    #[inline]
+    pub fn grid_line(input: &stylo::GridLine) -> taffy::GridPlacement {
+        // The empty atom marks "no named line" (stylo uses `atom!("")`).
+        let empty = style::Atom::default();
+        if input.is_auto() {
+            taffy::GridPlacement::Auto
+        } else if input.is_span {
+            if input.ident.0 != empty {
+                taffy::GridPlacement::NamedSpan(
+                    input.ident.0.to_string(),
+                    input.line_num.try_into().unwrap(),
+                )
+            } else {
+                taffy::GridPlacement::Span(input.line_num as u16)
+            }
+        } else if input.ident.0 != empty {
+            taffy::GridPlacement::NamedLine(input.ident.0.to_string(), input.line_num as i16)
+        } else if input.line_num != 0 {
+            taffy::style_helpers::line(input.line_num as i16)
+        } else {
+            taffy::GridPlacement::Auto
+        }
+    }
+
+    #[inline]
+    pub fn grid_template_tracks(
+        input: &stylo::GridTemplateComponent,
+    ) -> Vec<taffy::GridTemplateComponent<String>> {
+        match input {
+            stylo::GenericGridTemplateComponent::None => Vec::new(),
+            stylo::GenericGridTemplateComponent::TrackList(list) => list
+                .values
+                .iter()
+                .map(|track| match track {
+                    stylo::TrackListValue::TrackSize(size) => {
+                        taffy::GridTemplateComponent::Single(track_size(size))
+                    }
+                    stylo::TrackListValue::TrackRepeat(repeat) => {
+                        taffy::GridTemplateComponent::Repeat(taffy::GridTemplateRepetition {
+                            count: track_repeat(repeat.count),
+                            tracks: repeat.track_sizes.iter().map(track_size).collect(),
+                            line_names: repeat
+                                .line_names
+                                .iter()
+                                .map(|line_name_set| {
+                                    line_name_set
+                                        .iter()
+                                        .map(|ident| ident.0.to_string())
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect::<Vec<_>>(),
+                        })
+                    }
+                })
+                .collect(),
+
+            // Subgrid and masonry are not supported by taffy.
+            stylo::GenericGridTemplateComponent::Subgrid(_) => Vec::new(),
+            stylo::GenericGridTemplateComponent::Masonry => Vec::new(),
+        }
+    }
+
+    /// The per-track `<line-names>` of a template component, as
+    /// `Vec<Vec<String>>` (one set per grid line). Empty when there are no names.
+    #[inline]
+    pub fn grid_template_line_names(input: &stylo::GridTemplateComponent) -> Vec<Vec<String>> {
+        match input {
+            stylo::GenericGridTemplateComponent::TrackList(list) => list
+                .line_names
+                .iter()
+                .map(|set| {
+                    set.iter()
+                        .map(|ident| ident.0.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            // None / subgrid / masonry carry no taffy-representable line names.
+            stylo::GenericGridTemplateComponent::None
+            | stylo::GenericGridTemplateComponent::Subgrid(_)
+            | stylo::GenericGridTemplateComponent::Masonry => Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn grid_template_area(input: &stylo::NamedArea) -> taffy::GridTemplateArea<String> {
+        taffy::GridTemplateArea {
+            name: input.name.to_string(),
+            row_start: input.rows.start as u16,
+            row_end: input.rows.end as u16,
+            column_start: input.columns.start as u16,
+            column_end: input.columns.end as u16,
+        }
+    }
+
+    #[inline]
+    pub fn grid_template_areas(
+        input: &stylo::GridTemplateAreas,
+    ) -> Vec<taffy::GridTemplateArea<String>> {
+        match input {
+            stylo::GridTemplateAreas::None => Vec::new(),
+            stylo::GridTemplateAreas::Areas(template_areas_arc) => template_areas_arc
+                .0
+                .areas
+                .iter()
+                .map(grid_template_area)
+                .collect(),
+        }
+    }
+
+    #[inline]
+    pub fn grid_auto_tracks(input: &stylo::ImplicitGridTracks) -> Vec<taffy::TrackSizingFunction> {
+        input.0.iter().map(track_size).collect()
+    }
+
+    #[inline]
+    pub fn track_repeat(input: stylo::RepeatCount<i32>) -> taffy::RepetitionCount {
+        match input {
+            stylo::RepeatCount::Number(val) => {
+                taffy::RepetitionCount::Count(val.try_into().unwrap())
+            }
+            stylo::RepeatCount::AutoFill => taffy::RepetitionCount::AutoFill,
+            stylo::RepeatCount::AutoFit => taffy::RepetitionCount::AutoFit,
+        }
+    }
+
+    #[inline]
+    pub fn track_size(
+        input: &stylo::TrackSize<stylo::LengthPercentage>,
+    ) -> taffy::TrackSizingFunction {
+        use taffy::MaxTrackSizingFunction;
+
+        match input {
+            stylo::TrackSize::Breadth(breadth) => taffy::MinMax {
+                min: min_track(breadth),
+                max: max_track(breadth),
+            },
+            stylo::TrackSize::Minmax(min, max) => taffy::MinMax {
+                min: min_track(min),
+                max: max_track(max),
+            },
+            stylo::TrackSize::FitContent(limit) => taffy::MinMax {
+                min: taffy::MinTrackSizingFunction::AUTO,
+                max: match limit {
+                    stylo::TrackBreadth::Breadth(lp) => {
+                        MaxTrackSizingFunction::fit_content(length_percentage(lp))
+                    }
+
+                    // These are not valid inside fit-content() and taffy
+                    // wouldn't support them anyway.
+                    stylo::TrackBreadth::Fr(_) => unreachable!(),
+                    stylo::TrackBreadth::Auto => unreachable!(),
+                    stylo::TrackBreadth::MinContent => unreachable!(),
+                    stylo::TrackBreadth::MaxContent => unreachable!(),
+                },
+            },
+        }
+    }
+
+    #[inline]
+    pub fn min_track(
+        input: &stylo::TrackBreadth<stylo::LengthPercentage>,
+    ) -> taffy::MinTrackSizingFunction {
+        match input {
+            stylo::TrackBreadth::Breadth(lp) => {
+                taffy::MinTrackSizingFunction::from(length_percentage(lp))
+            }
+            stylo::TrackBreadth::Fr(_) => taffy::MinTrackSizingFunction::AUTO,
+            stylo::TrackBreadth::Auto => taffy::MinTrackSizingFunction::AUTO,
+            stylo::TrackBreadth::MinContent => taffy::MinTrackSizingFunction::MIN_CONTENT,
+            stylo::TrackBreadth::MaxContent => taffy::MinTrackSizingFunction::MAX_CONTENT,
+        }
+    }
+
+    #[inline]
+    pub fn max_track(
+        input: &stylo::TrackBreadth<stylo::LengthPercentage>,
+    ) -> taffy::MaxTrackSizingFunction {
+        use taffy::prelude::FromFr;
+
+        match input {
+            stylo::TrackBreadth::Breadth(lp) => {
+                taffy::MaxTrackSizingFunction::from(length_percentage(lp))
+            }
+            stylo::TrackBreadth::Fr(val) => taffy::MaxTrackSizingFunction::from_fr(*val),
+            stylo::TrackBreadth::Auto => taffy::MaxTrackSizingFunction::AUTO,
+            stylo::TrackBreadth::MinContent => taffy::MaxTrackSizingFunction::MIN_CONTENT,
+            stylo::TrackBreadth::MaxContent => taffy::MaxTrackSizingFunction::MAX_CONTENT,
+        }
+    }
+
     /// Eagerly convert an entire `ComputedValues` into a `taffy::Style`
-    /// (flex + block + box-model subset; grid/float omitted).
+    /// (flex + block + grid + box-model subset; float omitted).
+    ///
+    /// Returns the DEFAULT `taffy::Style` (custom-ident = `String`) rather than
+    /// Blitz's `Style<Atom>`: taffy's `TaffyTree` (which `StyloEngine::layout`
+    /// uses) hard-wires its node `Style` to the default `String` custom-ident
+    /// (its `LayoutGridContainer` impl is `type CustomIdent = DefaultCheapStr`),
+    /// so named grid lines/areas are interned to `String` here. Blitz's `Atom`
+    /// generic is only reachable via its own `TaffyStyloStyle` trait wrapper,
+    /// not `TaffyTree`. Fixed/fr/named grids are unaffected.
     pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style {
         let display = style.clone_display();
         let pos = style.get_position();
@@ -1745,6 +2004,9 @@ mod taffy_convert {
             justify_content: self::content_alignment(pos.justify_content),
             align_items: self::item_alignment(pos.align_items.0),
             align_self: self::item_alignment(pos.align_self.0),
+            // Grid-only inline-axis alignment (gated by taffy's `grid` feature).
+            justify_items: self::item_alignment((pos.justify_items.computed.0).0),
+            justify_self: self::item_alignment(pos.justify_self.0),
 
             // Block container: keep taffy default (Auto). Not read from stylo
             // because no flex/block geometry test depends on text-align.
@@ -1756,6 +2018,24 @@ mod taffy_convert {
             flex_grow: pos.flex_grow.0,
             flex_shrink: pos.flex_shrink.0,
             flex_basis: self::flex_basis(&pos.flex_basis),
+
+            // Grid
+            grid_auto_flow: self::grid_auto_flow(pos.grid_auto_flow),
+            grid_template_rows: self::grid_template_tracks(&pos.grid_template_rows),
+            grid_template_columns: self::grid_template_tracks(&pos.grid_template_columns),
+            grid_template_row_names: self::grid_template_line_names(&pos.grid_template_rows),
+            grid_template_column_names: self::grid_template_line_names(&pos.grid_template_columns),
+            grid_template_areas: self::grid_template_areas(&pos.grid_template_areas),
+            grid_auto_rows: self::grid_auto_tracks(&pos.grid_auto_rows),
+            grid_auto_columns: self::grid_auto_tracks(&pos.grid_auto_columns),
+            grid_row: taffy::Line {
+                start: self::grid_line(&pos.grid_row_start),
+                end: self::grid_line(&pos.grid_row_end),
+            },
+            grid_column: taffy::Line {
+                start: self::grid_line(&pos.grid_column_start),
+                end: self::grid_line(&pos.grid_column_end),
+            },
         }
     }
 }
@@ -2201,5 +2481,81 @@ mod tests {
             child.origin.x
         );
         assert!(near(child.size.w, 100.0), "child w {}", child.size.w);
+    }
+
+    #[test]
+    fn layout_calc_width() {
+        // width:calc(50px + 10px) -> resolved width 60px. Exercises the restored
+        // `calc()` pointer path in `length_percentage` (taffy `calc` feature).
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(html, "display:block; width:calc(50px + 10px); height:40px");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 1, "just the html box");
+
+        let c = rects[0];
+        assert!(
+            near(c.size.w, 60.0),
+            "calc(50px + 10px) should resolve to ~60, got {}",
+            c.size.w
+        );
+    }
+
+    #[test]
+    fn layout_grid_two_columns() {
+        // display:grid; grid-template-columns:100px 100px; width:200px container
+        // with two children -> child 0 at x~=0 w~=100, child 1 at x~=100 w~=100.
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            doc.set_inline_style(
+                html,
+                "display:grid; grid-template-columns:100px 100px; width:200px; height:50px",
+            );
+            let _a = doc.add_element(html, "div", None, &[]);
+            let _b = doc.add_element(html, "div", None, &[]);
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 3, "html + 2 grid children");
+
+        // index 0 = grid container
+        let c = rects[0];
+        assert!(
+            near(c.size.w, 200.0),
+            "grid container w should be ~200, got {}",
+            c.size.w
+        );
+
+        // index 1 = first child: column 1 (0..100)
+        let a = rects[1];
+        assert!(
+            near(a.origin.x, 0.0),
+            "grid child 0 x should be ~0, got {}",
+            a.origin.x
+        );
+        assert!(
+            near(a.size.w, 100.0),
+            "grid child 0 w should be ~100, got {}",
+            a.size.w
+        );
+
+        // index 2 = second child: column 2 (100..200)
+        let b = rects[2];
+        assert!(
+            near(b.origin.x, 100.0),
+            "grid child 1 x should be ~100, got {}",
+            b.origin.x
+        );
+        assert!(
+            near(b.size.w, 100.0),
+            "grid child 1 w should be ~100, got {}",
+            b.size.w
+        );
     }
 }
