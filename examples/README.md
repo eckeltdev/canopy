@@ -20,12 +20,14 @@ whole render pipeline is `no_std` + `alloc`.
 
 ## `full/` — the capable tier
 
-GPU rasterization (`wgpu`/`vello`, Metal/Vulkan), real text shaping, and **sandboxed
-untrusted plugins** (the `wasmtime` / Component-Model transports). Desktop / SBC class.
+GPU rasterization (`wgpu`/`vello`, Metal/Vulkan), a **real Servo-Stylo CSS cascade**
+([`canopy-style-stylo`](../crates/canopy-style-stylo)), and **sandboxed untrusted
+plugins** (the `wasmtime` / Component-Model transports). Desktop / SBC class.
 
 | Example | What it shows | Run |
 | --- | --- | --- |
 | [`landing`](full/landing) | The GPU twin of `lite/landing`: the same shared UI, rasterized on the GPU. | `cargo run` · `cargo run --no-default-features --bin render` |
+| [`stylo`](full/stylo) | The full-tier **`StyleEngine`**: a real Stylo cascade (inheritance, specificity, descendant combinators — what the lite class-only engine can't do) resolves a styled tree, then it's rasterized to a PPM. | `cargo run [out.ppm]` |
 | [`demo`](full/demo) | The kitchen sink — a counter + text field + list, with an **untrusted wasm plugin** hosted in a side panel. | `cargo run` · `cargo run --no-default-features --bin render` |
 | [`plugin-counter`](full/plugin-counter) | A tiny untrusted guest compiled to `wasm32-unknown-unknown`; loaded by `demo` and the `wasmtime` transport's tests. | built automatically by its hosts |
 | [`component-guest`](full/component-guest) | The same idea as a real **WebAssembly Component** (wit-bindgen against `wit/canopy.wit`); loaded by the Component-Model transport's tests. | built automatically by its host |

@@ -1,0 +1,37 @@
+[package]
+name = "canopy-style-stylo"
+description = "The FULL-tier Canopy StyleEngine: a real Servo-Stylo CSS cascade (inheritance, specificity, combinators) over a small HTML-like arena DOM, flattened into Canopy's flat `ComputedStyle`. This is the capable-tier counterpart to canopy-style-css (the constrained-tier, class-only resolver); both satisfy the same `canopy_traits::StyleEngine` trait. Modeled on Blitz's blitz-dom Stylo glue."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# DELIBERATELY OUTSIDE the core workspace (see the root Cargo.toml `exclude`): Stylo pulls
+# a large std-only dependency tree (~130 crates: cssparser, selectors, servo_arc, icu_*,
+# url, …) that must never leak into the no_std core or its pinned lockfile. This crate is
+# full-tier only, std-only, and carries its own Cargo.lock. Build/test it from this dir:
+#   cargo +nightly test
+#
+# Stylo declares `links = "servo_style_crate"`, so EXACTLY ONE package in the graph may
+# depend on a given Stylo version: this crate is that single source. Any future Stylo
+# interop (e.g. stylo_taffy) must share this exact `style`/`stylo` version, not pull its own.
+
+[dependencies]
+# Canopy's flat, no_std style PAL: the `StyleEngine` trait + `ComputedStyle`/`Color`/
+# `Display`/`HostError` we resolve into, and `NodeId`. (std crate may depend on no_std.)
+canopy-traits = { path = "../canopy-traits" }
+canopy-protocol = { path = "../canopy-protocol" }
+
+# Servo's Stylo, in `servo` mode (the default feature) — the library target is named
+# `style`. Version set pinned to a known link-compatible combination (matches Blitz's).
+style = { package = "stylo", version = "0.18.0" }
+style_dom = { package = "stylo_dom", version = "0.18.0" }     # ElementState
+selectors = "0.38.0"                                          # the Element/SelectorImpl traits
+servo_arc = "0.4.3"                                           # the Arc Stylo cascades into
+markup5ever = "0.39.0"                                        # html atoms (LocalName/Namespace/QualName); matches stylo's web_atoms 0.2
+app_units = "0.7"                                             # Au <-> px
+euclid = "0.22"                                               # viewport Size2D/Scale for the Device
+url = "2"                                                     # UrlExtraData's only public ctor is From<url::Url>
+
+# Pin the workspace boundary (standalone, excluded crate; own lockfile).
+[workspace]

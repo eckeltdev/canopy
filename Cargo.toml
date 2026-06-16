@@ -7,6 +7,8 @@ resolver = "2"
 #   examples/full/* — capable tier: GPU (wgpu/vello), sandboxed wasm plugins
 #   examples/common/* — shared support libs (e.g. the landing UI both tiers render)
 exclude = [
+    # Full-tier Stylo cascade: pulls Stylo's large std-only tree; standalone, own lockfile.
+    "crates/canopy-style-stylo",
     "examples/common/landing-ui",
     "examples/lite/welcome",
     "examples/lite/landing",

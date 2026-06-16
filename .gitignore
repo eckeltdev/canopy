@@ -9,5 +9,8 @@
 # Workflow agent worktrees (harness scratch)
 /.claude/worktrees/
 
+# Deep-dive agent scratch (distillations with machine-specific paths)
+/.context/
+
 # Nested example build dir + lockfile noise
 /examples/full/demo/target/

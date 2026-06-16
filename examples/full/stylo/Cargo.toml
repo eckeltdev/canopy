@@ -1,0 +1,26 @@
+[package]
+name = "canopy-full-stylo"
+description = "Full-tier demonstration: a real Servo-Stylo CSS cascade (canopy-style-stylo) drives Canopy rendering. Builds a styled tree, resolves each node's ComputedStyle through Stylo (inheritance + specificity + descendant combinators — things the lite class-only engine cannot do), and rasterizes the result to a PPM with the CPU software renderer."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone, excluded from the core workspace (it depends on the heavy, std-only
+# canopy-style-stylo). Run headless:  cargo +nightly run            (writes a PPM)
+#                              or:     cargo +nightly run -- out.ppm
+
+[dependencies]
+# The full-tier StyleEngine: real Stylo cascade -> canopy ComputedStyle.
+canopy-style-stylo = { path = "../../../crates/canopy-style-stylo" }
+# The flat style PAL (ComputedStyle/Color/Display + the StyleEngine trait) and NodeId.
+canopy-traits = { path = "../../../crates/canopy-traits" }
+canopy-protocol = { path = "../../../crates/canopy-protocol" }
+# The lite CPU software rasterizer used to draw the resolved styles to a PPM.
+canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+
+# Pin the workspace boundary (standalone example; own lockfile).
+[workspace]
+
+[profile.dev.package."*"]
+opt-level = 3
