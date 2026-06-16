@@ -86,7 +86,11 @@ pub fn build() -> Landing {
     ui.mount(hero, wordmark);
     enter(&ui, &mut tl, &rt, wordmark, 0.16);
 
-    let tagline = text(&ui, &["tagline"], "A native UI runtime \u{2014} no JavaScript.");
+    let tagline = text(
+        &ui,
+        &["tagline"],
+        "A native UI runtime \u{2014} no JavaScript.",
+    );
     ui.mount(hero, tagline);
     enter(&ui, &mut tl, &rt, tagline, 0.30);
 
@@ -132,7 +136,14 @@ pub fn build() -> Landing {
     let cta = el(&ui, &["cta"]);
     ui.mount(cta, text(&ui, &["cta-text"], "canopy new"));
     ui.mount(footer, cta);
-    ui.mount(footer, text(&ui, &["status"], "v0.0  \u{00b7}  27 crates  \u{00b7}  no JS runtime"));
+    ui.mount(
+        footer,
+        text(
+            &ui,
+            &["status"],
+            "v0.0  \u{00b7}  27 crates  \u{00b7}  no JS runtime",
+        ),
+    );
     enter(&ui, &mut tl, &rt, footer, 0.74);
 
     Landing { ui, timeline: tl }

@@ -137,7 +137,9 @@ impl ApplicationHandler for LandingApp {
         match self.last_frame {
             Some(last) if now.duration_since(last) >= FRAME => {
                 self.last_frame = Some(now);
-                self.landing.timeline.tick(now.duration_since(last).as_secs_f32());
+                self.landing
+                    .timeline
+                    .tick(now.duration_since(last).as_secs_f32());
                 self.landing.ui.runtime().flush();
                 self.apply_and_redraw();
             }
@@ -151,6 +153,14 @@ impl ApplicationHandler for LandingApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
+            // The `.stage` is `100% x 100%`, so a resize just relayouts at the new
+            // viewport — redraw at the new size (the animation loop redraws too, but
+            // this makes the resize feel immediate).
+            WindowEvent::Resized(_) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             // Press any key / click to hot-reload styles.css from disk.
             WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } => {
                 self.landing.ui.reload_css(&load_styles(), None);
