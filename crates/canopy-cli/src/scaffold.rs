@@ -13,7 +13,7 @@
 //! `styles.css`, and a `README.md`. We refuse to clobber a non-empty existing
 //! directory.
 //!
-//! The welcome app is authored exactly like the in-repo `canopy-welcome` example: one
+//! The welcome app is authored exactly like the in-repo `canopy-lite-welcome` example: one
 //! JSX [`rsx!`] tree over the batteries-included [`canopy_ui::Ui`] context, plus a thin
 //! winit + softbuffer host (gated behind a default-on `window` feature) whose
 //! click/hover logic is one-liners on `Ui` and which **hot-reloads** `styles.css` — a

@@ -1,6 +1,6 @@
 //! End-to-end tests for the untrusted **component** transport.
 //!
-//! These load the **real** guest component (`examples/canopy-component-guest`, built
+//! These load the **real** guest component (`examples/full/component-guest`, built
 //! by this crate's `build.rs` via wit-bindgen + `wasm-tools component new`) and run it
 //! through the host, proving the cross-language Component Model path works end to end:
 //! a component built from `wit/canopy.wit` drives the host `Dom` through the single

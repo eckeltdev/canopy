@@ -28,19 +28,19 @@ Both carry the **same** `canopy-protocol` op bytes and validate them through the
 
 ## The guest component build pipeline
 
-The guest lives in `examples/canopy-component-guest` (excluded from the workspace). It
+The guest lives in `examples/full/component-guest` (excluded from the workspace). It
 is a `wit-bindgen` guest compiled to a core module and then packaged into a component.
 `build.rs` runs this automatically for the integration test, but to do it by hand:
 
 ```sh
 # 1. Build the guest into a CORE wasm module (wit-bindgen emits the canonical-ABI glue).
 cargo +nightly build --release --target wasm32-unknown-unknown \
-  --manifest-path examples/canopy-component-guest/Cargo.toml
+  --manifest-path examples/full/component-guest/Cargo.toml
 
 # 2. Package the core module into a COMPONENT. No WASI adapter is needed because the
 #    world grants no WASI — the core module imports only `canopy:ui/host`.
 wasm-tools component new \
-  examples/canopy-component-guest/target/wasm32-unknown-unknown/release/canopy_component_guest.wasm \
+  examples/full/component-guest/target/wasm32-unknown-unknown/release/canopy_component_guest.wasm \
   -o canopy_component_guest.component.wasm
 
 # 3. (optional) Confirm the component imports ONLY `canopy:ui/host` and exports `run`:

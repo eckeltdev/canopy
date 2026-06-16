@@ -13,7 +13,7 @@ rust-version.workspace = true
 # and no host-side `unsafe` memory access at all (unlike the core-wasm transport,
 # which still goes through wasmtime's safe `Memory::read`).
 #
-# `build.rs` builds the guest component (`examples/canopy-component-guest`) and hands
+# `build.rs` builds the guest component (`examples/full/component-guest`) and hands
 # its path to the integration test via CANOPY_COMPONENT_WASM. Unlike the core-wasm
 # transport's build.rs, producing a *component* needs both the
 # `wasm32-unknown-unknown` target AND the `wasm-tools` CLI (to run

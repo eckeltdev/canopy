@@ -1,0 +1,32 @@
+[package]
+name = "canopy-landing-ui"
+description = "Shared UI for the Canopy landing examples: the one-page (no-scroll) dark, animated landing tree + its animation timeline, authored once and rendered two ways — on the CPU (examples/lite/landing) and on the GPU (examples/full/landing). This is the crisp lite-vs-full demo: identical app, swap the backend. Design inspiration: x.ai."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A plain example-support library: it owns the UI tree, the `canopy-anim` timeline, and
+# the (hot-reloadable) `styles.css`, but NO renderer or windowing deps — each tier's
+# example crate brings its own backend and binaries. It is consumed only as a path
+# dependency by examples/lite/landing and examples/full/landing.
+
+[dependencies]
+# The batteries-included authoring layer (Ui + the prelude re-exports: NodeId, Runtime,
+# Dom). Three dirs up to the repo root, then into crates/.
+canopy-ui = { path = "../../../crates/canopy-ui" }
+# The animation timeline (tweens with delay + repeat + easings).
+canopy-anim = { path = "../../../crates/canopy-anim" }
+# The paint PropId consts (OPACITY, TRANSLATE_Y, WIDTH) the animations bind to.
+canopy-paint = { path = "../../../crates/canopy-paint" }
+
+[dev-dependencies]
+# The `OpSink` trait, for the build-smoke test that drains the mount batch.
+canopy-traits = { path = "../../../crates/canopy-traits" }
+
+[lib]
+path = "src/lib.rs"
+
+# Pin the workspace boundary so `cargo` inside this dir does not climb to the root
+# workspace (which excludes examples/); it is built only as a path dep of the tier crates.
+[workspace]

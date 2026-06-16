@@ -1,6 +1,6 @@
 //! Run-verified tests for the untrusted-plugin transport.
 //!
-//! These load the **real** wasm guest (`examples/canopy-plugin-counter`, built to
+//! These load the **real** wasm guest (`examples/full/plugin-counter`, built to
 //! `wasm32-unknown-unknown` by this crate's `build.rs`) and run it through the
 //! sandbox, plus a couple of hand-assembled adversarial modules that prove the
 //! capability/safety properties hold.

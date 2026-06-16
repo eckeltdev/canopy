@@ -1,4 +1,4 @@
-//! Build the untrusted wasm guest (`examples/canopy-plugin-counter`) so the tests
+//! Build the untrusted wasm guest (`examples/full/plugin-counter`) so the tests
 //! can load a real sandboxed module.
 //!
 //! The guest targets `wasm32-unknown-unknown` and is excluded from the workspace, so
@@ -19,12 +19,13 @@ fn main() {
     let manifest_dir = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env("OUT_DIR"));
 
-    // The guest crate lives next to this one under the repo's `examples/`.
+    // The guest crate lives under the repo's `examples/` (full-tier: sandboxed plugins).
     let guest_dir = manifest_dir
         .join("..")
         .join("..")
         .join("examples")
-        .join("canopy-plugin-counter");
+        .join("full")
+        .join("plugin-counter");
     let guest_manifest = guest_dir.join("Cargo.toml");
 
     // Rebuild the wasm whenever the guest's sources or manifest change.

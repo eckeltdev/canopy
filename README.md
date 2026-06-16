@@ -44,7 +44,7 @@ CANOPY_CRATES_PATH=/path/to/canopy canopy new myapp
 
 The whole welcome screen is **one `rsx!` expression** — the JSX-shaped macro lowers
 angle-bracket tags onto a `canopy-ui` `Ui` context. Here is the reactive counter from the
-[`canopy-welcome`](examples/canopy-welcome/src/lib.rs) example, verbatim:
+[`canopy-lite-welcome`](examples/lite/welcome/src/lib.rs) example, verbatim:
 
 ```rust
 use canopy_ui::prelude::*;
@@ -261,7 +261,7 @@ rustup target add thumbv7em-none-eabi
 cargo +nightly build -p canopy-core --target thumbv7em-none-eabi
 ```
 
-The windowed examples (`examples/canopy-welcome` and friends) pull `winit`/`softbuffer`
+The windowed examples (`examples/lite/welcome` and friends) pull `winit`/`softbuffer`
 and are deliberately **excluded** from the core workspace; build them from their own
 directories.
 

@@ -1,14 +1,19 @@
 [workspace]
 resolver = "2"
-# The windowed example pulls winit/softbuffer; keep it out of the no_std core
-# workspace. Build it from examples/canopy-demo directly.
+# The examples pull winit/softbuffer/wgpu (and the wasm guests target a different
+# triple); keep them out of the no_std core workspace. Each is its own standalone
+# `[workspace]`; build it from its own directory. Organized by tier:
+#   examples/lite/* — constrained tier: CPU software raster, baked/parley text
+#   examples/full/* — capable tier: GPU (wgpu/vello), sandboxed wasm plugins
+#   examples/common/* — shared support libs (e.g. the landing UI both tiers render)
 exclude = [
-    "examples/canopy-demo",
-    "examples/canopy-welcome",
-    "examples/canopy-landing",
-    "examples/canopy-landing-gpu",
-    "examples/canopy-plugin-counter",
-    "examples/canopy-component-guest",
+    "examples/common/landing-ui",
+    "examples/lite/welcome",
+    "examples/lite/landing",
+    "examples/full/landing",
+    "examples/full/demo",
+    "examples/full/plugin-counter",
+    "examples/full/component-guest",
 ]
 members = [
     "crates/canopy-protocol",

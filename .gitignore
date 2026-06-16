@@ -10,4 +10,4 @@
 /.claude/worktrees/
 
 # Nested example build dir + lockfile noise
-/examples/canopy-demo/target/
+/examples/full/demo/target/

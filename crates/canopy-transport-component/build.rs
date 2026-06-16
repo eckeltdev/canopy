@@ -1,4 +1,4 @@
-//! Build the untrusted guest **component** (`examples/canopy-component-guest`) so the
+//! Build the untrusted guest **component** (`examples/full/component-guest`) so the
 //! integration test can instantiate a real, end-to-end Component Model guest.
 //!
 //! Producing a component is a two-step pipeline:
@@ -25,12 +25,13 @@ fn main() {
     let manifest_dir = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env("OUT_DIR"));
 
-    // The guest crate lives under the repo's `examples/`.
+    // The guest crate lives under the repo's `examples/` (full-tier: sandboxed plugins).
     let guest_dir = manifest_dir
         .join("..")
         .join("..")
         .join("examples")
-        .join("canopy-component-guest");
+        .join("full")
+        .join("component-guest");
     let guest_manifest = guest_dir.join("Cargo.toml");
 
     // Rebuild whenever the guest sources, its manifest, or the shared WIT change.

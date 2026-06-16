@@ -1,0 +1,72 @@
+[package]
+name = "canopy-lite-welcome"
+description = "The flagship Canopy welcome app — Canopy's answer to the Vite/React starter. A centered, rounded \"create-canopy-app\" landing authored with canopy-ui's rsx! macro: a live counter button and a hot-reloading stylesheet. A windowed binary (winit + softbuffer) plus a headless `render` binary that writes a PPM."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+# `cargo run` launches the welcome window; the headless renderer is `cargo run --bin render`.
+default-run = "canopy-lite-welcome"
+
+# This example is intentionally OUTSIDE the core workspace (see the root Cargo.toml
+# `exclude`) so the no_std core never inherits winit/softbuffer/notify.
+# Build the windowed app:   cargo run                                  (from this directory)
+# Render a frame headless:  cargo run --no-default-features --bin render
+
+[dependencies]
+# The batteries-included authoring + host layer: the `Ui` context and the `rsx!` macro.
+# Pulls in the view/signals/style/dom/layout core transitively, so the app code needs
+# only this one crate.
+canopy-ui = { path = "../../../crates/canopy-ui" }
+# Render-side types (Color, Rect, Renderer, OpSink) the binaries paint with.
+canopy-traits = { path = "../../../crates/canopy-traits" }
+canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+# Sharp, antialiased glyphs: the capable-tier renderer that draws both binaries' frames
+# (real cosmic-text glyphs, not the baked 8x8 software font).
+canopy-render-text = { path = "../../../crates/canopy-render-text" }
+# The text engine itself, so the windowed loop can hold one `TextEngine` and reuse its
+# shaping/rasterization caches across redraws (via `render_dom_with`).
+canopy-text-parley = { path = "../../../crates/canopy-text-parley" }
+# The signature feature: a debounced filesystem Watcher that fires when styles.css is
+# saved, so the window restyles live (the re-apply itself is `Ui::reload_css`).
+canopy-hotreload = { path = "../../../crates/canopy-hotreload" }
+# The tween/clock engine driving the logo's "sprout" entrance animation; its animated
+# `Signal<f32>` plugs into `Ui::bind_style`.
+canopy-anim = { path = "../../../crates/canopy-anim" }
+# The `PropId` consts (WIDTH, HEIGHT, …) the entrance animation binds the leaves' size to.
+canopy-paint = { path = "../../../crates/canopy-paint" }
+
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+[features]
+default = ["window"]
+window = ["dep:winit", "dep:softbuffer"]
+
+[lib]
+path = "src/lib.rs"
+
+# Always available, no windowing deps: builds the UI and renders one frame to a PPM.
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+
+# The windowed welcome app; needs the `window` feature (on by default).
+[[bin]]
+name = "canopy-lite-welcome"
+path = "src/bin/window.rs"
+required-features = ["window"]
+
+# Make this excluded example its own standalone workspace root. The root Cargo.toml
+# already `exclude`s it, but when the repo is checked out *inside* another directory
+# tree (e.g. a git worktree nested under the main checkout) Cargo can otherwise walk
+# up past this package and bind it to an outer workspace it isn't a member of. An
+# empty `[workspace]` table pins the boundary here so `cargo build`/`run` works from
+# this directory in every layout.
+[workspace]
+
+# Optimize dependencies even in a dev (`cargo run`) build so the software rasterizer +
+# cosmic-text run at full speed while this crate stays fast to rebuild. Without it an
+# unoptimized debug build of the renderer is ~50x slower and the window feels laggy.
+[profile.dev.package."*"]
+opt-level = 3
