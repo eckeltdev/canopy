@@ -50,7 +50,7 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -70,13 +70,39 @@ pub type Classes = &'static [&'static str];
 /// styled nodes — the single value the [`rsx!`](canopy_rsx::rsx) macro lowers onto and
 /// a host drives.
 ///
+/// Which tier resolves styles for this `Ui` — the two implementations of the
+/// `StyleEngine` seam.
+///
+/// - [`Lite`](Cascade::Lite): the constrained tier. `class()` resolves rules
+///   **author-side** through `canopy-style-css` and emits the resulting inline styles,
+///   so the host needs no style engine. The default.
+/// - [`Capable`](Cascade::Capable): the desktop/SBC tier. `class()` carries the class
+///   **names** (and `tag()`/`set_id()` carry tag-name/id) to the host via the op-stream,
+///   so a host-side real cascade (Stylo) can run against the retained tree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Cascade {
+    /// Constrained tier: resolve classes author-side to inline styles.
+    #[default]
+    Lite,
+    /// Capable tier: carry element identity to the host for a real (Stylo) cascade.
+    Capable,
+}
+
+/// The Canopy authoring context: an [`App`], its stylesheet, and the registry of
+/// styled nodes — the single value the [`rsx!`](canopy_rsx::rsx) macro lowers onto and
+/// a host drives.
+///
 /// `Ui` is `RefCell`-backed so the builder methods take `&self` (the macro emits
 /// `ui.method(..)` chains against one shared `&Ui`), and a host can keep styling and
 /// re-styling after the initial build (e.g. on hot-reload) through the same handle.
 pub struct Ui {
     app: App,
-    /// The current parsed stylesheet. Mutable so [`reload_css`](Ui::reload_css) can
-    /// swap in a freshly parsed sheet on a `styles.css` save.
+    /// Which tier resolves styles (see [`Cascade`]).
+    cascade: Cascade,
+    /// The raw author CSS, kept so a capable-tier host can hand it to its style engine.
+    css_src: String,
+    /// The current parsed stylesheet (lite tier only). Mutable so
+    /// [`reload_css`](Ui::reload_css) can swap in a freshly parsed sheet on a save.
     css: RefCell<Stylesheet>,
     /// Every `(node, classes)` styled through [`class`](Ui::class), in styling order —
     /// the registry that both `:hover` and hot-reload replay from.
@@ -90,6 +116,8 @@ impl Ui {
     pub fn new() -> Self {
         Self {
             app: App::new(),
+            cascade: Cascade::Lite,
+            css_src: String::new(),
             css: RefCell::new(Stylesheet::new()),
             styled: RefCell::new(Vec::new()),
         }
@@ -97,14 +125,45 @@ impl Ui {
 
     /// A `Ui` whose stylesheet is parsed from `src` (CSS-lite class rules; see
     /// [`canopy_style_css`]). A host typically reads `styles.css` from disk and passes
-    /// its contents here — this crate stays `no_std` and does no I/O.
+    /// its contents here — this crate stays `no_std` and does no I/O. Constrained
+    /// (lite) tier: classes resolve to inline styles author-side.
     #[must_use]
     pub fn with_css(src: &str) -> Self {
         Self {
             app: App::new(),
+            cascade: Cascade::Lite,
+            css_src: src.to_string(),
             css: RefCell::new(canopy_style_css::parse(src)),
             styled: RefCell::new(Vec::new()),
         }
+    }
+
+    /// A **capable-tier** `Ui`: instead of resolving classes author-side, the authored
+    /// tree carries real element identity (class names via [`class`](Ui::class), tag
+    /// names via [`tag`](Ui::tag), id via [`set_id`](Ui::set_id)) to the host, which
+    /// runs a full cascade (Stylo) over the retained tree. `src` is the author CSS the
+    /// host will hand to its style engine — retrieve it with [`css_source`](Ui::css_source).
+    #[must_use]
+    pub fn capable(src: &str) -> Self {
+        Self {
+            app: App::new(),
+            cascade: Cascade::Capable,
+            css_src: src.to_string(),
+            css: RefCell::new(Stylesheet::new()),
+            styled: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// This `Ui`'s style tier.
+    #[must_use]
+    pub fn cascade(&self) -> Cascade {
+        self.cascade
+    }
+
+    /// The raw author CSS (for a capable-tier host to feed its style engine).
+    #[must_use]
+    pub fn css_source(&self) -> &str {
+        &self.css_src
     }
 
     /// The underlying reactive [`App`] — its op-emitting/event surface for anything the
@@ -194,8 +253,37 @@ impl Ui {
     /// hover and hot-reload can replay it. This is the only styling path `rsx!` emits,
     /// which is what keeps the reload registry exactly equal to the set of styled nodes.
     pub fn class(&self, node: NodeId, classes: Classes) {
-        self.css.borrow().apply(&self.app, node, classes);
+        match self.cascade {
+            // Constrained tier: resolve the rules to inline styles author-side.
+            Cascade::Lite => self.css.borrow().apply(&self.app, node, classes),
+            // Capable tier: carry the class NAMES to the host for a real cascade.
+            Cascade::Capable => {
+                let em = self.app.emitter();
+                let mut e = em.borrow_mut();
+                for class in classes {
+                    e.set_class(node, class);
+                }
+            }
+        }
         self.styled.borrow_mut().push((node, classes));
+    }
+
+    /// Declare `node`'s CSS local name (e.g. `"div"`, `"button"`) for a host-side
+    /// cascade. No-op on the lite tier (which has no host cascade to use it).
+    pub fn tag(&self, node: NodeId, name: &str) {
+        if self.cascade == Cascade::Capable {
+            self.app.emitter().borrow_mut().set_tag_name(node, name);
+        }
+    }
+
+    /// Set `node`'s CSS id for a host-side cascade. No-op on the lite tier.
+    pub fn set_id(&self, node: NodeId, id: &str) {
+        if self.cascade == Cascade::Capable {
+            self.app
+                .emitter()
+                .borrow_mut()
+                .set_attribute(node, canopy_protocol::AttrId::ID, id);
+        }
     }
 
     /// Register a click handler on `node`; returns the [`HandlerId`] the host echoes
@@ -417,6 +505,32 @@ mod tests {
             Some("#f9e2af"),
             "reload changed the color"
         );
+    }
+
+    #[test]
+    fn capable_tier_carries_identity_not_inline_styles() {
+        // In capable mode, class()/tag()/set_id() carry element IDENTITY to the host
+        // (for a real host-side cascade) instead of expanding classes to inline styles.
+        let ui = Ui::capable(CSS);
+        let btn = ui.button("ok");
+        ui.tag(btn, "button");
+        ui.class(btn, &["btn"]);
+        ui.set_id(btn, "submit");
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+
+        // The host retained the real identity (tag / classes / id) ...
+        assert_eq!(dom.tag_name(btn), Some("button"));
+        assert_eq!(dom.classes(btn), &["btn".to_string()]);
+        assert_eq!(dom.id(btn), Some("submit"));
+        // ... and did NOT receive pre-expanded inline styles (the lite tier would have).
+        assert_eq!(
+            dom.style(btn, FG),
+            None,
+            "capable tier does not expand classes"
+        );
+        // The author CSS is available for the host's style engine.
+        assert_eq!(ui.css_source(), CSS);
     }
 
     #[test]

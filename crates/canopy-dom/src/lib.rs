@@ -95,7 +95,10 @@ impl Dom {
 
     /// The node's CSS class names, in declaration order.
     pub fn classes(&self, node: NodeId) -> &[String] {
-        self.nodes.get(&node).map(|n| n.classes.as_slice()).unwrap_or(&[])
+        self.nodes
+            .get(&node)
+            .map(|n| n.classes.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The resolved value of `node`'s attribute `attr`, if set.
@@ -274,7 +277,7 @@ impl Dom {
             Op::SetClass { node, class } => {
                 let class = self.resolve_str(class)?;
                 let n = self.nodes.get_mut(&node).ok_or(HostError::BadHandle)?;
-                if !n.classes.iter().any(|c| *c == class) {
+                if !n.classes.contains(&class) {
                     n.classes.push(class);
                 }
             }
@@ -296,7 +299,10 @@ impl Dom {
             }
             Op::SetTagName { node, name } => {
                 let name = self.resolve_str(name)?;
-                self.nodes.get_mut(&node).ok_or(HostError::BadHandle)?.tag_name = Some(name);
+                self.nodes
+                    .get_mut(&node)
+                    .ok_or(HostError::BadHandle)?
+                    .tag_name = Some(name);
             }
 
             // host -> guest op; never valid in a guest -> host batch.
