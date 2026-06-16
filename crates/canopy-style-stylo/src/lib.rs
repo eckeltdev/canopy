@@ -108,6 +108,9 @@ use canopy_traits::{Color, ComputedStyle, Display, HostError, StyleEngine};
 pub mod html;
 /// L3 paint: rasterize the cascaded + laid-out tree to pixels.
 pub mod paint;
+/// Text measurement: shape a text leaf's content (via cosmic-text + Ahem) so an
+/// auto-sized box leaves the size of its text during [`StyloEngine::layout`].
+pub mod text_measure;
 
 // ===========================================================================
 // StyloData: interior-mutable slot for Stylo's ElementData.
@@ -1411,12 +1414,52 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
         Display::Block
     };
 
+    // border: uniform width / color / radius taken from the TOP edge + top-left
+    // corner (the seam is uniform-only). The width longhand computes to a
+    // `BorderSideWidth(Au)`; `.0.to_f32_px()` is the same accessor `taffy_convert`
+    // uses. The color is a `computed::Color` (the same `GenericColor<Percentage>`
+    // as `background-color`), resolved against the foreground `currentColor`.
+    //
+    // CRITICAL: `border-top-width` computes to the `medium` keyword (3px) even when
+    // `border-style` is `none`/`hidden` — every element (incl. a bare `<div>` or
+    // `<html>`) would then report a 3px frame. Gate the width on the style exactly
+    // as `taffy_convert::border` does, so "no border-style" => width 0.
+    let border = style.get_border();
+    let border_width = if border.border_top_style.none_or_hidden() {
+        0.0
+    } else {
+        border.border_top_width.0.to_f32_px()
+    };
+    let border_color = absolute_to_color(
+        border
+            .border_top_color
+            .clone()
+            .resolve_to_absolute(&style.clone_color()),
+    );
+    // `border-top-left-radius` computes to a `BorderCornerRadius<LengthPercentage>`
+    // = `Size2D<LengthPercentage>`; take the horizontal (`.0.width`) component and
+    // resolve a bare length to px (percentages have no box to resolve against here,
+    // so they fall back to 0.0 like `padding` does above).
+    let border_radius = match border.border_top_left_radius.0.width.0.unpack() {
+        Unpacked::Length(l) => l.px(),
+        Unpacked::Percentage(_) => 0.0,
+        Unpacked::Calc(_) => 0.0,
+    };
+
+    // opacity: `effects` style struct, computed `Opacity = CSSFloat` (already a
+    // straight f32 in [0,1]). Clamp defensively.
+    let opacity = style.get_effects().opacity.clamp(0.0, 1.0);
+
     ComputedStyle {
         display,
         color,
         background,
         font_size,
         padding,
+        border_width,
+        border_color,
+        border_radius,
+        opacity,
     }
 }
 
@@ -2101,6 +2144,55 @@ mod taffy_convert {
 // taffy, and return absolute border-box rects in cascade DFS order.
 // ===========================================================================
 
+/// The four edge widths of a box (padding, border, or margin), in logical px.
+///
+/// A small `Copy` value type returned by [`StyloEngine::element_layout_detail`]
+/// alongside each element's absolute border-box rect, so a caller can recover the
+/// padding/border/margin a Taffy layout resolved for the element without
+/// re-running the engine. Read straight off taffy's [`taffy::Layout`].
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Edges {
+    /// Top edge width.
+    pub top: f32,
+    /// Right edge width.
+    pub right: f32,
+    /// Bottom edge width.
+    pub bottom: f32,
+    /// Left edge width.
+    pub left: f32,
+}
+
+impl Edges {
+    /// Build from a taffy `Rect<f32>` (taffy's edge container).
+    fn from_taffy(r: taffy::Rect<f32>) -> Self {
+        Edges {
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+            left: r.left,
+        }
+    }
+}
+
+/// One element's resolved geometry: its arena slab id, its absolute border-box
+/// rect, and the padding / border / margin edge widths Taffy resolved for it.
+///
+/// Returned (in DFS element order) by [`StyloEngine::element_layout_detail`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ElementLayoutDetail {
+    /// Arena slab id of the element.
+    pub slab: usize,
+    /// Absolute border-box rectangle (same coordinate space as
+    /// [`StyloEngine::layout`]'s rects).
+    pub rect: canopy_traits::Rect,
+    /// Padding edge widths.
+    pub padding: Edges,
+    /// Border edge widths.
+    pub border: Edges,
+    /// Margin edge widths.
+    pub margin: Edges,
+}
+
 impl StyloEngine {
     /// Return the slab ids of the document's elements in the SAME DFS order the
     /// cascade visits them (pre-order from the root element). Text nodes skipped.
@@ -2157,17 +2249,53 @@ impl StyloEngine {
             slab_to_idx.insert(slab, i);
         }
 
-        let mut tree: taffy::TaffyTree<()> = taffy::TaffyTree::new();
+        // Node-context type carries text + font for auto-sized text leaves; a
+        // non-text (or explicitly-sized) leaf gets `None` and never measures.
+        let mut tree: taffy::TaffyTree<Option<text_measure::MeasureContext>> =
+            taffy::TaffyTree::new();
         // taffy node handle per element index.
         let mut taffy_nodes: Vec<taffy::NodeId> = Vec::with_capacity(order.len());
 
         // First pass: create a leaf taffy node for each element with its style.
+        // A LEAF element with a direct Text child AND no explicit width/height
+        // also carries a measure context, so it sizes from its shaped text.
         for &slab in &order {
-            let style = self
-                .computed_values_for(slab)
-                .map(|cv| taffy_convert::to_taffy_style(&cv))
+            let cv = self.computed_values_for(slab);
+            let style = cv
+                .as_ref()
+                .map(|cv| taffy_convert::to_taffy_style(cv))
                 .unwrap_or_default();
-            let node = tree.new_leaf(style).expect("taffy new_leaf");
+
+            let ctx = cv.as_ref().and_then(|cv| {
+                // Only auto-sized leaves measure text: if width or height is set
+                // explicitly, the box geometry is fixed and text never resizes it.
+                if !style.size.width.is_auto() || !style.size.height.is_auto() {
+                    return None;
+                }
+                let text = self.direct_text_of(slab)?;
+                let font = cv.get_font();
+                let font_size = font.font_size.used_size().px();
+                let family = font
+                    .font_family
+                    .families
+                    .iter()
+                    .find_map(|f| match f {
+                        style::values::computed::font::SingleFontFamily::FamilyName(name) => {
+                            Some(name.name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some(text_measure::MeasureContext {
+                    text,
+                    font_size,
+                    family,
+                })
+            });
+
+            let node = tree
+                .new_leaf_with_context(style, ctx)
+                .expect("taffy new_leaf_with_context");
             taffy_nodes.push(node);
         }
 
@@ -2187,11 +2315,24 @@ impl StyloEngine {
         }
 
         let root = taffy_nodes[0];
-        tree.compute_layout(
+        tree.compute_layout_with_measure(
             root,
             taffy::Size {
                 width: taffy::AvailableSpace::Definite(viewport.w),
                 height: taffy::AvailableSpace::Definite(viewport.h),
+            },
+            // Measure closure: only auto-sized text leaves carry a context; every
+            // other leaf falls back to its zero/style-driven size.
+            |known_dimensions, available_space, _node_id, node_context, _style| {
+                // `node_context` is `Option<&mut Option<MeasureContext>>`: outer
+                // Some for every leaf, inner Some only for auto-sized text leaves.
+                match node_context.and_then(|c| c.as_ref()) {
+                    Some(ctx) => text_measure::measure_text(known_dimensions, available_space, ctx),
+                    None => taffy::Size {
+                        width: known_dimensions.width.unwrap_or(0.0),
+                        height: known_dimensions.height.unwrap_or(0.0),
+                    },
+                }
             },
         )
         .expect("taffy compute_layout");
@@ -2246,6 +2387,145 @@ impl StyloEngine {
         let rects = self.layout(viewport);
         let order = self.element_dfs_order();
         order.into_iter().zip(rects).collect()
+    }
+
+    /// Compute layout and return, per element (in DFS element order), an
+    /// [`ElementLayoutDetail`]: its slab id, absolute border-box rect, and the
+    /// padding / border / margin [`Edges`] Taffy resolved.
+    ///
+    /// A sibling to [`layout`](StyloEngine::layout) /
+    /// [`element_layout`](StyloEngine::element_layout): those return only the
+    /// border-box rect, which hides the box-model breakdown (how much of the box is
+    /// padding vs. border vs. how far the margin pushed it). This method reads
+    /// taffy's [`Layout::padding`](taffy::Layout), `border`, and `margin` edge
+    /// rects directly, so a caller can, e.g., assert that a `padding:10px` box
+    /// resolved a 10px padding edge. It rebuilds and re-runs the taffy tree exactly
+    /// as `layout` does (it does **not** touch `layout`'s codepath).
+    pub fn element_layout_detail(
+        &mut self,
+        viewport: canopy_traits::Size,
+    ) -> Vec<ElementLayoutDetail> {
+        use canopy_traits::{Point, Rect, Size};
+
+        self.resolve_styles();
+
+        let order = self.element_dfs_order();
+        if order.is_empty() {
+            return Vec::new();
+        }
+
+        // slab id -> index into `order`.
+        let mut slab_to_idx = std::collections::HashMap::new();
+        for (i, &slab) in order.iter().enumerate() {
+            slab_to_idx.insert(slab, i);
+        }
+
+        let mut tree: taffy::TaffyTree<()> = taffy::TaffyTree::new();
+        let mut taffy_nodes: Vec<taffy::NodeId> = Vec::with_capacity(order.len());
+
+        // Leaf per element with its converted style.
+        for &slab in &order {
+            let style = self
+                .computed_values_for(slab)
+                .map(|cv| taffy_convert::to_taffy_style(&cv))
+                .unwrap_or_default();
+            let node = tree.new_leaf(style).expect("taffy new_leaf");
+            taffy_nodes.push(node);
+        }
+
+        // Wire element children in document order.
+        for (i, &slab) in order.iter().enumerate() {
+            let child_handles: Vec<taffy::NodeId> = self.doc.nodes[slab]
+                .children
+                .iter()
+                .copied()
+                .filter(|c| self.doc.nodes[*c].is_element())
+                .map(|c| taffy_nodes[slab_to_idx[&c]])
+                .collect();
+            if !child_handles.is_empty() {
+                tree.set_children(taffy_nodes[i], &child_handles)
+                    .expect("taffy set_children");
+            }
+        }
+
+        let root = taffy_nodes[0];
+        tree.compute_layout(
+            root,
+            taffy::Size {
+                width: taffy::AvailableSpace::Definite(viewport.w),
+                height: taffy::AvailableSpace::Definite(viewport.h),
+            },
+        )
+        .expect("taffy compute_layout");
+
+        // Walk accumulating absolute origins (same accumulation as `layout`), and
+        // capture each node's padding/border/margin edges off the taffy `Layout`.
+        let mut details = vec![
+            ElementLayoutDetail {
+                slab: 0,
+                rect: Rect::default(),
+                padding: Edges::default(),
+                border: Edges::default(),
+                margin: Edges::default(),
+            };
+            order.len()
+        ];
+        let mut stack = vec![(0usize, 0.0f32, 0.0f32)];
+        while let Some((idx, px, py)) = stack.pop() {
+            let l = tree.layout(taffy_nodes[idx]).expect("taffy layout");
+            let ax = px + l.location.x;
+            let ay = py + l.location.y;
+            details[idx] = ElementLayoutDetail {
+                slab: order[idx],
+                rect: Rect {
+                    origin: Point { x: ax, y: ay },
+                    size: Size {
+                        w: l.size.width,
+                        h: l.size.height,
+                    },
+                },
+                padding: Edges::from_taffy(l.padding),
+                border: Edges::from_taffy(l.border),
+                margin: Edges::from_taffy(l.margin),
+            };
+            let slab = order[idx];
+            for c in self.doc.nodes[slab]
+                .children
+                .iter()
+                .copied()
+                .filter(|c| self.doc.nodes[*c].is_element())
+            {
+                stack.push((slab_to_idx[&c], ax, ay));
+            }
+        }
+
+        details
+    }
+
+    /// The concatenated text of an element's **direct** Text children, if any,
+    /// and only when the element has no *element* children (a leaf). Returns
+    /// `None` for non-leaves or elements with no direct text — those don't get a
+    /// text measure context. Used by [`layout`](StyloEngine::layout) to size an
+    /// auto-width/height text box from its content.
+    fn direct_text_of(&self, node_id: usize) -> Option<String> {
+        let node = self.doc.nodes.get(node_id)?;
+        if !node.is_element() {
+            return None;
+        }
+        // A text-bearing leaf has only Text children (no element children).
+        let mut text = String::new();
+        for &c in &node.children {
+            match &self.doc.nodes[c].kind {
+                NodeKind::Text(s) => text.push_str(s),
+                NodeKind::Element { .. } => return None,
+                NodeKind::Document => return None,
+            }
+        }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Borrow the primary `ComputedValues` for an element slab id (post-resolve).
@@ -2398,6 +2678,34 @@ mod tests {
         assert_eq!(style.display, Display::Flex, "display should be Flex");
     }
 
+    #[test]
+    fn element_layout_detail_padding() {
+        // A box with `padding:10px` must report a 10px padding edge in its
+        // ElementLayoutDetail (read straight off taffy's Layout).
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let boxed = doc.add_element(html, "div", None, &[]);
+        engine
+            .document_mut()
+            .set_inline_style(boxed, "width:100px; height:50px; padding:10px");
+
+        let details = engine.element_layout_detail(TSize { w: 200.0, h: 200.0 });
+        // index 1 is the styled div (index 0 is the root <html>).
+        let detail = details
+            .iter()
+            .find(|d| d.slab == boxed)
+            .expect("styled box present in layout detail");
+        assert!(
+            near(detail.padding.top, 10.0)
+                && near(detail.padding.right, 10.0)
+                && near(detail.padding.bottom, 10.0)
+                && near(detail.padding.left, 10.0),
+            "padding edges should all be ~10px, got {:?}",
+            detail.padding
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Layout smoke tests (Stylo cascade -> taffy_convert -> taffy layout).
     //
@@ -2412,6 +2720,46 @@ mod tests {
     /// Approximate-equality helper for f32 geometry (+/-1px).
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() <= 1.0
+    }
+
+    #[test]
+    fn layout_text_leaf_measures_from_content() {
+        // A leaf <div font-family:Ahem; font-size:20px> containing "XXXXX",
+        // inside an AUTO-width parent (a column flex that does NOT stretch its
+        // child: `align-items:flex-start`, so the child shrinks to its content
+        // rather than filling the container — the CSS way a box "leaves the size
+        // of its text"). Ahem is metrics-perfect (every glyph a 1em square), so
+        // the leaf sizes to EXACTLY 100px x 20px from its text — the measure
+        // closure runs because the leaf has a Text child and no explicit
+        // width/height. (Requires /tmp/wpt/fonts/Ahem.ttf.)
+        let mut engine = StyloEngine::new("");
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            let parent = doc.add_element(html, "div", None, &[]);
+            doc.set_inline_style(
+                parent,
+                "display:flex; flex-direction:column; align-items:flex-start",
+            );
+            let leaf = doc.add_element(parent, "div", None, &[]);
+            doc.set_inline_style(leaf, "font-family:Ahem; font-size:20px");
+            doc.add_text(leaf, "XXXXX");
+        }
+
+        let rects = engine.layout(TSize { w: 800.0, h: 600.0 });
+        assert_eq!(rects.len(), 3, "html + parent + leaf div");
+        let leaf = rects[2];
+        println!("text leaf box = {:?}", leaf.size);
+        assert!(
+            (leaf.size.w - 100.0).abs() <= 2.0,
+            "leaf width should be ~100 (5 Ahem glyphs @ 20px), got {}",
+            leaf.size.w
+        );
+        assert!(
+            (leaf.size.h - 20.0).abs() <= 2.0,
+            "leaf height should be ~20 (one 20px Ahem line), got {}",
+            leaf.size.h
+        );
     }
 
     #[test]

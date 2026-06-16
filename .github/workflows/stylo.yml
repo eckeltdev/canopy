@@ -1,0 +1,162 @@
+name: Stylo conformance
+
+# The Stylo tier (canopy-style-stylo) and its WPT runner (canopy-wpt) live
+# OUTSIDE the core workspace (root Cargo.toml `exclude`) because Stylo drags in a
+# large std-only tree that must never leak into the no_std core. They carry their
+# own Cargo.lock and build only on nightly. The main `ci.yml` builds the workspace
+# on stable and never touches these crates, so this dedicated workflow covers them.
+#
+# Two jobs:
+#   1. stylo-build-test — build + test canopy-style-stylo on the pinned nightly.
+#      The browser-oracle / layout-oracle tests are `#[ignore]`d (they shell out to
+#      a local Chrome), so the default `cargo test` skips them automatically.
+#   2. wpt-regression — fetch a small WPT subset and run canopy-wpt --check against
+#      the COMMITTED baselines for css-flexbox and css-grid, failing on regression.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "crates/canopy-style-stylo/**"
+      - "crates/canopy-wpt/**"
+      - ".github/workflows/stylo.yml"
+  pull_request:
+    paths:
+      - "crates/canopy-style-stylo/**"
+      - "crates/canopy-wpt/**"
+      - ".github/workflows/stylo.yml"
+  # Allow manual runs (e.g. to refresh after a known-good baseline bump).
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The nightly that the Stylo + Taffy stack is verified against locally
+  # (`cargo +nightly --version` -> nightly d811228b1, 2025-04-15). Pinned so a
+  # future nightly regression in the toolchain can't turn CI red out of nowhere.
+  NIGHTLY: nightly-2025-04-15
+  # The WPT subset we test against — must cover both suites plus their shared
+  # support assets and the Ahem/test fonts the pages reference.
+  WPT_REF: master
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # 1. Build and test the excluded Stylo engine crate on the pinned nightly.
+  # ----------------------------------------------------------------------------
+  stylo-build-test:
+    name: build + test canopy-style-stylo (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: rustfmt, clippy
+
+      # Cache the (large) Stylo dependency tree keyed on the crate's own lockfile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/canopy-style-stylo
+
+      - name: fmt
+        working-directory: crates/canopy-style-stylo
+        run: cargo +${{ env.NIGHTLY }} fmt --check
+
+      - name: clippy
+        working-directory: crates/canopy-style-stylo
+        run: cargo +${{ env.NIGHTLY }} clippy --all-targets -- -D warnings
+
+      # Default test run: the Chrome-dependent oracles are `#[ignore]`d, so this
+      # builds the engine and runs the offline cascade/layout unit tests only.
+      - name: test (offline; Chrome oracles are #[ignore]d)
+        working-directory: crates/canopy-style-stylo
+        run: cargo +${{ env.NIGHTLY }} test
+
+  # ----------------------------------------------------------------------------
+  # 2. WPT regression gate: run canopy-wpt --check against committed baselines.
+  # ----------------------------------------------------------------------------
+  wpt-regression:
+    name: WPT --check vs committed baselines (flexbox + grid)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/canopy-wpt
+
+      # How CI gets the WPT checkout: a SHALLOW, BLOBLESS, SPARSE clone of the
+      # upstream repo restricted to exactly the paths the two suites need. This is
+      # the same subset present at /tmp/wpt locally:
+      #   * css/css-flexbox, css/css-grid — the suites under test
+      #   * css/support                   — shared stylesheets the tests @import
+      #   * fonts                         — Ahem.ttf etc. the pages reference
+      # --depth 1 + --filter=blob:none keeps the download to a few MB rather than
+      # cloning the entire multi-gigabyte WPT history.
+      - name: Fetch WPT subset (shallow + sparse)
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/web-platform-tests/wpt.git /tmp/wpt
+          cd /tmp/wpt
+          git sparse-checkout set \
+            css/css-flexbox \
+            css/css-grid \
+            css/support \
+            fonts
+          echo "css-flexbox tests:" && find css/css-flexbox -name '*.html' | wc -l
+          echo "css-grid tests:"    && find css/css-grid    -name '*.html' | wc -l
+
+      - name: Build runner
+        working-directory: crates/canopy-wpt
+        run: cargo +${{ env.NIGHTLY }} build --release
+
+      # The regression gate. `--check` re-runs the suite and exits non-zero if any
+      # test that the committed baseline marks PASS is no longer PASS. Improvements
+      # (more tests passing than the baseline) are reported but never fail CI; to
+      # lock them in, regenerate the baseline locally with --write-baseline.
+      - name: css-flexbox regression check
+        working-directory: crates/canopy-wpt
+        env:
+          WPT_DIR: /tmp/wpt
+        run: |
+          ./target/release/canopy-wpt /tmp/wpt/css/css-flexbox \
+            --check expectations/css-flexbox.txt
+
+      - name: css-grid regression check
+        working-directory: crates/canopy-wpt
+        env:
+          WPT_DIR: /tmp/wpt
+        run: |
+          ./target/release/canopy-wpt /tmp/wpt/css/css-grid \
+            --check expectations/css-grid.txt
+
+  # ----------------------------------------------------------------------------
+  # OPTIONAL Chrome lane (not enabled by default).
+  #
+  # The browser-oracle / layout-oracle tests in canopy-style-stylo are #[ignore]d
+  # because they shell out to a real headless Chrome and compare our Stylo cascade
+  # against getComputedStyle. To run them in CI, add a job like the following.
+  # ubuntu-latest ships with Chrome preinstalled, so usually no setup is needed:
+  #
+  #   chrome-oracle:
+  #     name: Stylo cascade vs Chrome (browser oracle)
+  #     runs-on: ubuntu-latest
+  #     steps:
+  #       - uses: actions/checkout@v4
+  #       - uses: dtolnay/rust-toolchain@master
+  #         with: { toolchain: nightly-2025-04-15 }
+  #       - uses: browser-actions/setup-chrome@v1   # or rely on preinstalled
+  #       - working-directory: crates/canopy-style-stylo
+  #         env: { CANOPY_CHROME: chrome }
+  #         run: cargo +nightly-2025-04-15 test --test browser_oracle -- --ignored --nocapture
+  #
+  # It is intentionally left out of the required set so the gate stays fast and
+  # has no external browser dependency; the oracles auto-SKIP (and pass) when no
+  # Chrome is found, so they never block a browser-less environment.
+  # ----------------------------------------------------------------------------

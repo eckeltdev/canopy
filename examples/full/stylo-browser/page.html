@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      /* Cascade: inheritance + specificity + descendant combinators, all real Stylo. */
+      body {
+        background: #0c0d10;
+        color: #c9d1d9;
+        font-size: 16px;
+        padding: 16px;
+      }
+
+      .page {
+        display: flex;
+        flex-direction: column;
+        background: #161b22;
+        padding: 16px;
+      }
+
+      h1 {
+        background: #1f6feb;
+        color: #ffffff;
+        font-size: 28px;
+        padding: 12px;
+      }
+
+      h2 {
+        color: #58a6ff;
+        font-size: 20px;
+        padding: 8px;
+      }
+
+      /* A card panel that nests its own content. */
+      .card {
+        display: flex;
+        flex-direction: column;
+        background: #21262d;
+        padding: 14px;
+      }
+
+      /* Descendant combinator: only headings INSIDE a .card get this treatment,
+         so the two h2 elements resolve to different boxes — the constrained-tier
+         class-only engine cannot express this. */
+      .card h2 {
+        color: #f0883e;
+      }
+
+      .row {
+        background: #2d333b;
+        color: #adbac7;
+        font-size: 15px;
+        padding: 8px;
+      }
+
+      .muted {
+        color: #6e7681;
+        font-size: 13px;
+        padding: 6px;
+      }
+
+      /* A call-to-action button styled by id (highest specificity here). */
+      #apply {
+        background: #238636;
+        color: #ffffff;
+        font-size: 16px;
+        padding: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <h1>Canopy Browser</h1>
+      <h2>Rendered live through Servo Stylo</h2>
+
+      <div class="card">
+        <h2>Settings</h2>
+        <div class="row">Theme: dark</div>
+        <div class="row">Reduce motion: off</div>
+        <div class="row">Telemetry: disabled</div>
+        <div id="apply">Apply changes</div>
+      </div>
+
+      <div class="muted">stylo cascade + taffy layout + cpu paint</div>
+    </div>
+  </body>
+</html>

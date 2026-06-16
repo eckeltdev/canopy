@@ -14,11 +14,12 @@
 //!     BOTH test and ref to RGBA buffers (same renderer) and compare:
 //!     reject-blank -> exact-equality -> per-pixel max-channel diff at a threshold.
 //!
-//! Honesty over green: many flexbox tests size boxes by their TEXT contents, and
-//! our engine does NOT measure text (leaves get size purely from their `Style`).
-//! Those would spuriously fail, so we feature-gate them into SKIP buckets (see
-//! [`SkipReason`]) — exactly the spirit of Blitz's feature flags. The value is a
-//! working harness + an accurate baseline with a clear skip taxonomy.
+//! Honesty over green: features the engine doesn't model yet (writing-mode,
+//! `position:absolute`, the `min-/max-/fit-content` intrinsic keywords) would
+//! spuriously fail, so we feature-gate those into SKIP buckets (see [`SkipReason`])
+//! — exactly the spirit of Blitz's feature flags. (Text *is* measured now, via the
+//! Ahem font in `canopy-style-stylo`'s `text_measure`, so Ahem tests are run.) The
+//! value is a working harness + an accurate baseline with a clear skip taxonomy.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -27,8 +28,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs};
 
+mod expectations;
 mod test_runners;
 
+use expectations::{Baseline, Status};
 use test_runners::{run_attr_test, run_ref_test, AttrOutcome, RefOutcome};
 
 /// Viewport the engine lays out / renders at. Matches Blitz (800x600).
@@ -50,8 +53,9 @@ enum SkipReason {
     NoSupportedAssertion,
     /// On the hand-maintained block list.
     Blocked,
-    /// Sizes boxes by TEXT content / Ahem-font metrics — we do not measure text,
-    /// so the expected boxes are unreachable. Biggest single bucket.
+    /// Uses a CSS intrinsic-sizing keyword (`min-/max-/fit-content`) that sizes a
+    /// box from its contents in a way our Taffy leaf measure doesn't model. (Plain
+    /// Ahem/text sizing IS handled now — only these keywords are skipped.)
     TextDependent,
     /// Uses `writing-mode` / vertical flow — Taffy/our mapping doesn't do it.
     WritingMode,
@@ -68,7 +72,7 @@ impl SkipReason {
         match self {
             SkipReason::NoSupportedAssertion => "no supported assertion",
             SkipReason::Blocked => "blocked (crash/hang list)",
-            SkipReason::TextDependent => "text-dependent sizing (no text measurement)",
+            SkipReason::TextDependent => "intrinsic-content keyword (min/max/fit-content)",
             SkipReason::WritingMode => "writing-mode / vertical flow",
             SkipReason::AbsolutePosition => "position:absolute",
             SkipReason::Script => "script beyond checkLayout",
@@ -90,6 +94,19 @@ struct TestResult {
     name: String,
     kind: &'static str,
     outcome: Outcome,
+}
+
+impl Outcome {
+    /// Project this outcome onto the coarse [`Status`] used by the expectation
+    /// baseline (the per-test PASS/FAIL/SKIP/CRASH bucket, dropping detail text).
+    fn status(&self) -> Status {
+        match self {
+            Outcome::Pass => Status::Pass,
+            Outcome::Fail(_) => Status::Fail,
+            Outcome::Skip(_) => Status::Skip,
+            Outcome::Crash(_) => Status::Crash,
+        }
+    }
 }
 
 /// `true` if this is a test we should attempt (not a -ref/reference/support file
@@ -159,15 +176,12 @@ fn detect_skip(src: &str, is_attr: bool) -> Option<SkipReason> {
         return Some(SkipReason::AbsolutePosition);
     }
 
-    // TEXT-dependent sizing. Our engine does NOT measure text, so any box whose
-    // size comes from its text content (or the Ahem font, which WPT uses for
-    // deterministic glyph metrics) is unreachable. Heuristics:
-    //   * the Ahem font is loaded/used, or
-    //   * an intrinsic content keyword sizes a box from contents, or
-    //   * a flex item explicitly has `height:auto`/`width:auto` "from contents".
-    if lower.contains("ahem")
-        || lower.contains("font-family: ahem")
-        || lower.contains("max-content")
+    // INTRINSIC-content sizing we still can't resolve. We DO measure text now
+    // (the Ahem font is loaded into the layout measure-fn — see canopy-style-stylo's
+    // text_measure module — so Ahem-based tests are run, not skipped), but the CSS
+    // intrinsic sizing *keywords* (`min-/max-/fit-content`) size a box from its
+    // contents in a way Taffy's leaf measure doesn't model here, so those stay skipped.
+    if lower.contains("max-content")
         || lower.contains("min-content")
         || lower.contains("fit-content")
     {
@@ -289,14 +303,86 @@ impl TestResult {
     }
 }
 
+/// Parsed command-line options.
+///
+/// Usage:
+///   canopy-wpt [SUITE_DIR] [--check BASELINE] [--write-baseline PATH]
+///
+/// * `--write-baseline PATH` — run the suite, then write a fresh expectation
+///   baseline (per-test PASS/FAIL/SKIP/CRASH) to `PATH`. Used to (re)generate the
+///   committed `expectations/<suite>.txt` files.
+/// * `--check BASELINE` — run the suite, then compare against `BASELINE` and exit
+///   non-zero if any test REGRESSED (was PASS, now not PASS). This is the CI gate.
+struct Opts {
+    suite_dir: Option<String>,
+    check: Option<String>,
+    write_baseline: Option<String>,
+}
+
+/// Parse argv into [`Opts`]. Flags accept either `--flag VALUE` or `--flag=VALUE`.
+/// On a malformed flag, prints usage and exits 2.
+fn parse_opts(args: &[String]) -> Opts {
+    let mut opts = Opts {
+        suite_dir: None,
+        check: None,
+        write_baseline: None,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // Helper: pull the value for `--flag`, supporting both `--flag=v` and
+        // `--flag v`. Advances `i` past the consumed value when separate.
+        let mut take_value = |inline: Option<&str>| -> String {
+            if let Some(v) = inline {
+                v.to_string()
+            } else if i + 1 < args.len() {
+                i += 1;
+                args[i].clone()
+            } else {
+                eprintln!("error: {arg} requires a value");
+                std::process::exit(2);
+            }
+        };
+        if let Some(rest) = arg.strip_prefix("--check") {
+            let inline = rest.strip_prefix('=');
+            opts.check = Some(take_value(inline));
+        } else if let Some(rest) = arg.strip_prefix("--write-baseline") {
+            let inline = rest.strip_prefix('=');
+            opts.write_baseline = Some(take_value(inline));
+        } else if arg == "-h" || arg == "--help" {
+            println!("usage: canopy-wpt [SUITE_DIR] [--check BASELINE] [--write-baseline PATH]");
+            std::process::exit(0);
+        } else if arg.starts_with('-') {
+            eprintln!("error: unknown flag {arg}");
+            std::process::exit(2);
+        } else if opts.suite_dir.is_none() {
+            opts.suite_dir = Some(arg.clone());
+        } else {
+            eprintln!("error: unexpected positional argument {arg}");
+            std::process::exit(2);
+        }
+        i += 1;
+    }
+    opts
+}
+
+/// Derive a short suite name (e.g. `css-grid`) from the suite directory, for the
+/// baseline header. Falls back to the full path's last component.
+fn suite_name(suite_path: &Path) -> String {
+    suite_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| suite_path.to_string_lossy().into_owned())
+}
+
 fn main() {
-    // Args / env: suite dir (positional, default css-flexbox) + WPT root.
+    // Args / env: suite dir (positional, default css-flexbox) + WPT root + flags.
     let args: Vec<String> = env::args().skip(1).collect();
+    let opts = parse_opts(&args);
     let wpt_root = env::var("WPT_DIR").unwrap_or_else(|_| "/tmp/wpt".to_string());
-    let suite_dir = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .cloned()
+    let suite_dir = opts
+        .suite_dir
+        .clone()
         .unwrap_or_else(|| format!("{wpt_root}/css/css-flexbox"));
 
     let suite_path = PathBuf::from(&suite_dir);
@@ -444,6 +530,94 @@ fn main() {
     println!("---------------------------------------------------");
     println!("per-test results written to {}", report_path.display());
     println!("===================================================");
+
+    // ---- Expectation tracking (--write-baseline / --check) ----
+    // The coarse per-test status list shared by both modes.
+    let current: Vec<(String, Status)> = results
+        .iter()
+        .map(|r| (r.name.clone(), r.outcome.status()))
+        .collect();
+    let suite = suite_name(&suite_path);
+
+    if let Some(path) = &opts.write_baseline {
+        let baseline = Baseline::from_results(&suite, current.iter().cloned());
+        let path = PathBuf::from(path);
+        match baseline.write(&path) {
+            Ok(()) => println!(
+                "wrote baseline ({} tests) to {}",
+                current.len(),
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("error: failed to write baseline {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(path) = &opts.check {
+        let path = PathBuf::from(path);
+        let baseline = match Baseline::load(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: failed to read baseline {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        };
+        let report = expectations::check(&baseline, &current);
+
+        println!();
+        println!("================ --check vs baseline ===============");
+        println!(
+            "baseline:     {} ({} tests)",
+            path.display(),
+            baseline.statuses.len()
+        );
+        if !report.improvements.is_empty() {
+            println!(
+                "improvements: {} test(s) now PASS that were not PASS in the baseline",
+                report.improvements.len()
+            );
+            for imp in report.improvements.iter().take(10) {
+                let was = imp.was.map(|s| s.token()).unwrap_or("NEW");
+                println!("  + {} ({was} -> {})", imp.name, imp.now.token());
+            }
+            if report.improvements.len() > 10 {
+                println!("  + (+{} more)", report.improvements.len() - 10);
+            }
+            println!("  (refresh the committed baseline with --write-baseline to lock these in)");
+        }
+        if !report.missing.is_empty() {
+            println!(
+                "missing:      {} baseline test(s) not present in this run",
+                report.missing.len()
+            );
+        }
+        if report.has_regressions() {
+            println!("---------------------------------------------------");
+            println!(
+                "REGRESSIONS:  {} test(s) were PASS, now FAIL/CRASH/SKIP",
+                report.regressions.len()
+            );
+            for reg in &report.regressions {
+                println!(
+                    "  - {} ({} -> {})",
+                    reg.name,
+                    reg.was.token(),
+                    reg.now.token()
+                );
+            }
+            println!("===================================================");
+            eprintln!(
+                "canopy-wpt --check FAILED: {} regression(s) against {}",
+                report.regressions.len(),
+                path.display()
+            );
+            std::process::exit(1);
+        }
+        println!("no regressions. OK.");
+        println!("===================================================");
+    }
 }
 
 /// Build the `wpt-report.txt` body: one line per test.

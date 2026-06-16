@@ -1,0 +1,46 @@
+[package]
+name = "canopy-full-stylo-browser"
+description = "Full-tier demonstration: a tiny HTML/CSS browser. Feeds ARBITRARY HTML (with embedded <style> blocks) straight into the real Servo-Stylo engine (canopy-style-stylo) — parse → cascade → Taffy layout → CPU paint — and presents the result in a winit + softbuffer window. Unlike the sibling `stylo` example (which hand-builds an arena tree and hot-reloads a separate styles.css), this one is HTML-driven: edit page.html (markup AND CSS together) and hot-reload the whole page. A headless `render` binary writes a PPM."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+default-run = "canopy-full-stylo-browser"
+
+# Standalone, excluded from the core workspace (it depends on the heavy, std-only
+# canopy-style-stylo). From this directory:
+#   cargo +nightly run                                       # the live window (hot-reloads page.html)
+#   cargo +nightly run --no-default-features --bin render    # a still -> PPM
+
+[dependencies]
+# The full-tier StyleEngine: real Stylo HTML parse + cascade + layout + paint.
+canopy-style-stylo = { path = "../../../crates/canopy-style-stylo" }
+# The flat PAL types (Size/Color) that cross the engine boundary.
+canopy-traits = { path = "../../../crates/canopy-traits" }
+# The lite CPU software rasterizer whose Buffer the engine renders into.
+canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+[features]
+default = ["window"]
+window = ["dep:winit", "dep:softbuffer"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+
+[[bin]]
+name = "canopy-full-stylo-browser"
+path = "src/bin/window.rs"
+required-features = ["window"]
+
+# Pin the workspace boundary (standalone example; own lockfile).
+[workspace]
+
+[profile.dev.package."*"]
+opt-level = 3

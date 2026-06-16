@@ -79,7 +79,13 @@ pub enum Display {
 /// This is the output of a [`StyleEngine`] — Stylo on the desktop, a const/
 /// build-time resolver on a constrained target. The retained tree only ever sees
 /// this; there is no "cascade" type in the core.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+///
+/// The paint-affecting fields beyond the box model — `border_width`,
+/// `border_color`, `border_radius`, and `opacity` — let a renderer draw a framed,
+/// rounded, optionally-faded box without re-consulting the style engine.
+/// `opacity` is a straight multiplier on every painted color's alpha (`1.0` =
+/// fully opaque, the default).
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ComputedStyle {
     /// Layout mode.
     pub display: Display,
@@ -91,6 +97,36 @@ pub struct ComputedStyle {
     pub font_size: f32,
     /// Uniform padding in logical pixels.
     pub padding: f32,
+    /// Uniform border width in logical pixels (`border-top-width`). `0.0` = no
+    /// border frame.
+    pub border_width: f32,
+    /// Border color (`border-top-color`), painted as the frame when
+    /// `border_width > 0.0`.
+    pub border_color: Color,
+    /// Uniform corner radius in logical pixels (`border-top-left-radius`). `0.0` =
+    /// square corners.
+    pub border_radius: f32,
+    /// Element opacity in `[0.0, 1.0]`: a straight multiplier applied to every
+    /// painted color's alpha. Defaults to `1.0` (fully opaque).
+    pub opacity: f32,
+}
+
+impl Default for ComputedStyle {
+    fn default() -> Self {
+        ComputedStyle {
+            display: Display::default(),
+            color: Color::default(),
+            background: Color::default(),
+            font_size: 0.0,
+            padding: 0.0,
+            border_width: 0.0,
+            border_color: Color::default(),
+            border_radius: 0.0,
+            // Opacity must default to fully-opaque, not 0.0, so a style that
+            // never sets it paints normally.
+            opacity: 1.0,
+        }
+    }
 }
 
 /// Per-node computed layout boxes for a frame.
@@ -331,6 +367,11 @@ mod tests {
         let s = ComputedStyle::default();
         assert_eq!(s.display, Display::Block);
         assert_eq!(s.color, Color::default());
+        // The enriched paint fields default to "no frame, square, fully opaque".
+        assert_eq!(s.border_width, 0.0);
+        assert_eq!(s.border_color, Color::default());
+        assert_eq!(s.border_radius, 0.0);
+        assert_eq!(s.opacity, 1.0);
         assert!(DisplayList::default().items.is_empty());
     }
 
