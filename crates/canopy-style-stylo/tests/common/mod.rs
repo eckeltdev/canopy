@@ -14,14 +14,6 @@ use canopy_protocol::NodeId;
 use canopy_style_stylo::StyloEngine;
 use canopy_traits::{Color, ComputedStyle, Display, StyleEngine};
 
-/// A minimal UA stylesheet: the block-display defaults a browser applies that affect the
-/// (small) set of properties we compare. Prepended to the author CSS on the Stylo side so
-/// a bare `<div>` computes `display: block` (its CSS *initial* value is `inline`), matching
-/// the browser's UA sheet. The author rules in each fixture still win (higher origin/
-/// specificity), so this only fills in defaults.
-pub const UA_CSS: &str =
-    "div, p, section, header, footer, main, article, h1, h2, h3 { display: block }";
-
 /// A fixture element: a tag, optional id, classes, optional inline `style`, optional
 /// text, and element children.
 #[derive(Clone)]
@@ -117,7 +109,9 @@ pub fn dfs<'a>(root: &'a El, out: &mut Vec<&'a El>) {
 /// Build the fixture into a [`StyloEngine`] arena and resolve every element's
 /// [`ComputedStyle`] through the real Stylo cascade, returned in depth-first order.
 pub fn resolve_stylo(css: &str, root: &El) -> Vec<ComputedStyle> {
-    let mut engine = StyloEngine::new(&format!("{UA_CSS}\n{css}"));
+    // The engine ships a user-agent stylesheet (block display defaults etc.), so the
+    // fixture CSS is the author sheet alone — no UA prepend needed.
+    let mut engine = StyloEngine::new(css);
     let mut ids: Vec<usize> = Vec::new();
     build_arena(engine.document_mut(), 0, root, &mut ids);
 
@@ -135,7 +129,7 @@ pub fn resolve_stylo(css: &str, root: &El) -> Vec<ComputedStyle> {
 /// `viewport`, and return each element's absolute border box in DFS order (the same order
 /// [`resolve_stylo`] and the browser's `data-testid` use).
 pub fn resolve_layout_stylo(css: &str, root: &El, viewport: (u32, u32)) -> Vec<LayoutBox> {
-    let mut engine = StyloEngine::new(&format!("{UA_CSS}\n{css}"));
+    let mut engine = StyloEngine::new(css);
     let mut ids: Vec<usize> = Vec::new();
     build_arena(engine.document_mut(), 0, root, &mut ids);
 

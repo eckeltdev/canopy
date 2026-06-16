@@ -1,0 +1,36 @@
+# Canopy's Web Platform Tests (WPT) conformance runner.
+#
+# Modeled on Blitz's `wpt/runner`: runs REAL WPT CSS tests against Canopy's
+# Stylo + Taffy engine (`canopy-style-stylo`) and reports honest pass/fail/skip
+# numbers. Two test kinds, same as Blitz:
+#   * ATTR / checkLayout: parse HTML + author CSS, lay out, compare each element's
+#     Taffy box to its `data-expected-*` / `data-offset-*` attributes (±1px).
+#   * REF: render the test and its `<link rel=match>` reference to RGBA and compare.
+#
+# DELIBERATELY OUTSIDE the core workspace (root Cargo.toml `exclude`): it depends
+# on `canopy-style-stylo`, which pulls Stylo's large std-only tree and is itself
+# excluded. Standalone `[workspace]`, own lockfile. Build/run with nightly:
+#   cargo +nightly run --release -- /tmp/wpt/css/css-flexbox
+[package]
+name = "canopy-wpt"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "canopy-wpt"
+path = "src/main.rs"
+
+[dependencies]
+# The engine under test: real Stylo cascade + Taffy layout + CPU paint.
+canopy-style-stylo = { path = "../canopy-style-stylo" }
+# Geometry types (Size/Rect/Point) the engine's layout/render APIs speak.
+canopy-traits = { path = "../canopy-traits" }
+# The CPU rasterizer behind render_to_rgba (pulled transitively, listed for clarity).
+canopy-render-soft = { path = "../canopy-render-soft" }
+# Recursive directory globbing for the test list.
+glob = "0.3"
+
+# Standalone workspace boundary (excluded crate, own lockfile).
+[workspace]

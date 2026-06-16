@@ -17,3 +17,6 @@
 
 # Nested example build dir + lockfile noise
 /examples/full/demo/target/
+
+# WPT runner output
+wpt-report.txt

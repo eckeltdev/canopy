@@ -9,6 +9,8 @@ resolver = "2"
 exclude = [
     # Full-tier Stylo cascade: pulls Stylo's large std-only tree; standalone, own lockfile.
     "crates/canopy-style-stylo",
+    # WPT conformance runner: depends on the excluded Stylo crate; standalone, own lockfile.
+    "crates/canopy-wpt",
     "examples/common/landing-ui",
     "examples/lite/welcome",
     "examples/lite/landing",

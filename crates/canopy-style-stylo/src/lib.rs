@@ -1202,6 +1202,19 @@ impl StyloEngine {
     /// Build an engine with the given author CSS. The DOM is then built via
     /// [`Document`] mutators on [`StyloEngine::document_mut`].
     pub fn new(css: &str) -> Self {
+        // A minimal **user-agent stylesheet** — browsers ship one, and matching their
+        // layout requires it. Block-level `display` defaults (a bare `<div>`'s CSS
+        // *initial* `display` is `inline`, not `block`), `body { margin: 8px }` (the
+        // offset every HTML page inherits), and `display: none` for non-rendered
+        // elements. Appended at `Origin::UserAgent`, so any author rule still wins.
+        const UA_STYLESHEET: &str = "\
+html, body, div, p, section, article, header, footer, nav, main, aside, \
+h1, h2, h3, h4, h5, h6, ul, ol, li, dl, dd, dt, table, figure, figcaption, \
+blockquote, address, pre, form, fieldset, hr { display: block }
+head, script, style, title, meta, link, base, noscript, template { display: none }
+body { margin: 8px }
+";
+
         // Stylo (in `servo` mode) gates `display: grid` parsing AND the
         // `grid-template-*` / `grid-auto-*` longhands behind the runtime pref
         // `layout.grid.enabled`, which defaults to false. Flip it on (process-
@@ -1210,6 +1223,20 @@ impl StyloEngine {
 
         let device = Self::make_device();
         let mut stylist = Stylist::new(device, QuirksMode::NoQuirks);
+
+        // The user-agent sheet first (lowest cascade origin), then the author sheet.
+        let ua = Stylesheet::from_str(
+            UA_STYLESHEET,
+            dummy_url_data(),
+            Origin::UserAgent,
+            ServoArc::new(GLOBAL_GUARD.wrap(MediaList::empty())),
+            GLOBAL_GUARD.clone(),
+            None,
+            None,
+            QuirksMode::NoQuirks,
+            AllowImportRules::Yes,
+        );
+        stylist.append_stylesheet(DocumentStyleSheet(ServoArc::new(ua)), &GLOBAL_GUARD.read());
 
         // Parse the author stylesheet and append it.
         let sheet = Stylesheet::from_str(
@@ -1232,6 +1259,35 @@ impl StyloEngine {
             snapshots: SnapshotMap::new(),
             resolved: false,
         }
+    }
+
+    /// Build an engine from an already-parsed [`Document`] plus its author CSS.
+    ///
+    /// [`new`](StyloEngine::new) starts from an *empty* arena that the caller
+    /// fills via [`document_mut`](StyloEngine::document_mut); this constructor
+    /// instead injects a tree the caller already built (e.g. from
+    /// [`html::parse_html_with_css`](crate::html::parse_html_with_css)) so the
+    /// cascade/layout run over real parsed HTML. The CSS is parsed and appended
+    /// as the author stylesheet exactly as in `new`.
+    pub fn with_document(doc: Document, css: &str) -> Self {
+        let mut engine = Self::new(css);
+        engine.doc = doc;
+        engine.resolved = false;
+        engine
+    }
+
+    /// Convenience: parse `html` (harvesting its `<style>` CSS) and build an
+    /// engine over the resulting tree in one step.
+    ///
+    /// Equivalent to calling [`html::parse_html_with_css`] and
+    /// [`with_document`](StyloEngine::with_document); the `data-*` attributes are
+    /// discarded. For attribute ("checkLayout") tests, call
+    /// [`html::parse_html_with_css`] directly so you keep the `data-*` map.
+    ///
+    /// [`html::parse_html_with_css`]: crate::html::parse_html_with_css
+    pub fn from_html(html: &str) -> Self {
+        let (doc, css, _data) = crate::html::parse_html_with_css(html);
+        Self::with_document(doc, &css)
     }
 
     fn make_device() -> style::device::Device {
@@ -2171,6 +2227,25 @@ impl StyloEngine {
         }
 
         rects
+    }
+
+    /// Compute layout and return each element's ABSOLUTE border-box paired with
+    /// its arena **slab id**, in DFS element order.
+    ///
+    /// [`layout`](StyloEngine::layout) returns just the `Rect`s positionally (in
+    /// the same DFS order as the cascade), which is enough to zip against styles
+    /// but loses the slab id. A conformance runner needs to look up the box for a
+    /// *specific* element (the one carrying a `data-expected-*` attribute), so
+    /// this pairs each rect with its slab id. Build a `HashMap<usize, Rect>` from
+    /// the result and index it by the slab ids returned from
+    /// [`html::parse_html_with_css`](crate::html::parse_html_with_css).
+    pub fn element_layout(
+        &mut self,
+        viewport: canopy_traits::Size,
+    ) -> Vec<(usize, canopy_traits::Rect)> {
+        let rects = self.layout(viewport);
+        let order = self.element_dfs_order();
+        order.into_iter().zip(rects).collect()
     }
 
     /// Borrow the primary `ComputedValues` for an element slab id (post-resolve).
