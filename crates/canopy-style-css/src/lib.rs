@@ -60,7 +60,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use canopy_paint::{
-    BG, DIRECTION, FG, GAP, HEIGHT, OPACITY, PADDING, RADIUS, TRANSLATE_X, TRANSLATE_Y, WIDTH,
+    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TRANSLATE_X,
+    TRANSLATE_Y, WIDTH,
 };
 use canopy_protocol::{NodeId, PropId};
 use canopy_view::App;
@@ -381,6 +382,9 @@ fn map_property(name: &str) -> Option<PropId> {
         "opacity" => Some(OPACITY),
         "translate-x" => Some(TRANSLATE_X),
         "translate-y" => Some(TRANSLATE_Y),
+        // Flex alignment keywords (values pass through verbatim).
+        "align-items" | "align" => Some(ALIGN),
+        "justify-content" | "justify" => Some(JUSTIFY),
         _ => None,
     }
 }

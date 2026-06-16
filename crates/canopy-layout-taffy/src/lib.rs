@@ -36,14 +36,16 @@ use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
 use canopy_paint::{
-    BG, DIRECTION, FG, GAP, HEIGHT, OPACITY, PADDING, RADIUS, TRANSLATE_X, TRANSLATE_Y, WIDTH,
+    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TRANSLATE_X,
+    TRANSLATE_Y, WIDTH,
 };
 use canopy_protocol::{NodeId, PropId};
 use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, Size};
 
 use taffy::prelude::length;
 use taffy::{
-    AvailableSpace, Dimension, FlexDirection, LengthPercentage, Rect as TaffyRect,
+    AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
+    Rect as TaffyRect,
     Size as TaffySize, Style, TaffyTree,
 };
 
@@ -152,6 +154,34 @@ fn fade(color: Color, opacity: f32) -> Color {
     }
 }
 
+/// The container's cross-axis alignment ([`ALIGN`] / CSS `align-items`), or `None`
+/// (Taffy's default = stretch/start) when unset or unrecognized.
+fn style_align(dom: &Dom, id: NodeId) -> Option<AlignItems> {
+    // taffy 0.11 models alignment as a struct with associated-const keywords.
+    match dom.style(id, ALIGN)? {
+        "start" | "flex-start" => Some(AlignItems::FLEX_START),
+        "center" => Some(AlignItems::CENTER),
+        "end" | "flex-end" => Some(AlignItems::FLEX_END),
+        "stretch" => Some(AlignItems::STRETCH),
+        _ => None,
+    }
+}
+
+/// The container's main-axis distribution ([`JUSTIFY`] / CSS `justify-content`), or
+/// `None` (Taffy's default = start) when unset or unrecognized.
+fn style_justify(dom: &Dom, id: NodeId) -> Option<JustifyContent> {
+    // `JustifyContent` is taffy's `AlignContent`; same associated-const keyword style.
+    match dom.style(id, JUSTIFY)? {
+        "start" | "flex-start" => Some(JustifyContent::FLEX_START),
+        "center" => Some(JustifyContent::CENTER),
+        "end" | "flex-end" => Some(JustifyContent::FLEX_END),
+        "space-between" => Some(JustifyContent::SPACE_BETWEEN),
+        "space-around" => Some(JustifyContent::SPACE_AROUND),
+        "space-evenly" => Some(JustifyContent::SPACE_EVENLY),
+        _ => None,
+    }
+}
+
 /// Baked-font fixed pixel size for a text leaf: `scale = max(1, height_px / 8)`,
 /// `width = chars * 8 * scale`, `height = 8 * scale`. Integer math throughout —
 /// the same metrics `canopy-paint` uses, so the two engines agree on text size.
@@ -191,6 +221,8 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
         .unwrap_or(Dimension::auto());
     Style {
         flex_direction: dir,
+        align_items: style_align(dom, id),
+        justify_content: style_justify(dom, id),
         gap: TaffySize {
             width: length(gap),
             height: length(gap),
@@ -437,6 +469,27 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&e.take_batch(0)).unwrap();
         dom
+    }
+
+    #[test]
+    fn align_items_center_centers_a_child_on_the_cross_axis() {
+        // A 200-wide column with `align-items: center` and a 40-wide child: the child's
+        // x should be (200 - 40) / 2 = 80, not 0 (the default cross-start).
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "200");
+        e.set_inline_style(col, HEIGHT, "100");
+        e.set_inline_style(col, ALIGN, "center");
+        let child = e.create_element(ElementTag::new(2));
+        e.set_inline_style(child, WIDTH, "40");
+        e.set_inline_style(child, HEIGHT, "20");
+        e.append(col, child);
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
+        assert_eq!(child_rect.origin.x, 80.0, "child centered on the cross axis");
     }
 
     #[test]

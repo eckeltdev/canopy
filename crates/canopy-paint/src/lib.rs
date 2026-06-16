@@ -67,6 +67,17 @@ pub const TRANSLATE_X: PropId = PropId::new(10);
 /// Vertical paint translation in logical px, signed and fractional (e.g. `-24px`,
 /// `12.5px`). The Y-axis counterpart of [`TRANSLATE_X`]; see it for the semantics.
 pub const TRANSLATE_Y: PropId = PropId::new(11);
+/// Flex **cross-axis** alignment of a container's children (CSS `align-items`):
+/// `"start"`/`"center"`/`"end"`/`"stretch"`. On a column this centers children
+/// horizontally; on a row, vertically. The value is a keyword string the layout
+/// engine maps to its alignment enum; an unrecognized/absent value is the engine
+/// default (start).
+pub const ALIGN: PropId = PropId::new(12);
+/// Flex **main-axis** distribution of a container's children (CSS `justify-content`):
+/// `"start"`/`"center"`/`"end"`/`"space-between"`/`"space-around"`/`"space-evenly"`.
+/// On a column this distributes children vertically; on a row, horizontally — the
+/// honest way to center a hero or push a nav's ends apart without spacer hacks.
+pub const JUSTIFY: PropId = PropId::new(13);
 
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;

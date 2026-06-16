@@ -5,6 +5,7 @@ resolver = "2"
 exclude = [
     "examples/canopy-demo",
     "examples/canopy-welcome",
+    "examples/canopy-landing",
     "examples/canopy-plugin-counter",
     "examples/canopy-component-guest",
 ]
