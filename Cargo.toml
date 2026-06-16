@@ -10,6 +10,7 @@ exclude = [
     "examples/common/landing-ui",
     "examples/lite/welcome",
     "examples/lite/landing",
+    "examples/lite/embedded",
     "examples/full/landing",
     "examples/full/demo",
     "examples/full/plugin-counter",

@@ -1,0 +1,44 @@
+[package]
+name = "canopy-lite-embedded"
+description = "The lite tier's headline proof: a #![no_std] crate that builds a Canopy UI, lays it out, AND software-rasterizes it to a framebuffer — the whole pipeline, no std, no GPU, no allocator-of-its-own. It compiles for a bare-metal Cortex-M target (thumbv7em-none-eabi); a tiny host binary calls the same no_std code and writes the frame to a PPM so you can see what the microcontroller would have drawn."
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The point of this example is the LIBRARY, which is `#![no_std]` + alloc and contains
+# the entire build -> layout -> rasterize pipeline. Prove it compiles for bare metal:
+#
+#   rustup target add thumbv7em-none-eabi
+#   cargo +nightly build --lib --target thumbv7em-none-eabi
+#
+# (the `--lib` matters: the host `render` binary below uses std to write the PPM, so it
+#  is built only for the host — `cargo run --bin render frame.ppm`.)
+
+[dependencies]
+# The op-stream guest core: the `Emitter` that records create/append/style ops. no_std.
+canopy-core = { path = "../../../crates/canopy-core" }
+# Node identity + element tags for the ops. no_std.
+canopy-protocol = { path = "../../../crates/canopy-protocol" }
+# The retained tree the ops apply to, and `ROOT`. no_std.
+canopy-dom = { path = "../../../crates/canopy-dom" }
+# The lite tier's own hand-rolled flex layout + the style `PropId` consts
+# (BG/FG/WIDTH/HEIGHT/GAP/PADDING/DIRECTION/RADIUS). no_std.
+canopy-paint = { path = "../../../crates/canopy-paint" }
+# The lite tier's software rasterizer (+ the baked bitmap font via canopy-text-baked).
+# no_std: it paints into an in-memory `Buffer` with no OS, GPU, or float-std deps.
+canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+# Shared render-side types (Color, Size) and the `Renderer` / `OpSink` traits. no_std.
+canopy-traits = { path = "../../../crates/canopy-traits" }
+
+[lib]
+path = "src/lib.rs"
+
+# Host-only: writes the no_std-produced frame to a PPM. Uses std (file I/O), so it is
+# built for the host, never the embedded target.
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+
+# Pin the workspace boundary (standalone example; see the other examples for the why).
+[workspace]
