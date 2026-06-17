@@ -26,10 +26,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use canopy_dom::Dom;
+use canopy_host::{Host, SceneBuilder};
 use canopy_protocol::NodeId;
-use canopy_render_soft::Buffer;
+use canopy_render_soft::{Buffer, SoftwareRenderer};
 use canopy_style_stylo::StyloEngine;
-use canopy_traits::{Color, ComputedStyle, OpSink, Point, Rect, Size};
+use canopy_traits::{Color, ComputedStyle, DisplayList, OpSink, Point, Rect, Size};
 use canopy_ui::prelude::{resolve_tree, Classes, LiteEngine, Ui};
 
 /// Logical canvas size for each tier's PPM.
@@ -189,6 +190,58 @@ fn main() {
     write_ppm(dir, "capable-stylo.ppm", &cap_buf);
 
     print_contrast(&authored, &lite_styles, &cap_styles);
+
+    // ---- B: the capable tier through the REAL reusable host pipeline. -----------------
+    // The two PPMs above use this file's hand-rolled block-flow paint (kept for the crisp
+    // lite-vs-capable *color* contrast). This third render proves the whole capable
+    // pipeline end to end: the same authored Dom driven through the generic `Host` —
+    // apply the op-batch, then `paint` = Dom → Stylo (`from_dom`) → `DisplayList` →
+    // `SoftwareRenderer`. No bespoke paint; Stylo lays out and paints the box model.
+    let host = paint_via_host();
+    write_ppm(dir, "capable-host.ppm", host.renderer().buffer());
+    println!("wrote capable-host.ppm — the capable tier through the reusable Host pipeline.");
+}
+
+/// A capable-tier [`SceneBuilder`]: runs the real Stylo cascade over the host's `Dom`
+/// each frame and emits its display list. This is the crux of the capable host — the
+/// Stylo engine plugs into the reusable [`Host`] loop through one trait, and it lives
+/// here in the (excluded) example rather than in the workspace-member `canopy-host`,
+/// which must stay free of the heavy Stylo dependency.
+struct StyloSceneBuilder {
+    css: String,
+}
+
+impl SceneBuilder for StyloSceneBuilder {
+    fn build_scene(&mut self, dom: &Dom, viewport: Size) -> DisplayList {
+        // NOTE: this rebuilds the whole Stylo overlay and re-parses the CSS every frame
+        // — fine for a one-shot render, but a steady-state windowed host wants roadmap
+        // B4 (incremental re-cascade): hold the engine and re-sync only changed nodes.
+        let mut engine = StyloEngine::from_dom(dom, &self.css);
+        engine.set_viewport(viewport);
+        engine.build_display_list(viewport)
+    }
+}
+
+/// Drive the capable app through the reusable [`Host`]: author the identity-carrying
+/// tree, apply its op-batch into the host's `Dom`, and paint one frame through the
+/// Stylo-backed [`StyloSceneBuilder`]. Returns the host so the caller can read its
+/// rendered buffer.
+fn paint_via_host() -> Host<StyloSceneBuilder, SoftwareRenderer> {
+    let ui = Ui::capable(CAPABLE_CSS);
+    build_app(&ui);
+    let mut host = Host::with_scene_builder(
+        StyloSceneBuilder {
+            css: CAPABLE_CSS.to_string(),
+        },
+        SoftwareRenderer::new(VIEW_W, VIEW_H, CLEAR),
+    );
+    host.apply(&ui.take_batch(0)).expect("apply to host");
+    host.paint(Size {
+        w: VIEW_W as f32,
+        h: VIEW_H as f32,
+    })
+    .expect("host paint");
+    host
 }
 
 /// Rasterize the authored tree into a fresh [`Buffer`], reading each node's style from
@@ -354,6 +407,26 @@ fn write_ppm(dir: &str, name: &str, buf: &Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capable_host_pipeline_paints_the_cascaded_background() {
+        // B end to end: the same authored Dom driven through the reusable `Host`
+        // (Dom → Stylo → DisplayList → SoftwareRenderer) must paint the cascaded
+        // `.app` background, proving the capable engine plugged into the host loop and
+        // its cascade + layout + paint all ran — no hand-rolled paint involved.
+        let host = paint_via_host();
+        let buf = host.renderer().buffer();
+        let app_bg = [0x14, 0x16, 0x1c, 255];
+        let painted = (0..VIEW_H)
+            .flat_map(|y| (0..VIEW_W).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf.pixel(x, y) == app_bg)
+            .count();
+        // A real fill, not a stray pixel: the `.app` panel covers a large region.
+        assert!(
+            painted > 1000,
+            "the capable Host rendered the cascaded .app background (#14161c); got {painted} px"
+        );
+    }
 
     /// Build both tiers over the same authored tree and return the nested `.title`'s
     /// resolved foreground color under each — both resolved through the *same*

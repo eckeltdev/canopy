@@ -16,9 +16,6 @@ publish = false
 canopy-ui = { path = "../../../crates/canopy-ui" }
 # The retained tree both tiers apply their op-batch into (capable cascades over it).
 canopy-dom = { path = "../../../crates/canopy-dom" }
-# The paint PropId consts (BG/FG/PADDING) the lite class engine writes inline styles to,
-# read back here to synthesize a ComputedStyle for the lite render.
-canopy-paint = { path = "../../../crates/canopy-paint" }
 # The capable-tier StyleEngine: real Stylo cascade over the real Dom.
 canopy-style-stylo = { path = "../../../crates/canopy-style-stylo" }
 # The flat style PAL (ComputedStyle/Color + the StyleEngine trait + OpSink) and NodeId.
@@ -26,6 +23,9 @@ canopy-traits = { path = "../../../crates/canopy-traits" }
 canopy-protocol = { path = "../../../crates/canopy-protocol" }
 # One CPU rasterizer draws BOTH tiers, so the only variable is the ComputedStyle source.
 canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
+# The reusable headless host loop (apply -> build_scene -> render). A capable SceneBuilder
+# plugs StyloEngine into it, proving the real Dom -> Stylo -> DisplayList -> renderer path.
+canopy-host = { path = "../../../crates/canopy-host" }
 
 [[bin]]
 name = "canopy-full-capable-tier"

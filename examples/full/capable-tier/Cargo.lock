@@ -82,12 +82,21 @@ name = "canopy-full-capable-tier"
 version = "0.0.0"
 dependencies = [
  "canopy-dom",
- "canopy-paint",
+ "canopy-host",
  "canopy-protocol",
  "canopy-render-soft",
  "canopy-style-stylo",
  "canopy-traits",
  "canopy-ui",
+]
+
+[[package]]
+name = "canopy-host"
+version = "0.0.0"
+dependencies = [
+ "canopy-dom",
+ "canopy-paint",
+ "canopy-traits",
 ]
 
 [[package]]
