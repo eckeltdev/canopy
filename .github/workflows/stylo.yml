@@ -133,15 +133,15 @@ jobs:
 
       # The regression gate. `--check` re-runs the suite and exits non-zero if any
       # test that the committed baseline marks PASS is no longer PASS. Improvements
-      # (more tests passing than the baseline) are reported but never fail CI; to
-      # lock them in, regenerate the baseline with --write-baseline.
+      # (more tests passing than the baseline) are reported but never fail CI.
       #
-      # The committed baselines must be regenerated HERE in CI (run this job's
-      # fetch + build, then `./target/release/canopy-wpt <suite> --write-baseline
-      # expectations/<suite>.txt` and commit the result), NOT in a local checkout
-      # that lacks the css/reference tree — otherwise the flexbox REF tests bake
-      # in "reference file unreadable" INFRA skips instead of the real PASS/FAIL
-      # render-compares that the now-present css/reference path produces.
+      # The automatic push/PR runs ONLY `--check` and never rewrite the baseline.
+      # Regenerating must happen in an environment that HAS the css/reference tree
+      # (a plain local checkout lacks it, so regenerating there bakes "reference file
+      # unreadable" INFRA skips into the baseline instead of the real PASS/FAIL
+      # render-compares css/reference produces). The "Regenerate baselines" step below
+      # does this on a manual (workflow_dispatch) run, after this job's fetch + build,
+      # and uploads the result for a maintainer to download and commit.
       - name: css-flexbox regression check
         working-directory: crates/canopy-wpt
         env:
@@ -157,6 +157,28 @@ jobs:
         run: |
           ./target/release/canopy-wpt /tmp/wpt/css/css-grid \
             --check expectations/css-grid.txt
+
+      # Manual baseline refresh (workflow_dispatch only): regenerate both baselines
+      # against the freshly fetched css/reference tree and upload them as an artifact
+      # for a maintainer to download and commit. The push/PR runs above never do this.
+      - name: Regenerate baselines (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: crates/canopy-wpt
+        env:
+          WPT_DIR: /tmp/wpt
+        run: |
+          ./target/release/canopy-wpt /tmp/wpt/css/css-flexbox \
+            --write-baseline expectations/css-flexbox.txt
+          ./target/release/canopy-wpt /tmp/wpt/css/css-grid \
+            --write-baseline expectations/css-grid.txt
+      - name: Upload regenerated baselines
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-baselines
+          path: |
+            crates/canopy-wpt/expectations/css-flexbox.txt
+            crates/canopy-wpt/expectations/css-grid.txt
 
   # ----------------------------------------------------------------------------
   # 3. NON-BLOCKING Chrome browser-oracle lane.
@@ -189,18 +211,21 @@ jobs:
         with:
           workspaces: crates/canopy-style-stylo
 
-      # ubuntu-latest preinstalls Chrome; this action makes the resolved binary
-      # available on PATH (and is a no-op if one is already present), so the
-      # oracle's Chrome auto-discovery finds it and the tests actually RUN rather
-      # than SKIP. CANOPY_CHROME pins the binary the harness shells out to.
+      # ubuntu-latest preinstalls Chrome; this action resolves a Chrome binary and
+      # exposes its absolute path as `steps.setup-chrome.outputs.chrome-path`, which we
+      # pin via CANOPY_CHROME so the harness uses exactly that binary. (find_chrome only
+      # honors CANOPY_CHROME when it is an existing PATH/filesystem path — a bare name
+      # would be ignored and fall back to its built-in candidate list — so we pass the
+      # resolved absolute path, not "chrome".)
       - name: Set up Chrome
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
 
-      # Both oracle tests run by default now (no --ignored needed). With Chrome on
-      # PATH they perform the real comparison; without it they would no-op SKIP.
+      # Both oracle tests run by default now (no --ignored needed); with the pinned
+      # Chrome they perform the real comparison rather than the no-op SKIP.
       - name: browser + layout oracle vs Chrome
         working-directory: crates/canopy-style-stylo
         env:
-          CANOPY_CHROME: chrome
+          CANOPY_CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: |
           cargo +${{ env.NIGHTLY }} test --test browser_oracle --test layout_oracle -- --nocapture

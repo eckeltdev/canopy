@@ -189,6 +189,9 @@ struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
+    /// Hard cap on cached glyph runs, to keep a long-lived renderer's memory bounded.
+    const MAX_ENTRIES: usize = 4096;
+
     /// Return the coverage mask for `text` at `size`, rasterizing with `engine`
     /// only on a miss.
     ///
@@ -214,6 +217,13 @@ impl GlyphAtlas {
         }
         let mask = engine.rasterize(text, size, color);
         self.misses += 1;
+        // Bound the cache: a persistent renderer that churns text (a new string every
+        // frame) would otherwise grow this map without limit. On overflow drop the whole
+        // cache — cheap, and the live working set re-populates within a frame. (A real
+        // LRU would evict more gently; a hard cap is enough to keep memory bounded.)
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.clear();
+        }
         self.entries.insert(key, mask.clone());
         mask
     }

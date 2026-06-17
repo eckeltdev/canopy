@@ -69,10 +69,11 @@ enum SkipReason {
     /// REF accuracy denominator. The css-flexbox reference files live under
     /// `css/reference`, which CI now sparse-checks out (see stylo.yml); once that
     /// path is present these become real PASS/FAIL render-compares instead of
-    /// infra-skips. NOTE: the committed baselines are regenerated in CI via the
-    /// `--write-baseline` flag AFTER the css/reference fetch — do not regenerate
-    /// them in a checkout that lacks the reference tree (it would bake the
-    /// infra-skips into the baseline).
+    /// infra-skips. NOTE: the automatic CI runs only `--check`; the committed
+    /// baselines are refreshed by the manual (workflow_dispatch) "Regenerate
+    /// baselines" step in stylo.yml, which fetches `css/reference` first and runs
+    /// `--write-baseline`. Do not regenerate in a checkout lacking the reference tree
+    /// (it would bake these infra-skips into the baseline).
     RefFileUnreadable,
 }
 // NOTE: the former `AbsolutePosition` and `TextDependent` skip buckets were
