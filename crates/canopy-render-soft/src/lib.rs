@@ -47,6 +47,35 @@ fn blend_over(dst: &mut [u8], src: Color) {
     dst[3] = ((255 * a + u32::from(dst[3]) * inv + 127) / 255) as u8;
 }
 
+/// Whether point `(px, py)` (pixel-center, absolute logical coords) lies inside the
+/// rounded rect `rect` with corner radius `r`. The straight edges and interior are
+/// inside; only the four corner quarter-circles carve pixels away. Used by the rounded
+/// fill and stroke. `r` is clamped to half the shorter side; `r <= 0` is a plain rect.
+fn point_in_round_rect(px: f32, py: f32, rect: Rect, r: f32) -> bool {
+    if px < rect.origin.x
+        || px >= rect.origin.x + rect.size.w
+        || py < rect.origin.y
+        || py >= rect.origin.y + rect.size.h
+    {
+        return false;
+    }
+    let r = r.min(0.5 * rect.size.w.min(rect.size.h)).max(0.0);
+    if r <= 0.0 {
+        return true;
+    }
+    let left = rect.origin.x + r;
+    let right = rect.origin.x + rect.size.w - r;
+    let top = rect.origin.y + r;
+    let bottom = rect.origin.y + rect.size.h - r;
+    // Nearest arc center per axis; an unclamped axis contributes 0 distance, so straight
+    // edge strips stay inside and only true corners apply the quarter-circle cutoff.
+    let cx = px.clamp(left, right);
+    let cy = py.clamp(top, bottom);
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= r * r
+}
+
 /// An RGBA8888 pixel buffer, row-major, 4 bytes per pixel.
 pub struct Buffer {
     width: usize,
@@ -235,62 +264,62 @@ impl Buffer {
     /// Stroke a `width`-thick frame **inside** `rect` in `c`, src-over blended,
     /// clipped to the buffer.
     ///
-    /// This is the CPU tier's degraded [`DisplayItem::Border`] rasterization: the
-    /// four edge bands (top, bottom, left, right) are filled as solid rectangles so
-    /// the box reads as framed. A non-positive `width` paints nothing; `width` is
-    /// clamped to half the rect's shorter side so the bands never overlap into a
-    /// solid fill. `radius` is accepted for signature parity with the rounded fill
-    /// but **not** carved here — the corners stay square, a faithful approximation
-    /// (the GPU tier draws true rounded strokes). Each band reuses
-    /// [`fill_rect`](Buffer::fill_rect), so a translucent border color blends.
+    /// The CPU tier's [`DisplayItem::Border`] rasterization: paints the ring of pixels
+    /// that lie inside the outer rounded rect (`rect`, corner radius `radius`) but outside
+    /// the inner one (`rect` inset by `width`, radius shrunk by `width`). A non-positive
+    /// `width` paints nothing; `width` and `radius` are each clamped to half the rect's
+    /// shorter side. With `radius == 0.0` the ring is the four square edge bands; with a
+    /// positive radius the corners are carved to match the rounded fill (and the GPU
+    /// tier's rounded stroke), so a `border-radius` box frames correctly.
     pub fn stroke_rect(&mut self, rect: Rect, c: Color, width: f32, radius: f32) {
-        let _ = radius; // square-cornered approximation on the CPU tier.
         if width <= 0.0 {
             return;
         }
-        // Clamp the stroke to half the shorter side so opposite bands can't overlap.
-        let w = width.min(0.5 * rect.size.w.min(rect.size.h));
+        let half = 0.5 * rect.size.w.min(rect.size.h);
+        let w = width.min(half);
         if w <= 0.0 {
             return;
         }
-        let Rect { origin, size } = rect;
-        // Top and bottom bands span the full width; left/right fill the gap between
-        // them, so no corner pixel is painted twice.
-        let top = Rect {
-            origin,
-            size: Size { w: size.w, h: w },
-        };
-        let bottom = Rect {
+        let outer_r = radius.max(0.0).min(half);
+        // Inner edge of the band: the border-box inset by `w`, with the radius shrunk
+        // to keep the ring an even `w` thick around the curve.
+        let inner = Rect {
             origin: Point {
-                x: origin.x,
-                y: origin.y + size.h - w,
-            },
-            size: Size { w: size.w, h: w },
-        };
-        let left = Rect {
-            origin: Point {
-                x: origin.x,
-                y: origin.y + w,
+                x: rect.origin.x + w,
+                y: rect.origin.y + w,
             },
             size: Size {
-                w,
-                h: size.h - 2.0 * w,
+                w: (rect.size.w - 2.0 * w).max(0.0),
+                h: (rect.size.h - 2.0 * w).max(0.0),
             },
         };
-        let right = Rect {
-            origin: Point {
-                x: origin.x + size.w - w,
-                y: origin.y + w,
-            },
-            size: Size {
-                w,
-                h: size.h - 2.0 * w,
-            },
-        };
-        self.fill_rect(top, c);
-        self.fill_rect(bottom, c);
-        self.fill_rect(left, c);
-        self.fill_rect(right, c);
+        let inner_r = (outer_r - w).max(0.0);
+        let opaque = c.a == 255;
+
+        let x0 = (rect.origin.x as usize).min(self.width);
+        let y0 = (rect.origin.y as usize).min(self.height);
+        let x1 = ((rect.origin.x + rect.size.w) as usize).min(self.width);
+        let y1 = ((rect.origin.y + rect.size.h) as usize).min(self.height);
+
+        for y in y0..y1 {
+            let py = y as f32 + 0.5;
+            let start = (y * self.width + x0) * 4;
+            let end = (y * self.width + x1) * 4;
+            let row = &mut self.data[start..end];
+            for (i, px) in row.chunks_exact_mut(4).enumerate() {
+                let pxc = (x0 + i) as f32 + 0.5;
+                // In the frame ring: inside the outer rounded rect, outside the inner.
+                if point_in_round_rect(pxc, py, rect, outer_r)
+                    && !point_in_round_rect(pxc, py, inner, inner_r)
+                {
+                    if opaque {
+                        px.copy_from_slice(&[c.r, c.g, c.b, c.a]);
+                    } else {
+                        blend_over(px, c);
+                    }
+                }
+            }
+        }
     }
 
     /// Paint one opaque pixel, clipped to the buffer.
