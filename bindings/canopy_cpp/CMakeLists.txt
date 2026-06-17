@@ -38,6 +38,23 @@ target_sources(canopy_cpp PRIVATE "src/build_context.cpp")
 target_include_directories(canopy_cpp PUBLIC "../../crates/canopy-abi/include" include)
 target_compile_features(canopy_cpp PUBLIC cxx_std_23)
 
+# Target: canopy_cpp_counter_example
+add_executable(canopy_cpp_counter_example)
+target_sources(
+	canopy_cpp_counter_example
+	PRIVATE
+	"examples/counter_card/main.cpp"
+	"src/build_context.cpp"
+)
+target_include_directories(
+	canopy_cpp_counter_example
+	PRIVATE
+	"../../crates/canopy-abi/include"
+	include
+)
+target_compile_features(canopy_cpp_counter_example PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_counter_example PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_dsl_test
 add_executable(canopy_cpp_dsl_test)
 target_sources(canopy_cpp_dsl_test PRIVATE "tests/dsl_test.cpp")

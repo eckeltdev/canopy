@@ -57,10 +57,20 @@ compile-options = ["-fno-exceptions", "-fno-rtti"]
 
 # P2 round-trip oracle: links the real Rust engine (libcanopy_abi.a, built by
 # `cargo build -p canopy-abi`) and asserts a DSL-built tree, applied through it, yields the
-# expected Dom dump. The link dir is relative to this dir (../../target/debug = repo target).
+# expected Dom dump. The link dir is relative to the BUILD dir (build/ -> repo target/debug).
 [target.canopy_cpp_roundtrip_test]
 type = "executable"
 sources = ["tests/roundtrip_test.cpp", "src/build_context.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
+# Worked example: a counter-card component authored with the DSL, applied through the real
+# engine, its Dom dump printed (and self-verified). Links libcanopy_abi.a like the round-trip
+# test, so it needs `cargo build -p canopy-abi` first.
+[target.canopy_cpp_counter_example]
+type = "executable"
+sources = ["examples/counter_card/main.cpp", "src/build_context.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
