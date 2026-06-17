@@ -22,13 +22,17 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 # transport does.
 canopy-dom = { path = "../canopy-dom" }
 canopy-traits = { path = "../canopy-traits" }
+# Encode the host->guest DispatchEvent batch the event drain returns (OpEncoder), and
+# lay out + hit-test the retained tree to turn a pointer into the node under it. The
+# lite (inline-style) layout; the host-side-cascade geometry path is a follow-up.
+canopy-protocol = { path = "../canopy-protocol" }
+canopy-layout-taffy = { path = "../canopy-layout-taffy" }
 
 [dev-dependencies]
 # The guest-side op-builder, used by the tests to produce real op batches (create an
 # element + a text child, append under ROOT, take_batch) and drive them through the
 # C entry points.
 canopy-core = { path = "../canopy-core" }
-canopy-protocol = { path = "../canopy-protocol" }
 # The reference host's well-known id registries, so the protocol_header parity test can
 # machine-check include/canopy_protocol.h against the live constants (ElementTag/EventKind
 # in canopy-view, PropId in canopy-paint) and catch any header drift.

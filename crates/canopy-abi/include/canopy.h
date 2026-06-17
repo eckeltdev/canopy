@@ -108,6 +108,59 @@ int32_t canopy_host_apply(CanopyHost *host, const uint8_t *ptr, size_t len);
 size_t canopy_host_node_count(const CanopyHost *host);
 
 /*
+ * Events (host -> guest)
+ * ----------------------
+ * Set the viewport, deliver pointer input, and drain the resulting DispatchEvent
+ * batch. See canopy_protocol.h for the DispatchEvent wire layout and the well-known
+ * EventKind ids (e.g. CANOPY_EVENT_CLICK).
+ */
+
+/*
+ * Set the viewport (logical pixels) the tree is laid out within for hit-testing. Call
+ * on window create/resize. Until set, the viewport is 0x0 (nothing has area to hit).
+ * Returns CANOPY_OK, or CANOPY_ERR_NULL_HOST.
+ */
+int32_t canopy_host_resize(CanopyHost *host, float width, float height);
+
+/*
+ * Deliver a pointer event at (x, y): hit-test the laid-out tree and, if it lands on (or
+ * within) a node carrying a listener for `event` (e.g. CANOPY_EVENT_CLICK), queue a
+ * DispatchEvent for the guest to drain with canopy_host_poll_events. `button` is the
+ * pressed button (0 = primary); `event` is the EventKind to match.
+ *
+ * Returns the number of events queued (0 or 1), or a negative CANOPY_ERR_* code.
+ *
+ * Hit geometry is the lite (inline-style) layout. A host-side-cascade tree (class
+ * identity only, no inline styles) has no geometry here until its cascade runs.
+ */
+int32_t canopy_host_pointer(CanopyHost *host, float x, float y, uint8_t button,
+                            uint16_t event);
+
+/*
+ * Drain queued host -> guest events into `out` (capacity `cap` bytes), writing the byte
+ * length to *out_len. The drained bytes are one canopy-protocol batch
+ * (BeginBatch ... DispatchEvent* ... EndBatch) the guest decodes with its normal reader.
+ *
+ * Returns CANOPY_OK with *out_len set (0 if the queue was empty; otherwise the queue is
+ * cleared); CANOPY_ERR_TOO_LARGE with *out_len set to the NEEDED size if the batch does
+ * not fit in `cap` (nothing is consumed — retry with a bigger buffer;
+ * CANOPY_MAX_EVENT_BATCH_BYTES always suffices); or CANOPY_ERR_NULL_HOST /
+ * CANOPY_ERR_NULL_DATA.
+ *
+ * Precondition: `out_len` is a writable size_t, and if cap > 0, `out` points to `cap`
+ * writable bytes valid for the call.
+ */
+int32_t canopy_host_poll_events(CanopyHost *host, uint8_t *out, size_t cap,
+                                size_t *out_len);
+
+/*
+ * Cap on a single drained event batch, in bytes (64 KiB) — the outbound analog of
+ * CANOPY_MAX_BATCH_BYTES. An `out` of this size always drains the queue in one call.
+ * Keep in sync with `canopy_abi::MAX_EVENT_BATCH_BYTES`.
+ */
+#define CANOPY_MAX_EVENT_BATCH_BYTES (64u << 10)
+
+/*
  * Destroy a host created by canopy_host_new, freeing its retained tree.
  *
  * Passing NULL is a no-op. Passing the same non-NULL pointer twice, or any pointer

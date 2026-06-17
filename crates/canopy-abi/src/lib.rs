@@ -67,7 +67,8 @@
 #![allow(unsafe_code)]
 
 use canopy_dom::Dom;
-use canopy_traits::{HostError, OpSink};
+use canopy_protocol::{EventKind, EventPayload, Op, OpEncoder};
+use canopy_traits::{HostError, OpSink, Point, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
 ///
@@ -76,6 +77,17 @@ use canopy_traits::{HostError, OpSink};
 /// `canopy-transport-wasmtime`'s `MAX_BATCH_BYTES`: the host never sizes a buffer
 /// from an untrusted length.
 pub const MAX_BATCH_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Cap on a single [`canopy_host_poll_events`] drained batch, in bytes — the outbound
+/// analog of [`MAX_BATCH_BYTES`]. The host never queues more events than encode within
+/// this, so an `out` buffer of this size always drains the queue in one call.
+pub const MAX_EVENT_BATCH_BYTES: usize = 64 * 1024; // 64 KiB
+
+/// Internal cap on queued events between drains, chosen so the encoded batch never
+/// exceeds [`MAX_EVENT_BATCH_BYTES`] (a Pointer DispatchEvent is ~23 bytes + an 8-byte
+/// envelope). Past this, new events are dropped until the queue is drained — bounded
+/// memory under a flood of input with no poll.
+const MAX_PENDING_EVENTS: usize = 2048;
 
 /// Return code: the batch was decoded, validated, and applied.
 pub const CANOPY_OK: i32 = 0;
@@ -99,9 +111,17 @@ pub const CANOPY_ERR_UNSUPPORTED: i32 = -6;
 /// created by [`canopy_host_new`], driven by [`canopy_host_apply`], and destroyed by
 /// [`canopy_host_free`].
 pub struct CanopyHost {
-    /// The host's retained tree. It validates every handle and decodes the op bytes,
-    /// so the C ABI itself holds no protocol knowledge.
+    /// The host's retained tree. It validates every handle and decodes inbound op
+    /// bytes, so the C ABI holds no inbound protocol knowledge.
     dom: Dom,
+    /// The viewport the tree is laid out within for hit-testing. Set via
+    /// [`canopy_host_resize`]; `0×0` until then (so no node has area to hit).
+    viewport: Size,
+    /// Events produced by hit-testing pointers, waiting to be drained by
+    /// [`canopy_host_poll_events`]. Each is a host→guest `DispatchEvent`.
+    pending_events: Vec<Op>,
+    /// Monotonic seq stamped into each drained event batch's `BeginBatch`.
+    event_seq: u32,
 }
 
 impl CanopyHost {
@@ -109,7 +129,86 @@ impl CanopyHost {
     /// this crate as an `rlib` and would rather use the handle directly than go
     /// through raw pointers.
     pub fn new() -> Self {
-        Self { dom: Dom::new() }
+        Self {
+            dom: Dom::new(),
+            viewport: Size::default(),
+            pending_events: Vec::new(),
+            event_seq: 0,
+        }
+    }
+
+    /// Set the viewport the tree is laid out within for hit-testing.
+    pub fn set_viewport(&mut self, width: f32, height: f32) {
+        self.viewport = Size {
+            w: width,
+            h: height,
+        };
+    }
+
+    /// Hit-test a pointer at `(x, y)` and, if it lands on (or within) a node carrying a
+    /// listener for `event`, queue a `DispatchEvent` for that handler. Returns the
+    /// number of events queued (`0` or `1`).
+    ///
+    /// Geometry comes from the **lite (inline-style) layout**: correct for a tree whose
+    /// nodes carry inline styles. A *host-side-cascade* tree (class identity only, no
+    /// inline styles) lays out with no geometry here until its cascade has run — wiring
+    /// the lite host-side cascade → layout is the follow-up that makes hit-testing
+    /// correct for that model (the same gap that makes `canopy-ui`'s capable-tier
+    /// hit-test defer to the host engine).
+    pub fn pointer_event(&mut self, x: f32, y: f32, button: u8, event: u16) -> i32 {
+        if self.pending_events.len() >= MAX_PENDING_EVENTS {
+            return 0; // back-pressure: drop until the queue is drained
+        }
+        let (_scene, layout) = canopy_layout_taffy::layout(&self.dom, self.viewport);
+        let Some(mut node) = canopy_layout_taffy::hit_test(&layout, Point { x, y }) else {
+            return 0;
+        };
+        let kind = EventKind::new(event);
+        // The nearest ancestor (including the hit node) with a matching listener wins —
+        // mirroring `canopy-ui::click_handler`.
+        loop {
+            let Some(n) = self.dom.node(node) else {
+                return 0;
+            };
+            if let Some((_, handler)) = n.listeners.iter().find(|(ev, _)| *ev == kind) {
+                self.pending_events.push(Op::DispatchEvent {
+                    handler: *handler,
+                    node,
+                    payload: EventPayload::Pointer { x, y, button },
+                });
+                return 1;
+            }
+            match n.parent {
+                Some(p) => node = p,
+                None => return 0,
+            }
+        }
+    }
+
+    /// Drain the queued events into `out` as one `BeginBatch … DispatchEvent* … EndBatch`
+    /// batch (so the guest decodes it with the same reader it uses for any batch).
+    /// Returns `(code, written)`: on success `written` is the byte length and the queue
+    /// is cleared; if the encoded batch exceeds `out.len()` nothing is consumed and the
+    /// returned `(CANOPY_ERR_TOO_LARGE, needed)` lets the caller retry with a bigger
+    /// buffer (an `out` of [`MAX_EVENT_BATCH_BYTES`] always suffices).
+    pub fn poll_events_into(&mut self, out: &mut [u8]) -> (i32, usize) {
+        if self.pending_events.is_empty() {
+            return (CANOPY_OK, 0);
+        }
+        let mut enc = OpEncoder::new();
+        enc.begin_batch(self.event_seq);
+        for op in &self.pending_events {
+            enc.push(op);
+        }
+        enc.end_batch();
+        let bytes = enc.into_bytes();
+        if bytes.len() > out.len() {
+            return (CANOPY_ERR_TOO_LARGE, bytes.len()); // needed size; not consumed
+        }
+        out[..bytes.len()].copy_from_slice(&bytes);
+        self.pending_events.clear();
+        self.event_seq = self.event_seq.wrapping_add(1);
+        (CANOPY_OK, bytes.len())
     }
 
     /// Apply one op batch through the safe, capability-validating path, mapping the
@@ -255,6 +354,99 @@ pub unsafe extern "C" fn canopy_host_node_count(host: *const CanopyHost) -> usiz
     host.node_count()
 }
 
+/// Set the viewport (logical pixels) the tree is laid out within for hit-testing.
+///
+/// Call on window create/resize. Until set, the viewport is `0×0` and no node has area
+/// to hit. Returns [`CANOPY_OK`], or [`CANOPY_ERR_NULL_HOST`] if `host` is null.
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`] that is not freed.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_resize(host: *mut CanopyHost, width: f32, height: f32) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; unique ref
+    // for this call only.
+    let host = unsafe { &mut *host };
+    host.set_viewport(width, height);
+    CANOPY_OK
+}
+
+/// Deliver a pointer event at `(x, y)`: hit-test the laid-out tree and, if it lands on
+/// (or within) a node carrying a listener for `event` (e.g. [`CANOPY_EVENT_CLICK`]),
+/// queue a `DispatchEvent` for the guest to drain with [`canopy_host_poll_events`].
+///
+/// `button` is the pressed button (0 = primary). `event` is the `EventKind` to match.
+/// Returns the number of events queued (`0` or `1`), or a negative [`CANOPY_ERR_*`].
+/// Hit geometry is the lite (inline-style) layout — see [`CanopyHost::pointer_event`]
+/// for the host-side-cascade caveat.
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`] that is not freed.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_pointer(
+    host: *mut CanopyHost,
+    x: f32,
+    y: f32,
+    button: u8,
+    event: u16,
+) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; unique ref
+    // for this call only.
+    let host = unsafe { &mut *host };
+    host.pointer_event(x, y, button, event)
+}
+
+/// Drain queued host→guest events into `out` (capacity `cap` bytes), writing the byte
+/// length to `*out_len`. The drained bytes are one `canopy-protocol` batch
+/// (`BeginBatch … DispatchEvent* … EndBatch`) the guest decodes with its normal reader.
+///
+/// Returns [`CANOPY_OK`] with `*out_len` set (0 if the queue was empty, clearing the
+/// queue otherwise); [`CANOPY_ERR_TOO_LARGE`] with `*out_len` set to the **needed**
+/// size if the batch does not fit in `cap` (nothing is consumed — retry with a bigger
+/// buffer; [`MAX_EVENT_BATCH_BYTES`] always suffices); or [`CANOPY_ERR_NULL_HOST`] /
+/// [`CANOPY_ERR_NULL_DATA`].
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`]; `out_len` must be a
+/// valid writable `usize`; and if `cap > 0`, `out` must point to `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_poll_events(
+    host: *mut CanopyHost,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    if out_len.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    }
+    // Form the writable slice; tolerate a null `out` only when `cap == 0`.
+    let buf: &mut [u8] = if cap == 0 {
+        &mut []
+    } else if out.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    } else {
+        // SAFETY: per contract `out` points to `cap` writable bytes valid for this call.
+        unsafe { core::slice::from_raw_parts_mut(out, cap) }
+    };
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`.
+    let host = unsafe { &mut *host };
+    let (code, written) = host.poll_events_into(buf);
+    // SAFETY: `out_len` checked non-null above; per contract it is a valid writable usize.
+    unsafe { *out_len = written };
+    code
+}
+
 /// Destroy a host created by [`canopy_host_new`], freeing its retained tree.
 ///
 /// Passing null is a no-op (so double-free guards in foreign code that null their
@@ -283,7 +475,7 @@ mod tests {
     use super::*;
     use canopy_core::Emitter;
     use canopy_dom::ROOT;
-    use canopy_protocol::ElementTag;
+    use canopy_protocol::{ElementTag, HandlerId, NodeId};
 
     /// Build a real op batch: a column element with a text child, both appended under
     /// the host root. Returns the encoded bytes — exactly what a guest would hand the
@@ -445,5 +637,105 @@ mod tests {
         assert_eq!(host.apply_bytes(&mounted_batch()), CANOPY_OK);
         assert_eq!(host.node_count(), 2);
         assert_eq!(host.dom().children(ROOT).len(), 1);
+    }
+
+    /// A 100×40 button at the top-left with a CLICK listener (handler 7), as inline-
+    /// styled op bytes — the geometry the lite hit-test reads.
+    fn button_with_click() -> (Vec<u8>, NodeId, HandlerId) {
+        use canopy_paint::{HEIGHT, WIDTH};
+        use canopy_view::CLICK;
+        let handler = HandlerId::new(7);
+        let mut e = Emitter::new();
+        let btn = e.create_element(ElementTag::new(3));
+        e.append(ROOT, btn);
+        e.set_inline_style(btn, WIDTH, "100");
+        e.set_inline_style(btn, HEIGHT, "40");
+        e.add_listener(btn, CLICK, handler);
+        (e.take_batch(0), btn, handler)
+    }
+
+    #[test]
+    fn pointer_hit_test_queues_and_drains_a_dispatch_event() {
+        use canopy_protocol::{EventPayload, Op, OpReader};
+        use canopy_view::CLICK;
+
+        let (batch, btn, handler) = button_with_click();
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&batch), CANOPY_OK);
+        host.set_viewport(200.0, 200.0);
+
+        // Inside the button → one event queued; outside → none.
+        assert_eq!(host.pointer_event(10.0, 10.0, 0, CLICK.raw()), 1);
+        assert_eq!(host.pointer_event(150.0, 150.0, 0, CLICK.raw()), 0);
+
+        // Drain and decode the host→guest batch.
+        let mut out = [0u8; 256];
+        let (code, n) = host.poll_events_into(&mut out);
+        assert_eq!(code, CANOPY_OK);
+        assert!(n > 0, "a non-empty event batch was drained");
+
+        let ops: Vec<Op> = OpReader::new(&out[..n]).map(|r| r.unwrap()).collect();
+        let (h, node, payload) = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::DispatchEvent {
+                    handler,
+                    node,
+                    payload,
+                } => Some((*handler, *node, payload)),
+                _ => None,
+            })
+            .expect("a DispatchEvent in the drained batch");
+        assert_eq!(h, handler, "the button's click handler");
+        assert_eq!(node, btn, "the hit node");
+        assert!(
+            matches!(payload, EventPayload::Pointer { button: 0, .. }),
+            "a pointer payload with the primary button"
+        );
+
+        // The queue is now empty: a second poll yields nothing.
+        assert_eq!(host.poll_events_into(&mut out), (CANOPY_OK, 0));
+    }
+
+    #[test]
+    fn poll_events_reports_needed_size_without_consuming() {
+        use canopy_view::CLICK;
+        let (batch, _btn, _h) = button_with_click();
+        let mut host = CanopyHost::new();
+        host.apply_bytes(&batch);
+        host.set_viewport(200.0, 200.0);
+        assert_eq!(host.pointer_event(10.0, 10.0, 0, CLICK.raw()), 1);
+
+        // A 4-byte buffer cannot hold the batch: report the needed size, consume nothing.
+        let mut tiny = [0u8; 4];
+        let (code, needed) = host.poll_events_into(&mut tiny);
+        assert_eq!(code, CANOPY_ERR_TOO_LARGE);
+        assert!(needed > 4, "the needed size is reported");
+
+        // Still queued — a big enough buffer drains it.
+        let mut out = [0u8; 256];
+        let (code2, n) = host.poll_events_into(&mut out);
+        assert_eq!(code2, CANOPY_OK);
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn event_fns_tolerate_a_null_host() {
+        // SAFETY: a null host is a documented, handled input for every event fn.
+        unsafe {
+            assert_eq!(
+                canopy_host_resize(core::ptr::null_mut(), 1.0, 1.0),
+                CANOPY_ERR_NULL_HOST
+            );
+            assert_eq!(
+                canopy_host_pointer(core::ptr::null_mut(), 0.0, 0.0, 0, 1),
+                CANOPY_ERR_NULL_HOST
+            );
+            let mut len = 0usize;
+            assert_eq!(
+                canopy_host_poll_events(core::ptr::null_mut(), core::ptr::null_mut(), 0, &mut len),
+                CANOPY_ERR_NULL_HOST
+            );
+        }
     }
 }

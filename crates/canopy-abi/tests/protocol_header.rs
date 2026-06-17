@@ -61,6 +61,10 @@ fn header_matches_the_rust_constants() {
         // Protocol (canopy-protocol / canopy-abi).
         ("CANOPY_PROTOCOL_VERSION", u64::from(PROTOCOL_VERSION)),
         ("CANOPY_MAX_BATCH_BYTES", canopy_abi::MAX_BATCH_BYTES as u64),
+        (
+            "CANOPY_MAX_EVENT_BATCH_BYTES",
+            canopy_abi::MAX_EVENT_BATCH_BYTES as u64,
+        ),
         ("CANOPY_NODE_ROOT", 0),
         ("CANOPY_NODE_NULL", NodeId::NULL.raw()),
         ("CANOPY_ATTR_ID", u64::from(AttrId::ID.raw())),

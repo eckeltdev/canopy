@@ -45,6 +45,8 @@
 
 #define CANOPY_PROTOCOL_VERSION 1u            /* written into BeginBatch.version  */
 #define CANOPY_MAX_BATCH_BYTES  (1u << 20)    /* 1 MiB; canopy_host_apply rejects more */
+#define CANOPY_MAX_EVENT_BATCH_BYTES (64u << 10) /* 64 KiB; an out buffer this big always
+                                                    drains canopy_host_poll_events at once */
 
 #define CANOPY_NODE_ROOT 0ull                 /* the implicit mount parent        */
 #define CANOPY_NODE_NULL 0xFFFFFFFFFFFFFFFFull /* InsertBefore.anchor = append    */
