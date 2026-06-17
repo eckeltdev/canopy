@@ -8,10 +8,14 @@
 //! the geometry is font-independent and the comparison is apples-to-apples. A margin reset
 //! in the browser page zeroes the body offset so both place the root box at the origin.
 //!
-//! `#[ignore]` (shells out to a local browser). Run with:
+//! Shells out to a local browser, so it auto-SKIPs (no-op pass) when no Chrome
+//! is found — which is why it is NOT `#[ignore]`d: it stays a no-op locally and
+//! on the browser-less required CI job, while the non-blocking `chrome-oracle`
+//! lane (ubuntu-latest, which ships Chrome — see `.github/workflows/stylo.yml`)
+//! actually runs the geometry comparison. Run it directly with:
 //!
 //! ```text
-//! cargo +nightly test --test layout_oracle -- --ignored --nocapture
+//! cargo +nightly test --test layout_oracle -- --nocapture
 //! ```
 
 mod common;
@@ -21,7 +25,6 @@ use common::{
 };
 
 #[test]
-#[ignore = "needs a local Chrome; run with `cargo test --test layout_oracle -- --ignored`"]
 fn layout_matches_browser() {
     let Some(chrome) = find_chrome() else {
         eprintln!(

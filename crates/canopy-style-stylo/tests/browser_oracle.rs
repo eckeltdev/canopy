@@ -8,21 +8,25 @@
 //! `ComputedStyle`. We compare the five fields that survive that projection — `color`,
 //! `background`, `font-size`, `padding`, `display`.
 //!
-//! Marked `#[ignore]` because it shells out to a local browser. Run it with:
+//! It shells out to a local browser, so it auto-discovers Chrome (or honors
+//! `CANOPY_CHROME=/path/to/chrome`); if none is found it prints a SKIP and
+//! passes, so it never breaks a browser-less machine. Run it directly with:
 //!
 //! ```text
-//! cargo +nightly test --test browser_oracle -- --ignored --nocapture
+//! cargo +nightly test --test browser_oracle -- --nocapture
 //! ```
 //!
-//! It auto-discovers Chrome (or honors `CANOPY_CHROME=/path/to/chrome`); if none is
-//! found it prints a SKIP and passes, so it never breaks a browser-less machine.
+//! It is intentionally NOT `#[ignore]`d: because it no-ops (SKIPs) when Chrome
+//! is absent it is safe to run by default — it stays a no-op locally and on the
+//! browser-less required CI job, while the dedicated `chrome-oracle` CI lane
+//! (ubuntu-latest, which ships Chrome — see `.github/workflows/stylo.yml`)
+//! actually exercises the browser comparison as a non-blocking accuracy signal.
 
 mod common;
 
 use common::{diff, find_chrome, fixtures, resolve_browser, resolve_stylo};
 
 #[test]
-#[ignore = "needs a local Chrome; run with `cargo test --test browser_oracle -- --ignored`"]
 fn cascade_matches_browser() {
     let Some(chrome) = find_chrome() else {
         eprintln!(

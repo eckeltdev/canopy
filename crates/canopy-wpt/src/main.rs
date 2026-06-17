@@ -63,6 +63,17 @@ enum SkipReason {
     Script,
     /// A multi-call `checkLayout` test (we only handle a single selector).
     MultiCheckLayout,
+    /// A REF test whose reference file could not be read (missing/unresolvable).
+    /// This is an INFRASTRUCTURE skip, NOT an engine result: the engine never got
+    /// to render-compare, so counting it as a Fail would dishonestly depress the
+    /// REF accuracy denominator. The css-flexbox reference files live under
+    /// `css/reference`, which CI now sparse-checks out (see stylo.yml); once that
+    /// path is present these become real PASS/FAIL render-compares instead of
+    /// infra-skips. NOTE: the committed baselines are regenerated in CI via the
+    /// `--write-baseline` flag AFTER the css/reference fetch — do not regenerate
+    /// them in a checkout that lacks the reference tree (it would bake the
+    /// infra-skips into the baseline).
+    RefFileUnreadable,
 }
 // NOTE: the former `AbsolutePosition` and `TextDependent` skip buckets were
 // RETIRED: `position:absolute` now lays out via Taffy, and the
@@ -77,6 +88,7 @@ impl SkipReason {
             SkipReason::WritingMode => "writing-mode / vertical flow",
             SkipReason::Script => "script beyond checkLayout",
             SkipReason::MultiCheckLayout => "multiple checkLayout() calls",
+            SkipReason::RefFileUnreadable => "INFRA: reference file unreadable",
         }
     }
 }
@@ -296,9 +308,15 @@ fn process_test(rel_name: &str, abs_path: &Path) -> TestResult {
         })) {
             Ok(RefOutcome::Pass) => Outcome::Pass,
             Ok(RefOutcome::Fail(msg)) => Outcome::Fail(msg),
-            Ok(RefOutcome::Skip(msg)) => {
-                // ref file missing/unreadable etc — count as skip with a note.
-                Outcome::Fail(msg)
+            Ok(RefOutcome::Skip(_msg)) => {
+                // The reference file was missing/unreadable, so the engine never
+                // got to render-compare. That is an INFRASTRUCTURE skip, NOT an
+                // engine Fail: classifying it as Fail would dishonestly depress the
+                // REF accuracy denominator (a missing reference is a fetch/setup
+                // gap, not a rendering bug). The css-flexbox reference tree lives
+                // under `css/reference`, which CI sparse-checks out (see
+                // stylo.yml); with it present these run as real PASS/FAIL compares.
+                Outcome::Skip(SkipReason::RefFileUnreadable)
             }
             Err(_) => Outcome::Crash("panic during ref render".to_string()),
         };
