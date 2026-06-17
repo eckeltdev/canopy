@@ -345,8 +345,25 @@ impl Ui {
     /// Hit-test `point` (in `viewport` logical pixels) against `dom` and return the
     /// click [`HandlerId`] that should fire — the nearest ancestor of the hit node
     /// carrying a click listener — or `None` if nothing handles it.
+    ///
+    /// **Tier-aware.** On the [`Lite`](Cascade::Lite) tier the `dom` carries the inline
+    /// styles `class()` resolved author-side, so [`canopy_layout_taffy::layout`] runs
+    /// over a fully-styled tree and the hit geometry is correct.
+    ///
+    /// On the [`Capable`](Cascade::Capable) tier the `dom` carries element *identity*
+    /// only (tag/class/id) with **no inline styles** — the real cascade (Stylo) lives in
+    /// the host, outside this crate. Running Taffy over that unstyled tree would yield
+    /// silently wrong geometry, so this method returns `None` rather than a bogus hit.
+    /// Capable-tier hit-testing must be driven by the host against the geometry produced
+    /// by the engine that painted the frame; `canopy-ui` is a workspace member and cannot
+    /// depend on `canopy-style-stylo`, so it does not — and will not — guess that geometry
+    /// here.
     #[must_use]
     pub fn click_handler(&self, dom: &Dom, viewport: Size, point: Point) -> Option<HandlerId> {
+        // Capable tier: the styled geometry lives in the host's engine, not in this Dom.
+        if self.cascade == Cascade::Capable {
+            return None;
+        }
         let (_scene, lay) = layout(dom, viewport);
         let mut node = hit_test(&lay, point)?;
         loop {
@@ -361,8 +378,18 @@ impl Ui {
     /// Hit-test `point` and return the nearest ancestor that is a [`hoverable`](Ui::hoverables)
     /// node, or `None`. A host compares this across pointer moves to decide when a
     /// hover crossed a boundary (then calls [`set_hover`](Ui::set_hover)).
+    ///
+    /// **Tier-aware**, for the same reason as [`click_handler`](Ui::click_handler): the
+    /// [`Lite`](Cascade::Lite) tier's `dom` carries inline styles so Taffy geometry is
+    /// correct, but the [`Capable`](Cascade::Capable) tier's `dom` is unstyled (the real
+    /// cascade is the host's), so this returns `None` rather than a bogus hover target.
+    /// The host drives capable-tier hover off its own engine's geometry.
     #[must_use]
     pub fn hover_target(&self, dom: &Dom, viewport: Size, point: Point) -> Option<NodeId> {
+        // Capable tier: the styled geometry lives in the host's engine, not in this Dom.
+        if self.cascade == Cascade::Capable {
+            return None;
+        }
         let hoverables = self.hoverables();
         let (_scene, lay) = layout(dom, viewport);
         let mut node = hit_test(&lay, point)?;
@@ -635,6 +662,62 @@ mod tests {
         );
         // The author CSS is available for the host's style engine.
         assert_eq!(ui.css_source(), CSS);
+    }
+
+    #[test]
+    fn hit_test_is_tier_aware_lite_hits_capable_defers() {
+        // A clickable, sized button authored the SAME way on both tiers. Only the cascade
+        // differs: lite expands `.box` to inline width/height (so Taffy lays it out and the
+        // hit lands), capable carries identity only (the styled geometry lives in the host's
+        // engine, outside this crate). The honest answer on capable is "no hit here", NOT a
+        // bogus one computed over an unstyled tree.
+        const SIZED: &str = ".box { width: 40px; height: 20px }";
+        let viewport = Size { w: 100.0, h: 100.0 };
+        let inside = Point { x: 5.0, y: 5.0 };
+
+        // --- Lite tier: Dom carries inline styles -> Taffy geometry is correct, hit lands.
+        let lite = Ui::with_css(SIZED);
+        let btn = lite.button("ok");
+        lite.class(btn, &["box"]);
+        let handler = lite.on_click(btn, |_| {});
+        lite.mount_root(btn);
+        let dom = mount(&lite);
+        assert_eq!(
+            lite.click_handler(&dom, viewport, inside),
+            Some(handler),
+            "lite tier hit-tests over the inline-styled Dom"
+        );
+        assert_eq!(
+            lite.hover_target(&dom, viewport, inside),
+            None,
+            "no :hover rule, so no hover target (but the path ran over real geometry)"
+        );
+
+        // --- Capable tier: Dom carries identity only, NO inline styles. Running Taffy here
+        // would silently mis-place the box, so both helpers defer to the host with None.
+        let capable = Ui::capable(SIZED);
+        let cbtn = capable.button("ok");
+        capable.tag(cbtn, "button");
+        capable.class(cbtn, &["box"]);
+        let chandler = capable.on_click(cbtn, |_| {});
+        capable.mount_root(cbtn);
+        let cdom = mount(&capable);
+
+        // The click listener is still registered (so the host can route to it once it has
+        // hit a node via the capable engine) ...
+        assert_eq!(capable.cascade(), Cascade::Capable);
+        let _ = chandler;
+        // ... but this crate refuses to guess geometry it cannot compute.
+        assert_eq!(
+            capable.click_handler(&cdom, viewport, inside),
+            None,
+            "capable-tier hit-testing is the host's job (it owns the painting engine)"
+        );
+        assert_eq!(
+            capable.hover_target(&cdom, viewport, inside),
+            None,
+            "capable-tier hover is likewise host-driven"
+        );
     }
 
     #[test]
