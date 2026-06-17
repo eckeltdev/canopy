@@ -27,6 +27,16 @@ namespace canopy::wire {
     inline constexpr std::uint8_t op_remove_listener = CANOPY_OP_REMOVE_LISTENER;
     inline constexpr std::uint8_t op_intern_string = CANOPY_OP_INTERN_STRING;
     inline constexpr std::uint8_t op_set_tag_name = CANOPY_OP_SET_TAG_NAME;
+    // The one host -> guest op (echoed back through poll_events); note it writes handler(u32)
+    // BEFORE node(u64), opposite of every guest -> host op.
+    inline constexpr std::uint8_t op_dispatch_event = CANOPY_OP_DISPATCH_EVENT;
+
+    // DispatchEvent payload sub-tags.
+    inline constexpr std::uint8_t payload_none = CANOPY_PAYLOAD_NONE;
+    inline constexpr std::uint8_t payload_pointer =
+        CANOPY_PAYLOAD_POINTER;                                       // x:f32, y:f32, button:u8
+    inline constexpr std::uint8_t payload_key = CANOPY_PAYLOAD_KEY;   // code:u32, mods:u8
+    inline constexpr std::uint8_t payload_text = CANOPY_PAYLOAD_TEXT; // text:StrId(u32)
 
     // Reserved handles.
     inline constexpr std::uint64_t node_root = CANOPY_NODE_ROOT;

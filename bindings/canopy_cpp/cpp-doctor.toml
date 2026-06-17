@@ -65,6 +65,16 @@ include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
 
+# P3 event loop: drives pointer input through the real engine and fires the stored C++ handler
+# closures. Compiles host.cpp + build_context.cpp directly (NOT linking the canopy_cpp lib, to
+# avoid an ODR double-definition) and links libcanopy_abi.a (needs `cargo build -p canopy-abi`).
+[target.canopy_cpp_event_test]
+type = "executable"
+sources = ["tests/event_loop_test.cpp", "src/host.cpp", "src/build_context.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
 # Worked example: a counter-card component authored with the DSL, applied through the real
 # engine, its Dom dump printed (and self-verified). Links libcanopy_abi.a like the round-trip
 # test, so it needs `cargo build -p canopy-abi` first.

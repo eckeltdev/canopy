@@ -62,6 +62,19 @@ target_link_libraries(canopy_cpp_dsl_test PRIVATE canopy_cpp)
 target_include_directories(canopy_cpp_dsl_test PRIVATE "../../crates/canopy-abi/include" include)
 target_compile_features(canopy_cpp_dsl_test PRIVATE cxx_std_23)
 
+# Target: canopy_cpp_event_test
+add_executable(canopy_cpp_event_test)
+target_sources(
+	canopy_cpp_event_test
+	PRIVATE
+	"src/build_context.cpp"
+	"src/host.cpp"
+	"tests/event_loop_test.cpp"
+)
+target_include_directories(canopy_cpp_event_test PRIVATE "../../crates/canopy-abi/include" include)
+target_compile_features(canopy_cpp_event_test PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_event_test PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_freestanding_smoke
 add_executable(canopy_cpp_freestanding_smoke)
 target_sources(
