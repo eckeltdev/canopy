@@ -27,14 +27,36 @@ canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
 # plugs StyloEngine into it, proving the real Dom -> Stylo -> DisplayList -> renderer path.
 canopy-host = { path = "../../../crates/canopy-host" }
 
+# The interactive window (behind the `window` feature, exactly like the stylo-browser
+# example). The default build — `cargo run` for the static PPM contrast — never pulls them.
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
 [dev-dependencies]
 # Emit op-batches directly (create/append/set_class/remove_class) for the live-update
 # test, which feeds two frames of ops into the Host and checks the re-cascade.
 canopy-core = { path = "../../../crates/canopy-core" }
 
+[features]
+# The interactive window: an event loop that paints the capable tree, hit-tests the
+# pointer for live `:hover`, and reflows on resize. Pulls winit + softbuffer.
+window = ["dep:winit", "dep:softbuffer"]
+
+# The interactive capable-tier helpers (`CapableApp`, the authored tree, the `:hover`
+# CSS) the window bin and the headless interactivity test share.
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "canopy-full-capable-tier"
 path = "src/main.rs"
+
+# The live window: paints the capable tree and drives `:hover` from the pointer. Behind
+# the `window` feature so the default build stays headless (no winit/softbuffer).
+[[bin]]
+name = "window"
+path = "src/bin/window.rs"
+required-features = ["window"]
 
 # Pin the workspace boundary (standalone example; own lockfile, like the other Stylo demos).
 [workspace]
