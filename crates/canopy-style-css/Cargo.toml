@@ -11,11 +11,14 @@ rust-version.workspace = true
 canopy-protocol = { path = "../canopy-protocol" }
 canopy-paint = { path = "../canopy-paint" }
 canopy-view = { path = "../canopy-view" }
+# The retained tree the lite StyleEngine reads node classes from, and the flat style
+# PAL (ComputedStyle + the StyleEngine trait) it produces. Both are no_std and build on
+# thumbv7em, so the constrained tier stays embeddable.
+canopy-dom = { path = "../canopy-dom" }
+canopy-traits = { path = "../canopy-traits" }
 
 [dev-dependencies]
-canopy-dom = { path = "../canopy-dom" }
 canopy-core = { path = "../canopy-core" }
-canopy-traits = { path = "../canopy-traits" }
 
 [lints]
 workspace = true

@@ -417,6 +417,136 @@ fn normalize_value(prop: PropId, value: &str) -> String {
     value.to_string()
 }
 
+// ---------------------------------------------------------------------------------
+// The constrained-tier StyleEngine.
+// ---------------------------------------------------------------------------------
+
+use alloc::collections::BTreeMap;
+
+use canopy_dom::Dom;
+use canopy_traits::{Color, ComputedStyle, HostError, StyleEngine};
+
+/// CSS initial `color` — opaque black (`canvastext`).
+const INITIAL_COLOR: Color = Color {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 255,
+};
+/// CSS initial `font-size` — `medium`, i.e. 16 logical px.
+const INITIAL_FONT_SIZE: f32 = 16.0;
+
+/// The **constrained-tier** [`StyleEngine`]: resolves a node's flat [`ComputedStyle`]
+/// from its classes through the CSS-lite [`Stylesheet`], honoring the parent style for
+/// inherited properties.
+///
+/// This is the lite twin of the capable tier's `StyloEngine::from_dom`: both cascade
+/// the *real* [`canopy_dom`] tree behind the same [`StyleEngine`] trait, so one host
+/// loop can drive either tier. The difference is only in the language — this engine has
+/// the class-rule subset (no combinators, no specificity, no selector-driven
+/// inheritance), so it resolves each node's own classes and pulls inherited `color` /
+/// `font-size` from the `parent` argument per the [`StyleEngine::resolve`] contract.
+pub struct LiteEngine {
+    /// The parsed class rules.
+    sheet: Stylesheet,
+    /// Each node's class list, captured from the [`Dom`] at construction so `resolve`
+    /// needs no further tree access.
+    classes: BTreeMap<NodeId, Vec<String>>,
+}
+
+impl LiteEngine {
+    /// Build a lite engine over `dom` with the CSS-lite stylesheet `css`. Walks the
+    /// tree once to record each node's classes; `resolve` then needs only this engine.
+    #[must_use]
+    pub fn from_dom(dom: &Dom, css: &str) -> Self {
+        let mut classes = BTreeMap::new();
+        collect_classes(dom, canopy_dom::ROOT, &mut classes);
+        Self {
+            sheet: parse(css),
+            classes,
+        }
+    }
+}
+
+/// Record `dom`'s class list for every descendant of `parent` (depth-first).
+fn collect_classes(dom: &Dom, parent: NodeId, out: &mut BTreeMap<NodeId, Vec<String>>) {
+    for &child in dom.children(parent) {
+        out.insert(child, dom.classes(child).to_vec());
+        collect_classes(dom, child, out);
+    }
+}
+
+impl StyleEngine for LiteEngine {
+    fn resolve(
+        &mut self,
+        node: NodeId,
+        parent: Option<&ComputedStyle>,
+    ) -> Result<ComputedStyle, HostError> {
+        // Start from the CSS initial values, then — per the parent-inheritance
+        // contract — seed inherited properties from the parent, since this reduced
+        // resolver has no internal tree inheritance of its own.
+        let mut style = ComputedStyle {
+            color: INITIAL_COLOR,
+            font_size: INITIAL_FONT_SIZE,
+            opacity: 1.0,
+            ..ComputedStyle::default()
+        };
+        if let Some(p) = parent {
+            style.color = p.color;
+            style.font_size = p.font_size;
+        }
+
+        let classes = self.classes.get(&node).ok_or(HostError::BadHandle)?;
+        let refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        for (prop, value) in self.sheet.resolve(&refs, false) {
+            reduce(&mut style, prop, &value);
+        }
+        Ok(style)
+    }
+}
+
+/// Fold one resolved `(PropId, value)` declaration into a [`ComputedStyle`]. Only the
+/// properties the flat paint seam represents are mapped; layout/flex properties
+/// (width, gap, direction, align, …) have no `ComputedStyle` field and are ignored.
+fn reduce(style: &mut ComputedStyle, prop: PropId, value: &str) {
+    if prop == BG {
+        if let Some(c) = parse_color(value) {
+            style.background = c;
+        }
+    } else if prop == FG {
+        if let Some(c) = parse_color(value) {
+            style.color = c;
+        }
+    } else if prop == PADDING {
+        if let Ok(v) = value.parse::<f32>() {
+            style.padding = v;
+        }
+    } else if prop == RADIUS {
+        if let Ok(v) = value.parse::<f32>() {
+            style.border_radius = v;
+        }
+    } else if prop == OPACITY {
+        if let Ok(v) = value.parse::<f32>() {
+            style.opacity = v;
+        }
+    }
+}
+
+/// Parse a `#rrggbb` color (the format the CSS-lite path carries through verbatim);
+/// `None` on anything else.
+fn parse_color(s: &str) -> Option<Color> {
+    let hex = s.trim().strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    Some(Color {
+        r: u8::from_str_radix(&hex[0..2], 16).ok()?,
+        g: u8::from_str_radix(&hex[2..4], 16).ok()?,
+        b: u8::from_str_radix(&hex[4..6], 16).ok()?,
+        a: 255,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +847,113 @@ mod tests {
         dom.apply(&app.take_batch(0)).unwrap();
         assert_eq!(dom.style(node, BG), Some("#313244"));
         assert_eq!(dom.style(node, PADDING), Some("5"));
+    }
+
+    // --- LiteEngine: the constrained-tier StyleEngine ----------------------
+
+    /// Build a `Dom` carrying class identity (capable-style ops), as a host would.
+    fn dom_with(build: impl FnOnce(&mut canopy_core::Emitter)) -> Dom {
+        let mut e = canopy_core::Emitter::new();
+        build(&mut e);
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+        dom
+    }
+
+    #[test]
+    fn lite_engine_resolves_classes_to_computed_style() {
+        use canopy_protocol::ElementTag;
+        let (mut card, mut title) = (NodeId::new(0), NodeId::new(0));
+        let dom = dom_with(|e| {
+            card = e.create_element(ElementTag::new(1));
+            e.append(canopy_dom::ROOT, card);
+            e.set_class(card, "card");
+            title = e.create_element(ElementTag::new(1));
+            e.append(card, title);
+            e.set_class(title, "title");
+        });
+
+        let css = ".card { background: #1c2030; padding: 14 } .title { color: #e8eaf0 }";
+        let mut engine = LiteEngine::from_dom(&dom, css);
+
+        let card_s = engine.resolve(card, None).unwrap();
+        assert_eq!(
+            card_s.background,
+            Color {
+                r: 0x1c,
+                g: 0x20,
+                b: 0x30,
+                a: 255
+            }
+        );
+        assert_eq!(card_s.padding, 14.0);
+
+        let title_s = engine.resolve(title, None).unwrap();
+        assert_eq!(
+            title_s.color,
+            Color {
+                r: 0xe8,
+                g: 0xea,
+                b: 0xf0,
+                a: 255
+            }
+        );
+    }
+
+    #[test]
+    fn lite_engine_honors_parent_inheritance() {
+        use canopy_protocol::ElementTag;
+        // A child whose class sets only padding must inherit color + font-size from the
+        // parent style, per the StyleEngine::resolve contract (this reduced resolver has
+        // no internal tree inheritance).
+        let mut child = NodeId::new(0);
+        let dom = dom_with(|e| {
+            let parent = e.create_element(ElementTag::new(1));
+            e.append(canopy_dom::ROOT, parent);
+            child = e.create_element(ElementTag::new(1));
+            e.append(parent, child);
+            e.set_class(child, "plain");
+        });
+
+        let mut engine = LiteEngine::from_dom(&dom, ".plain { padding: 4 }");
+        let parent_style = ComputedStyle {
+            color: Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            font_size: 22.0,
+            ..ComputedStyle::default()
+        };
+        let s = engine.resolve(child, Some(&parent_style)).unwrap();
+        assert_eq!(s.color, parent_style.color, "color inherited from parent");
+        assert_eq!(s.font_size, 22.0, "font-size inherited from parent");
+        assert_eq!(s.padding, 4.0, "own padding still applies");
+    }
+
+    #[test]
+    fn lite_engine_defaults_to_css_initials_without_a_parent() {
+        // No parent and no matching rule: the node gets the CSS initial color
+        // (opaque black) and font-size (16), not the all-zero ComputedStyle default.
+        use canopy_protocol::ElementTag;
+        let mut node = NodeId::new(0);
+        let dom = dom_with(|e| {
+            node = e.create_element(ElementTag::new(1));
+            e.append(canopy_dom::ROOT, node);
+            e.set_class(node, "unstyled");
+        });
+        let mut engine = LiteEngine::from_dom(&dom, ".other { color: #ffffff }");
+        let s = engine.resolve(node, None).unwrap();
+        assert_eq!(s.color, INITIAL_COLOR);
+        assert_eq!(s.font_size, INITIAL_FONT_SIZE);
+        assert_eq!(s.opacity, 1.0);
+    }
+
+    #[test]
+    fn lite_engine_rejects_an_unknown_handle() {
+        let dom = Dom::new();
+        let mut engine = LiteEngine::from_dom(&dom, ".x { color: #fff }");
+        assert!(engine.resolve(NodeId::new(999), None).is_err());
     }
 }

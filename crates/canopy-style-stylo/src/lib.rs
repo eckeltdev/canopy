@@ -1763,6 +1763,10 @@ fn absolute_to_color(c: AbsoluteColor) -> Color {
 }
 
 impl StyleEngine for StyloEngine {
+    // `parent` is intentionally ignored: Stylo is a whole-tree engine that resolves
+    // CSS inheritance internally over its own document, so the advisory parent style
+    // carries no information it does not already have. See the parent-inheritance
+    // contract on [`StyleEngine::resolve`].
     fn resolve(
         &mut self,
         node: NodeId,

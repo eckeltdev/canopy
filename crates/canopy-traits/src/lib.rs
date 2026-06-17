@@ -373,6 +373,22 @@ pub trait Transport {
 /// on constrained tiers).
 pub trait StyleEngine {
     /// Compute the style for `node` given its parent's computed style, if any.
+    ///
+    /// **Parent-inheritance contract.** The `parent` style is how CSS *inherited*
+    /// properties (notably `color` and `font-size`) reach a node. How an engine uses
+    /// it depends on whether the engine owns the whole tree:
+    ///
+    /// - A **whole-tree** engine (e.g. Stylo, which holds its own document and runs a
+    ///   real cascade with inheritance built in) treats `parent` as **advisory** and
+    ///   may ignore it — it already resolves inheritance internally.
+    /// - A **reduced** resolver with no internal tree inheritance (the constrained
+    ///   tier's class engine) **must honor** `parent`: it has no other source for
+    ///   inherited values, so it seeds the node's inherited fields from `parent`
+    ///   before layering the node's own declarations.
+    ///
+    /// Callers that want correct inheritance from *any* engine should therefore always
+    /// resolve top-down, passing each node's resolved parent style — the advisory case
+    /// simply ignores it. See the tier-agnostic resolve helper in `canopy-ui`.
     fn resolve(
         &mut self,
         node: NodeId,

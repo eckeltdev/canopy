@@ -411,21 +411,60 @@ impl Default for Ui {
     }
 }
 
+/// Resolve every node in `dom` (depth-first from [`ROOT`]) through `engine`, threading
+/// each node's resolved style down to its children as the `parent` argument so CSS
+/// inherited properties propagate. Returns a map from node to its [`ComputedStyle`].
+///
+/// This is the **tier-agnostic** consume loop: it takes `&mut dyn StyleEngine`, so the
+/// *same* code drives the constrained tier ([`canopy_style_css::LiteEngine`]) and the
+/// capable tier (`StyloEngine`) — swap the engine, the loop is identical. Threading the
+/// parent top-down satisfies the [`StyleEngine::resolve`] inheritance contract for both:
+/// the lite engine reads inherited `color`/`font-size` from it, the whole-tree engine
+/// ignores it. Nodes the engine cannot resolve are simply absent from the map.
+#[must_use]
+pub fn resolve_tree(
+    engine: &mut dyn canopy_traits::StyleEngine,
+    dom: &Dom,
+) -> alloc::collections::BTreeMap<NodeId, canopy_traits::ComputedStyle> {
+    let mut out = alloc::collections::BTreeMap::new();
+    resolve_subtree(engine, dom, ROOT, None, &mut out);
+    out
+}
+
+/// Resolve `node`'s children under `parent`'s style, then recurse (see [`resolve_tree`]).
+fn resolve_subtree(
+    engine: &mut dyn canopy_traits::StyleEngine,
+    dom: &Dom,
+    node: NodeId,
+    parent: Option<canopy_traits::ComputedStyle>,
+    out: &mut alloc::collections::BTreeMap<NodeId, canopy_traits::ComputedStyle>,
+) {
+    for &child in dom.children(node) {
+        let style = engine.resolve(child, parent.as_ref()).ok();
+        if let Some(s) = style {
+            out.insert(child, s);
+        }
+        resolve_subtree(engine, dom, child, style, out);
+    }
+}
+
 /// One-line import for authoring: the [`Ui`] context, the [`rsx!`](canopy_rsx::rsx)
 /// macro, the reactive primitives, and the common host types.
 pub mod prelude {
-    pub use crate::{Classes, Ui};
+    pub use crate::{resolve_tree, Classes, Ui};
     pub use canopy_dom::{Dom, ROOT};
     pub use canopy_protocol::{EventPayload, HandlerId, NodeId, PropId};
     pub use canopy_rsx::rsx;
     pub use canopy_signals::{Memo, Runtime, Signal};
-    pub use canopy_traits::{Point, Size};
+    pub use canopy_style_css::LiteEngine;
+    pub use canopy_traits::{ComputedStyle, Point, Size, StyleEngine};
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use canopy_paint::{BG, FG};
+    use canopy_style_css::LiteEngine;
     use canopy_traits::OpSink;
     use canopy_view::CLICK;
 
@@ -440,6 +479,71 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&ui.take_batch(0)).expect("mount batch");
         dom
+    }
+
+    #[test]
+    fn resolve_tree_threads_parent_through_dyn_styleengine() {
+        use canopy_traits::{ComputedStyle, HostError, StyleEngine};
+        // A stub engine whose output is purely depth-derived, proving the helper threads
+        // each resolved parent into its children through `&mut dyn StyleEngine`.
+        struct DepthEngine;
+        impl StyleEngine for DepthEngine {
+            fn resolve(
+                &mut self,
+                _node: NodeId,
+                parent: Option<&ComputedStyle>,
+            ) -> Result<ComputedStyle, HostError> {
+                let base = parent.map_or(10.0, |p| p.font_size);
+                Ok(ComputedStyle {
+                    font_size: base + 1.0,
+                    ..ComputedStyle::default()
+                })
+            }
+        }
+
+        let ui = Ui::new();
+        let a = ui.column();
+        let b = ui.column();
+        ui.mount(a, b);
+        ui.mount_root(a);
+        let dom = mount(&ui);
+
+        let mut engine = DepthEngine;
+        let styles = resolve_tree(&mut engine, &dom);
+        assert_eq!(
+            styles.get(&a).unwrap().font_size,
+            11.0,
+            "child of ROOT resolves with parent = None"
+        );
+        assert_eq!(
+            styles.get(&b).unwrap().font_size,
+            12.0,
+            "grandchild inherits its parent's resolved style"
+        );
+    }
+
+    #[test]
+    fn resolve_tree_drives_the_real_lite_engine() {
+        // The constrained tier through the same helper: a capable-authored Dom (carrying
+        // class identity) resolves to ComputedStyle via LiteEngine behind the trait.
+        let ui = Ui::capable(".card { background: #1c2030 }");
+        let card = ui.column();
+        ui.tag(card, "div");
+        ui.class(card, &["card"]);
+        ui.mount_root(card);
+        let dom = mount(&ui);
+
+        let mut engine = LiteEngine::from_dom(&dom, ui.css_source());
+        let styles = resolve_tree(&mut engine, &dom);
+        assert_eq!(
+            styles.get(&card).unwrap().background,
+            canopy_traits::Color {
+                r: 0x1c,
+                g: 0x20,
+                b: 0x30,
+                a: 255
+            }
+        );
     }
 
     #[test]
