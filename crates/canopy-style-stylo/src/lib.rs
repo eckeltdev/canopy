@@ -1495,38 +1495,51 @@ body { margin: 8px }
             ua_or_user: &guard,
         };
 
-        // root = first element child of node 0.
-        let root_node: &Node = &self.doc.nodes[0];
-        let root = TDocument::as_node(&root_node)
-            .first_element_child()
-            .expect("document has no root element")
-            .as_element()
-            .expect("root is not an element");
+        // Every TOP-LEVEL element child of the document node (slab 0) is its own cascade
+        // root: a capable host may mount more than one element under `ROOT`, and
+        // `build_overlay` appends them all directly under the document. So process and
+        // traverse *each* — cascading only `first_element_child` silently dropped every
+        // sibling root (its slab got no `stylo_element_data`, so `resolve` returned
+        // `BadHandle` and it never painted). An HTML document has a single `<html>` root,
+        // so that path still loops exactly once.
+        let top_slabs: Vec<usize> = self.doc.nodes[0]
+            .children
+            .iter()
+            .copied()
+            .filter(|&s| matches!(self.doc.nodes[s].kind, NodeKind::Element { .. }))
+            .collect();
 
-        self.stylist
-            .flush(&guards)
-            .process_style(root, Some(&self.snapshots));
+        for slab in top_slabs {
+            let root_node: &Node = &self.doc.nodes[slab];
+            let root = TDocument::as_node(&root_node)
+                .as_element()
+                .expect("a top-level child filtered to NodeKind::Element is an element");
 
-        let context = SharedStyleContext {
-            traversal_flags: TraversalFlags::empty(),
-            stylist: &self.stylist,
-            options: GLOBAL_STYLE_DATA.options.clone(),
-            guards: StylesheetGuards {
-                author: &guard,
-                ua_or_user: &guard,
-            },
-            visited_styles_enabled: false,
-            animations: Default::default(),
-            current_time_for_animations: 0.0,
-            snapshot_map: &self.snapshots,
-            registered_speculative_painters: &RegisteredPaintersImpl,
-        };
+            self.stylist
+                .flush(&guards)
+                .process_style(root, Some(&self.snapshots));
 
-        let token = RecalcStyle::pre_traverse(root, &context);
-        if token.should_traverse() {
-            let traverser = RecalcStyle::new(context);
-            // None pool = single-threaded.
-            style::driver::traverse_dom(&traverser, token, None);
+            let context = SharedStyleContext {
+                traversal_flags: TraversalFlags::empty(),
+                stylist: &self.stylist,
+                options: GLOBAL_STYLE_DATA.options.clone(),
+                guards: StylesheetGuards {
+                    author: &guard,
+                    ua_or_user: &guard,
+                },
+                visited_styles_enabled: false,
+                animations: Default::default(),
+                current_time_for_animations: 0.0,
+                snapshot_map: &self.snapshots,
+                registered_speculative_painters: &RegisteredPaintersImpl,
+            };
+
+            let token = RecalcStyle::pre_traverse(root, &context);
+            if token.should_traverse() {
+                let traverser = RecalcStyle::new(context);
+                // None pool = single-threaded.
+                style::driver::traverse_dom(&traverser, token, None);
+            }
         }
 
         thread_state::exit(ThreadState::LAYOUT);
@@ -3246,6 +3259,50 @@ mod tests {
         engine
             .resolve(NodeId::new(id as u64), None)
             .expect("resolve failed")
+    }
+
+    #[test]
+    fn from_dom_cascades_every_top_level_root() {
+        // A host may mount MORE THAN ONE element directly under ROOT. Every top-level
+        // element (and its subtree) must be cascaded — not just the first.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::ElementTag;
+        use canopy_traits::OpSink;
+
+        let mut e = Emitter::new();
+        let a = e.create_element(ElementTag::new(1));
+        e.append(ROOT, a);
+        e.set_tag_name(a, "div");
+        e.set_class(a, "a");
+        let b = e.create_element(ElementTag::new(2));
+        e.append(ROOT, b); // a SECOND top-level element, sibling of `a` under ROOT
+        e.set_tag_name(b, "div");
+        e.set_class(b, "b");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let mut engine = StyloEngine::from_dom(&dom, ".a { color:#ff0000 } .b { color:#00ff00 }");
+        assert_eq!(
+            engine.resolve(a, None).unwrap().color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            },
+            ".a (first root) resolves red"
+        );
+        assert_eq!(
+            engine.resolve(b, None).unwrap().color,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            ".b (second root) resolves green — every top-level root is cascaded"
+        );
     }
 
     #[test]
