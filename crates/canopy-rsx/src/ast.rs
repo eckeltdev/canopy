@@ -10,7 +10,7 @@
 //! rsx      := UI "=>" element
 //! element  := "<" name attr* ( "/>" | ">" child* "</" name ">" )
 //! name     := div | button | span | label | p | input | el
-//! attr     := IDENT "=" STRING            // class="a b", value="seed"
+//! attr     := IDENT "=" STRING            // class="a b", id="hero", value="seed"
 //!           | "on" ":" IDENT "=" "{" EXPR "}"   // on:click={closure}
 //!           | "tag" "=" "{" EXPR "}"       // <el tag={MY_TAG}> escape hatch
 //! child    := STRING                        // static text
@@ -54,10 +54,18 @@ impl Parse for Rsx {
 pub struct Element {
     /// What the tag name mapped to.
     pub tag: Tag,
+    /// The literal CSS local name (`"div"`, `"span"`, `"button"`, …) carried to a
+    /// host-side cascade so **type selectors** work, or `None` for `<el>` (whose kind is
+    /// an opaque host [`ElementTag`](canopy_protocol::ElementTag), not a CSS name). This
+    /// is the source name verbatim — so `<span>`/`<label>`/`<p>` stay distinguishable
+    /// even though they share [`Tag::Text`].
+    pub local_name: Option<String>,
     /// Span of the tag name, so errors point at it.
     pub name_span: Span,
     /// `class="a b"` attributes (each may name several space-separated classes).
     pub classes: Vec<LitStr>,
+    /// An `id="hero"` attribute carried to a host-side cascade so **id selectors** work.
+    pub id: Option<LitStr>,
     /// An `on:click={ .. }` handler block, if present (a `{ .. }` so it can carry the
     /// usual `let c = count.clone(); move |_| ..` capture preamble).
     pub on_click: Option<Block>,
@@ -103,9 +111,13 @@ impl Parse for Element {
         let name: Ident = input.parse()?;
         let name_span = name.span();
         let tag = Tag::from_name(&name)?;
+        // The literal CSS local name for the host cascade — `None` for the `<el>` escape
+        // hatch, whose kind is an opaque numeric host tag rather than a CSS name.
+        let local_name = (tag != Tag::El).then(|| name.to_string());
 
         // ---- attributes until `>` or `/>` ---------------------------------------
         let mut classes = Vec::new();
+        let mut id = None;
         let mut on_click = None;
         let mut value = None;
         let mut el_tag = None;
@@ -138,6 +150,12 @@ impl Parse for Element {
                     input.parse::<Token![=]>()?;
                     classes.push(input.parse::<LitStr>()?);
                 }
+                "id" => {
+                    input.parse::<Token![=]>()?;
+                    if id.replace(input.parse::<LitStr>()?).is_some() {
+                        return Err(syn::Error::new_spanned(&attr_name, "duplicate `id`"));
+                    }
+                }
                 "value" => {
                     input.parse::<Token![=]>()?;
                     value = Some(input.parse::<LitStr>()?);
@@ -149,8 +167,8 @@ impl Parse for Element {
                 _ => {
                     return Err(syn::Error::new_spanned(
                         &attr_name,
-                        "unknown attribute; expected `class=\"..\"`, `value=\"..\"`, \
-                         `on:click={..}`, or (on `<el>`) `tag={..}`",
+                        "unknown attribute; expected `class=\"..\"`, `id=\"..\"`, \
+                         `value=\"..\"`, `on:click={..}`, or (on `<el>`) `tag={..}`",
                     ));
                 }
             }
@@ -188,8 +206,10 @@ impl Parse for Element {
 
         Ok(Element {
             tag,
+            local_name,
             name_span,
             classes,
+            id,
             on_click,
             value,
             el_tag,

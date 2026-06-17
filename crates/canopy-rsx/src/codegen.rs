@@ -112,6 +112,17 @@ fn lower(
         }
     };
 
+    // ---- 1b. element identity (tag-name + id) for a host-side cascade -------------
+    // The capable tier carries these so type/id selectors resolve; the lite tier no-ops
+    // `Ui::tag`/`Ui::set_id`, so the constrained op-stream is byte-identical.
+    if let Some(name) = &el.local_name {
+        let name_lit = LitStr::new(name, el.name_span);
+        body.extend(quote! { #ui.tag(#node, #name_lit); });
+    }
+    if let Some(id) = &el.id {
+        body.extend(quote! { #ui.set_id(#node, #id); });
+    }
+
     // ---- 2. classes -> one `ui.class(node, &[..])` (records for reload) ----------
     let words = class_words(el);
     if !words.is_empty() {

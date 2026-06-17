@@ -3057,6 +3057,55 @@ mod tests {
     }
 
     #[test]
+    fn from_dom_resolves_type_and_id_selectors() {
+        // The capability `rsx!` now unlocks: with real tag-names + ids carried into the
+        // Dom (which `rsx!` emits in capable mode), Stylo matches TYPE (`span`) and ID
+        // (`#hero`) selectors over the real tree — not just classes.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::{AttrId, ElementTag};
+        use canopy_traits::OpSink;
+
+        let mut e = Emitter::new();
+        let hero = e.create_element(ElementTag::new(1));
+        e.append(ROOT, hero);
+        e.set_tag_name(hero, "div");
+        e.set_attribute(hero, AttrId::ID, "hero");
+        let label = e.create_element(ElementTag::new(1));
+        e.append(hero, label);
+        e.set_tag_name(label, "span");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let css = "#hero { background:#101010 } span { color:#20c020 }";
+        let mut engine = StyloEngine::from_dom(&dom, css);
+
+        let hero_style = engine.resolve(hero, None).unwrap();
+        let label_style = engine.resolve(label, None).unwrap();
+
+        assert_eq!(
+            hero_style.background,
+            Color {
+                r: 0x10,
+                g: 0x10,
+                b: 0x10,
+                a: 255
+            },
+            "id selector `#hero` resolved over the real Dom"
+        );
+        assert_eq!(
+            label_style.color,
+            Color {
+                r: 0x20,
+                g: 0xc0,
+                b: 0x20,
+                a: 255
+            },
+            "type selector `span` resolved over the real Dom"
+        );
+    }
+
+    #[test]
     fn inheritance() {
         // .page { color: #ff0000 } on an ancestor; a descendant with no color
         // of its own inherits red through the tree.

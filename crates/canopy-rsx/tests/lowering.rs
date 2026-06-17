@@ -124,6 +124,50 @@ fn component_splice_and_static_text_leaf() {
 }
 
 #[test]
+fn capable_mode_carries_tag_names_and_id() {
+    // In capable mode, rsx! emits element identity (literal tag-name + id) so a host can
+    // run a real cascade with type and id selectors — without any hand-written
+    // `ui.tag`/`ui.set_id`.
+    let ui = Ui::capable(CSS);
+    let root = rsx!(ui =>
+        <div class="root" id="hero">
+            <span class="title">"Canopy"</span>
+            <button class="pill">"docs"</button>
+        </div>
+    );
+    ui.mount_root(root);
+    let dom = mount(&ui);
+
+    // The div carries its tag-name and id; classes are carried as names (not expanded).
+    assert_eq!(dom.tag_name(root), Some("div"));
+    assert_eq!(dom.id(root), Some("hero"));
+    assert_eq!(dom.classes(root), ["root"]);
+
+    // `<span>` keeps its literal local name (not collapsed to a generic text tag), and
+    // `<button>` keeps "button" — so type selectors can tell them apart.
+    let title = dom.children(root)[0];
+    assert_eq!(dom.tag_name(title), Some("span"));
+    let button = dom.children(root)[1];
+    assert_eq!(dom.tag_name(button), Some("button"));
+}
+
+#[test]
+fn lite_mode_does_not_carry_identity() {
+    // The constrained tier: `ui.tag`/`ui.set_id` are no-ops, so the Dom carries no
+    // tag-name or id (classes are expanded to inline styles author-side instead). This
+    // pins that the new identity emission leaves the lite op-stream unchanged.
+    let ui = Ui::with_css(CSS);
+    let root = rsx!(ui => <div class="root" id="hero">"x"</div>);
+    ui.mount_root(root);
+    let dom = mount(&ui);
+
+    assert_eq!(dom.tag_name(root), None);
+    assert_eq!(dom.id(root), None);
+    // The class still resolved to an inline style author-side, as before.
+    assert_eq!(dom.style(root, BG), Some("#1e1e2e"));
+}
+
+#[test]
 fn self_closing_input_and_el_escape_hatch() {
     use canopy_protocol::ElementTag;
     const CUSTOM: ElementTag = ElementTag::new(99);
