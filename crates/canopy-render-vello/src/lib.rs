@@ -340,12 +340,20 @@ fn lower_shadow(cmds: &mut Vec<DrawCmd>, rect: Rect, color: Color, blur: f32, of
     if color.a == 0 || rect.size.w <= 0.0 || rect.size.h <= 0.0 {
         return;
     }
+    // Inflate the shadow box outward by `blur` on every side (then offset), so the soft
+    // quad extends *beyond* the element's box and reads as a halo. Without this the shadow
+    // is the box's exact size and the opaque fill drawn over it occludes all but a thin
+    // offset sliver — a `box-shadow: 0 0 Npx` (zero offset) would vanish entirely. Mirrors
+    // the CPU `paint_box_shadow`, which inflates its outer bounds by `blur` the same way.
     let shadow_rect = Rect {
         origin: Point {
-            x: rect.origin.x + offset.x,
-            y: rect.origin.y + offset.y,
+            x: rect.origin.x + offset.x - blur,
+            y: rect.origin.y + offset.y - blur,
         },
-        size: rect.size,
+        size: Size {
+            w: rect.size.w + 2.0 * blur,
+            h: rect.size.h + 2.0 * blur,
+        },
     };
     // Soften: a bigger blur fades the shadow (alpha falls off as the energy spreads).
     // Clamp so even a large blur keeps a faint, visible shadow.
@@ -1428,8 +1436,19 @@ mod tests {
         assert_eq!(cmds.len(), 1, "a visible shadow is one quad");
         match &cmds[0] {
             DrawCmd::Rect(q) => {
-                // Offset applied: the shadow's origin is the box origin + offset.
-                assert_eq!(q.origin, [12.0, 14.0], "shadow is offset behind the box");
+                // Origin = box origin + offset - blur (inflated outward, then offset):
+                // (10 + 2 - 6, 10 + 4 - 6) = (6, 8).
+                assert_eq!(
+                    q.origin,
+                    [6.0, 8.0],
+                    "shadow is inflated by blur, then offset"
+                );
+                // The shadow must extend OUTSIDE the box (origin 10,10) so the opaque fill
+                // drawn over it cannot fully occlude it — the occlusion-regression guard.
+                assert!(
+                    q.origin[0] < 10.0 && q.origin[1] < 10.0,
+                    "inflated shadow starts above-left of the box, so a halo shows"
+                );
                 // Softened: a blurred shadow's alpha is below the source alpha.
                 assert!(
                     q.color[3] < 200.0 / 255.0,

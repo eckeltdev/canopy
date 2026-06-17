@@ -107,9 +107,17 @@ impl StyloEngine {
                 });
             }
 
-            // Background fill. A `gradient` is the more specific paint and replaces the
-            // flat background; otherwise the non-transparent flat `background` fills.
-            // Both are faded by the element's opacity.
+            // Background fill. CSS layers a `background-image` (the gradient) OVER the
+            // `background-color`, so the flat background paints first and the gradient
+            // composites on top — matching the CPU paint path, so a translucent gradient
+            // lets the background color show through on both tiers. Both faded by opacity.
+            if style.background.a > 0 {
+                items.push(DisplayItem::Rect {
+                    rect,
+                    color: fade(style.background, opacity),
+                    radius,
+                });
+            }
             if let Some(grad) = style.gradient {
                 items.push(DisplayItem::Gradient {
                     rect,
@@ -127,12 +135,6 @@ impl StyloEngine {
                         GradientAxis::Vertical => GradientDirection::Vertical,
                         GradientAxis::Horizontal => GradientDirection::Horizontal,
                     },
-                });
-            } else if style.background.a > 0 {
-                items.push(DisplayItem::Rect {
-                    rect,
-                    color: fade(style.background, opacity),
-                    radius,
                 });
             }
 

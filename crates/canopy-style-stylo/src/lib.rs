@@ -1938,6 +1938,28 @@ fn inline_prop_css_name(prop: canopy_protocol::PropId) -> Option<&'static str> {
     }
 }
 
+/// Whether `prop` is a **length** property whose inline value is stored as a bare number
+/// (the `px` unit stripped by convention — see `canopy-style-css`'s `normalize_value`).
+/// These need the unit re-attached before they are valid CSS for Stylo's parser.
+fn inline_prop_is_length(prop: canopy_protocol::PropId) -> bool {
+    // width, height, gap, padding, border-radius.
+    matches!(prop.raw(), 3 | 4 | 5 | 6 | 8)
+}
+
+/// Serialize one inline `(name, value)` declaration for Stylo's inline-style parser,
+/// re-attaching `px` to a length whose value is a bare number. Guests store lengths
+/// unit-stripped (`"12"`), but `padding:12` is invalid CSS that Stylo silently drops —
+/// so a bare numeric length must become `12px`. Values that already carry a unit, a `%`,
+/// a `calc(...)`, or a keyword (`auto`) parse fine and are left verbatim; colors and
+/// keyword props are never lengths and pass through unchanged.
+fn serialize_inline_decl(prop: canopy_protocol::PropId, name: &str, value: &str) -> String {
+    if inline_prop_is_length(prop) && value.trim().parse::<f32>().is_ok() {
+        format!("{name}:{}px", value.trim())
+    } else {
+        format!("{name}:{value}")
+    }
+}
+
 /// The HTML attribute name a `canopy_dom` [`AttrId`] carries into the overlay, for
 /// attribute selectors. [`AttrId::ID`] is `id` (already applied via `add_element`);
 /// any other id is application-minted with no public name registry, so it is exposed
@@ -1980,7 +2002,7 @@ fn build_overlay(
             let inline = dom
                 .styles(child)
                 .filter_map(|(prop, value)| {
-                    inline_prop_css_name(prop).map(|name| format!("{name}:{value}"))
+                    inline_prop_css_name(prop).map(|name| serialize_inline_decl(prop, name, value))
                 })
                 .collect::<Vec<_>>()
                 .join(";");
@@ -4076,6 +4098,41 @@ mod tests {
         let mut engine = StyloEngine::from_dom(&dom, "");
         let style = engine.resolve(node, None).unwrap();
         assert_eq!(style.padding, 5.0, "inline padding:5px cascaded as 5.0");
+    }
+
+    #[test]
+    fn from_dom_inline_bare_length_gets_px_and_cascades() {
+        // Guests store length inline styles as BARE NUMBERS (the `px` stripped by
+        // convention — every example emits `padding "12"`, not `"12px"`). The serializer
+        // must re-attach the unit, else `padding:12` is invalid CSS that Stylo drops and
+        // the value silently resolves to 0.0 instead of 12.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::{ElementTag, PropId};
+        use canopy_traits::OpSink;
+
+        const PADDING: PropId = PropId::new(6);
+        const RADIUS: PropId = PropId::new(8);
+
+        let mut e = Emitter::new();
+        let node = e.create_element(ElementTag::new(1));
+        e.append(ROOT, node);
+        e.set_tag_name(node, "div");
+        e.set_inline_style(node, PADDING, "12"); // bare, as real guests emit
+        e.set_inline_style(node, RADIUS, "8");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let mut engine = StyloEngine::from_dom(&dom, "");
+        let style = engine.resolve(node, None).unwrap();
+        assert_eq!(
+            style.padding, 12.0,
+            "bare inline padding cascades as 12, not 0"
+        );
+        assert_eq!(
+            style.border_radius, 8.0,
+            "bare inline border-radius cascades as 8"
+        );
     }
 
     // === D2: attribute selectors (presence + equality) ===
