@@ -8,9 +8,7 @@
 
 #include "canopy_cpp/protocol.hpp"
 
-// The rule measures this `namespace` block body (the whole TU) against the 80-line
-// *function* budget; every actual function below is small. Not a function — can't extract.
-namespace canopy { // cpp-doctor: allow layout.function-too-large
+namespace canopy {
 
     namespace {
 

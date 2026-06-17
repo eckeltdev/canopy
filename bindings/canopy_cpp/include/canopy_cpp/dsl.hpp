@@ -16,7 +16,7 @@
 // and emitting ops deterministically. C++ argument evaluation is unsequenced, so emission is
 // driven by the sequenced fold here, never by argument construction: the bytes are byte-for-
 // byte identical to the equivalent hand-written build_context calls (the P1 parity gate).
-namespace canopy { // cpp-doctor: allow layout.function-too-large
+namespace canopy {
 
     // ---- description nodes (allocator-free value types) ------------------------------------
 

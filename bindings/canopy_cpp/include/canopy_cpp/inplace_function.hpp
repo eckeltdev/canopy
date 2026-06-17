@@ -11,7 +11,7 @@
 // so a callable stored here never touches the heap and compiles under -fno-exceptions
 // -fno-rtti. A callable larger than `Capacity` is a COMPILE error (static_assert), never a
 // silent heap fallback. This is where Canopy event handlers (on_click closures) live.
-namespace canopy { // cpp-doctor: allow layout.function-too-large
+namespace canopy {
 
     template <class Signature, std::size_t Capacity = 32,
               std::size_t Align = alignof(std::max_align_t)>

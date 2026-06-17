@@ -141,9 +141,6 @@ namespace {
 
     // A Component spliced BETWEEN static siblings keeps source order.
     struct counter {
-        // Component is an all-public aggregate (designated-init `counter{.initial_value=N}`)
-        // WITH a build() method by design; the mixed-data-and-behavior check fights that.
-        // NOLINTNEXTLINE(misc-non-private-member-variables-in-classes)
         int initial_value = 0;
         void build(canopy::build_context& ctx, canopy::node_id parent) const {
             ctx.append(parent, ctx.create_text(std::to_string(initial_value)));

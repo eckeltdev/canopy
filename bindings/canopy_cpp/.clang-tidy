@@ -32,3 +32,7 @@ CheckOptions:
     value: lower_case
   - key: readability-identifier-naming.PrivateMemberSuffix
     value: _
+  # All-public aggregates (our Component pattern: `counter{.initial_value=N}` + a build()
+  # method) are intentional — only flag genuinely mixed public/private classes.
+  - key: misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true

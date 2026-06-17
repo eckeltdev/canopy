@@ -7,8 +7,6 @@ name = "canopy_cpp"
 version = "0.1.0"
 languages = ["CXX"]
 cxx = 23
-# clang-based checks read the compile DB CMake exports into the managed build dir.
-compile_commands = "build/compile_commands.json"
 
 # The canopy_cpp authoring library: a freestanding builder that emits the Canopy
 # op-stream. It reuses the machine-checked wire contract header shipped by canopy-abi
@@ -44,3 +42,15 @@ type = "executable"
 sources = ["tests/inplace_function_test.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
+
+# Freestanding compile gate: builds a representative DSL tree AND the encoder under
+# -fno-exceptions -fno-rtti, so any throw/try/catch/typeid/dynamic_cast in our code (or
+# std usage that isn't exception-free-compatible) is a host compile error, not an on-device
+# surprise at P5. Compiles src/build_context.cpp directly (not the normal lib) to keep the
+# flags isolated from the other targets.
+[target.canopy_cpp_freestanding_smoke]
+type = "executable"
+sources = ["tests/freestanding_smoke.cpp", "src/build_context.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-fno-exceptions", "-fno-rtti"]

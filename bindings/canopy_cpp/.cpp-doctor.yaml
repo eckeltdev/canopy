@@ -3,7 +3,7 @@ version: 1
 profile: strict-systems
 
 project:
-  name: example
+  name: canopy_cpp
   language_standard: c++23
   build_dir: build
   compile_commands: build/compile_commands.json
