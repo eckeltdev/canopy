@@ -27,6 +27,11 @@ canopy-render-soft = { path = "../../../crates/canopy-render-soft" }
 # plugs StyloEngine into it, proving the real Dom -> Stylo -> DisplayList -> renderer path.
 canopy-host = { path = "../../../crates/canopy-host" }
 
+[dev-dependencies]
+# Emit op-batches directly (create/append/set_class/remove_class) for the live-update
+# test, which feeds two frames of ops into the Host and checks the re-cascade.
+canopy-core = { path = "../../../crates/canopy-core" }
+
 [[bin]]
 name = "canopy-full-capable-tier"
 path = "src/main.rs"

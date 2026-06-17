@@ -81,6 +81,7 @@ dependencies = [
 name = "canopy-full-capable-tier"
 version = "0.0.0"
 dependencies = [
+ "canopy-core",
  "canopy-dom",
  "canopy-host",
  "canopy-protocol",

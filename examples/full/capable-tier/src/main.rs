@@ -20,8 +20,14 @@
 //! plain under lite. Both tiers are rasterized by the *same* CPU renderer, so the only
 //! variable is the cascade.
 //!
-//! Run: `cargo run` → writes `capable-lite.ppm` + `capable-stylo.ppm` and prints the
-//! resolved-color contrast to the terminal.
+//! A third render, `capable-host.ppm`, then drives that same capable Dom through the
+//! reusable [`canopy_host::Host`] — `apply` the op-batch, then `paint` = Dom → Stylo →
+//! `DisplayList` → renderer — proving the capable tier works through the real host loop,
+//! not just this file's hand-rolled comparison paint. The host's [`StyloSceneBuilder`]
+//! holds a persistent engine and re-syncs it per frame, so the loop supports live updates.
+//!
+//! Run: `cargo run` → writes `capable-lite.ppm`, `capable-stylo.ppm`, and
+//! `capable-host.ppm`, and prints the resolved-color contrast to the terminal.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -209,14 +215,33 @@ fn main() {
 /// which must stay free of the heavy Stylo dependency.
 struct StyloSceneBuilder {
     css: String,
+    /// The persistent Stylo engine: built (CSS parsed, `Stylist` constructed) on the
+    /// first frame, then re-synced each frame. Holding it across frames is the live-host
+    /// path — only the document arena is rebuilt per paint, not the stylesheet.
+    engine: Option<StyloEngine>,
+}
+
+impl StyloSceneBuilder {
+    fn new(css: &str) -> Self {
+        Self {
+            css: css.to_string(),
+            engine: None,
+        }
+    }
 }
 
 impl SceneBuilder for StyloSceneBuilder {
     fn build_scene(&mut self, dom: &Dom, viewport: Size) -> DisplayList {
-        // NOTE: this rebuilds the whole Stylo overlay and re-parses the CSS every frame
-        // — fine for a one-shot render, but a steady-state windowed host wants roadmap
-        // B4 (incremental re-cascade): hold the engine and re-sync only changed nodes.
-        let mut engine = StyloEngine::from_dom(dom, &self.css);
+        // First frame builds the engine (parses CSS + builds the `Stylist`); every later
+        // frame only re-syncs the overlay from the (possibly mutated) Dom — no CSS
+        // re-parse. That is what makes this a real per-frame host loop, not a rebuild.
+        let engine = match &mut self.engine {
+            Some(e) => {
+                e.sync_from_dom(dom);
+                e
+            }
+            None => self.engine.insert(StyloEngine::from_dom(dom, &self.css)),
+        };
         engine.set_viewport(viewport);
         engine.build_display_list(viewport)
     }
@@ -230,9 +255,7 @@ fn paint_via_host() -> Host<StyloSceneBuilder, SoftwareRenderer> {
     let ui = Ui::capable(CAPABLE_CSS);
     build_app(&ui);
     let mut host = Host::with_scene_builder(
-        StyloSceneBuilder {
-            css: CAPABLE_CSS.to_string(),
-        },
+        StyloSceneBuilder::new(CAPABLE_CSS),
         SoftwareRenderer::new(VIEW_W, VIEW_H, CLEAR),
     );
     host.apply(&ui.take_batch(0)).expect("apply to host");
@@ -408,6 +431,14 @@ fn write_ppm(dir: &str, name: &str, buf: &Buffer) {
 mod tests {
     use super::*;
 
+    /// Count pixels of exactly `color` in `buf` (over the logical viewport).
+    fn count_pixels(buf: &Buffer, color: [u8; 4]) -> usize {
+        (0..VIEW_H)
+            .flat_map(|y| (0..VIEW_W).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf.pixel(x, y) == color)
+            .count()
+    }
+
     #[test]
     fn capable_host_pipeline_paints_the_cascaded_background() {
         // B end to end: the same authored Dom driven through the reusable `Host`
@@ -415,16 +446,65 @@ mod tests {
         // `.app` background, proving the capable engine plugged into the host loop and
         // its cascade + layout + paint all ran — no hand-rolled paint involved.
         let host = paint_via_host();
-        let buf = host.renderer().buffer();
-        let app_bg = [0x14, 0x16, 0x1c, 255];
-        let painted = (0..VIEW_H)
-            .flat_map(|y| (0..VIEW_W).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf.pixel(x, y) == app_bg)
-            .count();
         // A real fill, not a stray pixel: the `.app` panel covers a large region.
+        let painted = count_pixels(host.renderer().buffer(), [0x14, 0x16, 0x1c, 255]);
         assert!(
             painted > 1000,
             "the capable Host rendered the cascaded .app background (#14161c); got {painted} px"
+        );
+    }
+
+    #[test]
+    fn capable_host_reflects_a_live_dom_update() {
+        // The live-host loop: apply a frame of ops, paint; then apply a SECOND frame that
+        // swaps a class on the SAME node, paint again. The persistent Stylo engine
+        // re-cascades the mutated Dom via sync_from_dom, so the second frame must show the
+        // new color and none of the old — proving real per-frame updates, not a rebuild.
+        use canopy_core::Emitter;
+        use canopy_dom::ROOT;
+        use canopy_protocol::ElementTag;
+
+        let viewport = Size {
+            w: VIEW_W as f32,
+            h: VIEW_H as f32,
+        };
+        let red = [0xff, 0x00, 0x00, 255];
+        let green = [0x00, 0xff, 0x00, 255];
+        let css = ".a { background:#ff0000; width:200px; height:120px } \
+                   .b { background:#00ff00; width:200px; height:120px }";
+        let mut host = Host::with_scene_builder(
+            StyloSceneBuilder::new(css),
+            SoftwareRenderer::new(VIEW_W, VIEW_H, CLEAR),
+        );
+
+        // Frame 1: a sized div with class `.a` (red).
+        let mut e = Emitter::new();
+        let node = e.create_element(ElementTag::new(1));
+        e.append(ROOT, node);
+        e.set_tag_name(node, "div");
+        e.set_class(node, "a");
+        host.apply(&e.take_batch(0)).unwrap();
+        host.paint(viewport).unwrap();
+        let red_px = count_pixels(host.renderer().buffer(), red);
+        assert!(
+            red_px > 1000,
+            "frame 1 paints the .a (red) box; got {red_px}"
+        );
+
+        // Frame 2: swap `.a` → `.b` (green) on the same node; re-apply + re-paint.
+        e.remove_class(node, "a");
+        e.set_class(node, "b");
+        host.apply(&e.take_batch(1)).unwrap();
+        host.paint(viewport).unwrap();
+        let green_px = count_pixels(host.renderer().buffer(), green);
+        assert!(
+            green_px > 1000,
+            "frame 2 re-cascaded to .b (green); got {green_px}"
+        );
+        assert_eq!(
+            count_pixels(host.renderer().buffer(), red),
+            0,
+            "no red remains after the live update"
         );
     }
 
