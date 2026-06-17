@@ -108,6 +108,28 @@ int32_t canopy_host_apply(CanopyHost *host, const uint8_t *ptr, size_t len);
 size_t canopy_host_node_count(const CanopyHost *host);
 
 /*
+ * Write a deterministic UTF-8 dump of `host`'s retained tree into `out` (capacity `cap`
+ * bytes), setting *out_len to the dump's byte length. The text is NOT NUL-terminated;
+ * *out_len is authoritative.
+ *
+ * This is the round-trip oracle: after canopy_host_apply, assert this dump equals the tree
+ * your op bytes intended. It catches structural bugs (swapped parent/child, dropped class,
+ * mis-attached listener) that canopy_host_node_count cannot. Format: pre-order DFS, one line
+ * per node, two spaces of indent per depth; a text node is `text=<content>`, an element is
+ * `el tag=<n>` then its `name=`, `class=`, `style=`, `attr=`, `on=` fields when present.
+ *
+ * Returns CANOPY_OK with *out_len set to the bytes written (0 for an empty tree);
+ * CANOPY_ERR_TOO_LARGE with *out_len set to the NEEDED size if the dump does not fit in `cap`
+ * (nothing is written — retry with a buffer of that size); or CANOPY_ERR_NULL_HOST /
+ * CANOPY_ERR_NULL_DATA.
+ *
+ * Precondition: `out_len` is a writable size_t, and if the dump fits and is non-empty, `out`
+ * points to `cap` writable bytes valid for the call.
+ */
+int32_t canopy_host_debug_snapshot(const CanopyHost *host, uint8_t *out, size_t cap,
+                                   size_t *out_len);
+
+/*
  * Events (host -> guest)
  * ----------------------
  * Set the viewport, deliver pointer input, and drain the resulting DispatchEvent

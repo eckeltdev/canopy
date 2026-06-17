@@ -67,7 +67,7 @@
 #![allow(unsafe_code)]
 
 use canopy_dom::Dom;
-use canopy_protocol::{EventKind, EventPayload, Op, OpEncoder};
+use canopy_protocol::{EventKind, EventPayload, NodeId, Op, OpEncoder};
 use canopy_traits::{HostError, OpSink, Point, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
@@ -234,6 +234,96 @@ impl CanopyHost {
     pub fn dom(&self) -> &Dom {
         &self.dom
     }
+
+    /// A deterministic, human-readable dump of the retained tree — the **round-trip
+    /// oracle** a foreign host asserts its op bytes against (a node count alone can't
+    /// tell a swapped parent/child, a dropped class, or a mis-attached listener apart).
+    ///
+    /// Pre-order DFS from the root; one line per node, indented two spaces per depth.
+    /// A text node renders as `text=<content>`; an element as `el tag=<n>` followed by
+    /// its `name=`, `class=`, `style=`, `attr=`, and `on=` (listener) fields when present.
+    /// `BTreeMap`-backed styles/attrs render in id order and `Vec`-backed
+    /// classes/listeners/children keep op order, so the same tree always renders byte-for-
+    /// byte identically.
+    pub fn debug_snapshot(&self) -> String {
+        let mut out = String::new();
+        for &child in self.dom.children(canopy_dom::ROOT) {
+            write_node(&self.dom, &mut out, child, 0);
+        }
+        out
+    }
+}
+
+/// Render one node and its subtree into `out` (see [`CanopyHost::debug_snapshot`]).
+fn write_node(dom: &Dom, out: &mut String, node: NodeId, depth: usize) {
+    let Some(n) = dom.node(node) else {
+        return;
+    };
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+    if let Some(text) = &n.text {
+        out.push_str("text=");
+        push_escaped(out, text);
+        out.push('\n');
+        return;
+    }
+    out.push_str("el tag=");
+    match n.tag {
+        Some(tag) => out.push_str(&tag.raw().to_string()),
+        None => out.push('?'),
+    }
+    if let Some(name) = &n.tag_name {
+        out.push_str(" name=");
+        push_escaped(out, name);
+    }
+    if !n.classes.is_empty() {
+        out.push_str(" class=");
+        out.push_str(&n.classes.join(","));
+    }
+    if !n.styles.is_empty() {
+        let parts: Vec<String> = n
+            .styles
+            .iter()
+            .map(|(p, v)| format!("{}:{v}", p.raw()))
+            .collect();
+        out.push_str(" style=");
+        out.push_str(&parts.join(";"));
+    }
+    if !n.attrs.is_empty() {
+        let parts: Vec<String> = n
+            .attrs
+            .iter()
+            .map(|(a, v)| format!("{}:{v}", a.raw()))
+            .collect();
+        out.push_str(" attr=");
+        out.push_str(&parts.join(";"));
+    }
+    if !n.listeners.is_empty() {
+        let parts: Vec<String> = n
+            .listeners
+            .iter()
+            .map(|(e, h)| format!("{}:{}", e.raw(), h.raw()))
+            .collect();
+        out.push_str(" on=");
+        out.push_str(&parts.join(","));
+    }
+    out.push('\n');
+    for &child in &n.children {
+        write_node(dom, out, child, depth + 1);
+    }
+}
+
+/// Escape `\` and newlines so each node stays on exactly one line (keeps the dump
+/// unambiguous even if a text node contains a newline).
+fn push_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 impl Default for CanopyHost {
@@ -352,6 +442,58 @@ pub unsafe extern "C" fn canopy_host_node_count(host: *const CanopyHost) -> usiz
     // `canopy_host_new`. We form a shared reference for this call only.
     let host = unsafe { &*host };
     host.node_count()
+}
+
+/// Write a deterministic UTF-8 dump of `host`'s retained tree into `out` (capacity `cap`
+/// bytes), setting `*out_len` to the dump's byte length. The text is **not** NUL-terminated;
+/// `*out_len` is authoritative. See [`CanopyHost::debug_snapshot`] for the format.
+///
+/// This is the **round-trip oracle** seam: a foreign host applies its op bytes, then asserts
+/// this dump equals the tree it intended — catching structural bugs (swapped parent/child,
+/// dropped class, mis-attached listener) that [`canopy_host_node_count`] cannot.
+///
+/// Returns [`CANOPY_OK`] with `*out_len` set to the bytes written (0 for an empty tree);
+/// [`CANOPY_ERR_TOO_LARGE`] with `*out_len` set to the **needed** size if the dump does not
+/// fit in `cap` (nothing is written — retry with a buffer of that size); or
+/// [`CANOPY_ERR_NULL_HOST`] / [`CANOPY_ERR_NULL_DATA`].
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`]; `out_len` must be a valid
+/// writable `usize`; and if the dump fits and is non-empty, `out` must point to `cap` writable
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_debug_snapshot(
+    host: *const CanopyHost,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    if out_len.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    }
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; shared ref for
+    // this call only.
+    let host = unsafe { &*host };
+    let snapshot = host.debug_snapshot();
+    let bytes = snapshot.as_bytes();
+    // SAFETY: `out_len` checked non-null above; per contract it is a valid writable usize.
+    unsafe { *out_len = bytes.len() };
+    if bytes.len() > cap {
+        return CANOPY_ERR_TOO_LARGE; // needed size reported in *out_len; nothing written
+    }
+    if !bytes.is_empty() {
+        if out.is_null() {
+            return CANOPY_ERR_NULL_DATA;
+        }
+        // SAFETY: `out` is non-null and points to `cap >= bytes.len()` writable bytes per
+        // contract; source and destination do not overlap.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+    }
+    CANOPY_OK
 }
 
 /// Set the viewport (logical pixels) the tree is laid out within for hit-testing.
@@ -526,6 +668,14 @@ mod tests {
         let count = unsafe { canopy_host_node_count(core::ptr::null()) };
         assert_eq!(count, 0);
 
+        // snapshot on null returns the null-host code before any deref.
+        let mut snap_len = 0usize;
+        // SAFETY: a null host is explicitly handled before `out`/`out_len` are touched.
+        let snap_rc = unsafe {
+            canopy_host_debug_snapshot(core::ptr::null(), core::ptr::null_mut(), 0, &mut snap_len)
+        };
+        assert_eq!(snap_rc, CANOPY_ERR_NULL_HOST);
+
         // Freeing null is a no-op.
         // SAFETY: a null host is explicitly handled.
         unsafe { canopy_host_free(core::ptr::null_mut()) };
@@ -637,6 +787,66 @@ mod tests {
         assert_eq!(host.apply_bytes(&mounted_batch()), CANOPY_OK);
         assert_eq!(host.node_count(), 2);
         assert_eq!(host.dom().children(ROOT).len(), 1);
+    }
+
+    #[test]
+    fn debug_snapshot_renders_the_tree_deterministically() {
+        use canopy_view::CLICK;
+        // column.card  >  button(on click → handler 0)  >  text "Click"
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_class(col, "card");
+        let btn = e.create_element(ElementTag::new(3));
+        e.append(col, btn);
+        e.add_listener(btn, CLICK, HandlerId::new(0));
+        let label = e.create_text("Click");
+        e.append(btn, label);
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+
+        let expected = "el tag=1 class=card\n  el tag=3 on=1:0\n    text=Click\n";
+        assert_eq!(host.debug_snapshot(), expected, "the safe-path dump");
+
+        // The C buffer-fill path agrees and reports the exact byte length.
+        let mut buf = [0u8; 256];
+        let mut len = 0usize;
+        // SAFETY: `host` is a live local; `buf`/`len` are valid writable storage for the call.
+        let code = unsafe {
+            canopy_host_debug_snapshot(
+                &host as *const CanopyHost,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len,
+            )
+        };
+        assert_eq!(code, CANOPY_OK);
+        assert_eq!(&buf[..len], expected.as_bytes(), "the C path matches");
+    }
+
+    #[test]
+    fn debug_snapshot_reports_needed_size_without_writing() {
+        let mut host = CanopyHost::new();
+        host.apply_bytes(&mounted_batch()); // column + text "hello"
+        let full = host.debug_snapshot();
+        assert!(!full.is_empty());
+
+        // A 1-byte buffer cannot hold it: report the needed size, write nothing.
+        let mut tiny = [0u8; 1];
+        let mut len = 0usize;
+        // SAFETY: `host` is live; the function reports the needed size before any write.
+        let code = unsafe {
+            canopy_host_debug_snapshot(
+                &host as *const CanopyHost,
+                tiny.as_mut_ptr(),
+                tiny.len(),
+                &mut len,
+            )
+        };
+        assert_eq!(code, CANOPY_ERR_TOO_LARGE);
+        assert_eq!(len, full.len(), "needed size is the full dump length");
+        assert_eq!(tiny, [0u8; 1], "nothing was written");
     }
 
     /// A 100×40 button at the top-left with a CLICK listener (handler 7), as inline-

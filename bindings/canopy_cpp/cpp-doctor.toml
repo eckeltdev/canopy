@@ -54,3 +54,13 @@ sources = ["tests/freestanding_smoke.cpp", "src/build_context.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 compile-options = ["-fno-exceptions", "-fno-rtti"]
+
+# P2 round-trip oracle: links the real Rust engine (libcanopy_abi.a, built by
+# `cargo build -p canopy-abi`) and asserts a DSL-built tree, applied through it, yields the
+# expected Dom dump. The link dir is relative to this dir (../../target/debug = repo target).
+[target.canopy_cpp_roundtrip_test]
+type = "executable"
+sources = ["tests/roundtrip_test.cpp", "src/build_context.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]

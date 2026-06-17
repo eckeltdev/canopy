@@ -73,6 +73,18 @@ target_include_directories(
 )
 target_compile_features(canopy_cpp_inplace_test PRIVATE cxx_std_23)
 
+# Target: canopy_cpp_roundtrip_test
+add_executable(canopy_cpp_roundtrip_test)
+target_sources(canopy_cpp_roundtrip_test PRIVATE "src/build_context.cpp" "tests/roundtrip_test.cpp")
+target_include_directories(
+	canopy_cpp_roundtrip_test
+	PRIVATE
+	"../../crates/canopy-abi/include"
+	include
+)
+target_compile_features(canopy_cpp_roundtrip_test PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_roundtrip_test PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_test
 add_executable(canopy_cpp_test)
 target_sources(canopy_cpp_test PRIVATE "tests/encoder_test.cpp")
