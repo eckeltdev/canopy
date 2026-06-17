@@ -1390,10 +1390,31 @@ body { margin: 8px }
     /// default to `"div"` (class/id selectors carry the selectivity for app CSS).
     pub fn from_dom(dom: &canopy_dom::Dom, css: &str) -> Self {
         let mut engine = Self::new(css);
-        let mut node_map = std::collections::HashMap::new();
-        build_overlay(dom, canopy_dom::ROOT, 0, &mut engine.doc, &mut node_map);
-        engine.node_map = node_map;
+        engine.sync_from_dom(dom);
         engine
+    }
+
+    /// Re-sync the overlay to a (possibly mutated) `dom` **without** rebuilding the
+    /// [`Stylist`] — the live-host re-cascade path.
+    ///
+    /// [`from_dom`](StyloEngine::from_dom) re-parses the author CSS and rebuilds the
+    /// whole `Stylist` (UA + author sheets + device) every call, which for a per-frame
+    /// host loop is the dominant cost. This keeps the parsed stylesheets and device and
+    /// only rebuilds the document arena + handle map from the current tree, then
+    /// invalidates the cascade so the next [`resolve`](StyleEngine::resolve) /
+    /// [`build_display_list`](StyloEngine::build_display_list) recomputes against the new
+    /// tree. The author CSS is fixed at construction; a stylesheet change (hot-reload)
+    /// still needs a fresh engine.
+    ///
+    /// This is a full arena rebuild, not a diff — correct and cheap (the tree is small),
+    /// and it is the seam a future true-incremental restyle would slot behind.
+    pub fn sync_from_dom(&mut self, dom: &canopy_dom::Dom) {
+        self.doc = Document::new();
+        let mut node_map = std::collections::HashMap::new();
+        build_overlay(dom, canopy_dom::ROOT, 0, &mut self.doc, &mut node_map);
+        self.node_map = node_map;
+        self.snapshots = SnapshotMap::new();
+        self.resolved = false;
     }
 
     /// Build an engine from an already-parsed [`Document`] plus its author CSS.
@@ -3319,6 +3340,54 @@ mod tests {
                 a: 255
             },
             "type selector `span` resolved over the real Dom"
+        );
+    }
+
+    #[test]
+    fn sync_from_dom_recascades_a_mutated_tree() {
+        // The live-host re-sync: build the engine once, then mutate the SAME Dom (a
+        // class swap) and `sync_from_dom` — the next resolve must reflect the new rule,
+        // proving the overlay re-syncs while the parsed Stylist is kept.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::ElementTag;
+        use canopy_traits::OpSink;
+
+        let mut e = Emitter::new();
+        let node = e.create_element(ElementTag::new(1));
+        e.append(ROOT, node);
+        e.set_tag_name(node, "div");
+        e.set_class(node, "a");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let css = ".a { color:#ff0000 } .b { color:#00ff00 }";
+        let mut engine = StyloEngine::from_dom(&dom, css);
+        assert_eq!(
+            engine.resolve(node, None).unwrap().color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            },
+            ".a resolves red before the swap"
+        );
+
+        // Swap `.a` for `.b` on the same Dom, then re-sync the existing engine.
+        e.remove_class(node, "a");
+        e.set_class(node, "b");
+        dom.apply(&e.take_batch(1)).unwrap();
+        engine.sync_from_dom(&dom);
+        assert_eq!(
+            engine.resolve(node, None).unwrap().color,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "sync_from_dom re-cascaded the class swap to .b (green)"
         );
     }
 
