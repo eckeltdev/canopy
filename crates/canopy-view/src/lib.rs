@@ -328,6 +328,30 @@ impl Default for App {
 /// Declarative subtree builder that lowers to [`App`] calls and returns the **root**
 /// [`NodeId`] of the subtree it built.
 ///
+/// # Two `rsx!` macros — this is the **low-level core** one
+///
+/// Canopy intentionally ships *two* macros named `rsx!`, and they are **not** the
+/// same macro and not meant to be merged:
+///
+/// - **This one** (`canopy_view::rsx!`) is the low-level core builder. It is a
+///   `macro_rules!` that expands directly to method calls on an [`App`] receiver
+///   (`el`/`text`/`style`/`mount`), emitting the targeted op-stream by hand. It takes
+///   `$app` as its first argument, has no notion of CSS classes or a widget library,
+///   and is what the higher layers (and hand-written tests/demos) lower *to*. Reach for
+///   it when you are working directly against an [`App`] and want the op-stream with no
+///   intervening machinery — e.g. inside `canopy-view` itself or a minimal host.
+/// - The **`canopy-ui` `rsx!`** is a separate *proc-macro* that authors against a
+///   `Ui` builder (classes, components, ergonomic attributes) and is the surface most
+///   application code should use. It does not take an `App` receiver.
+///
+/// The shared name reflects shared intent (declarative tree authoring), but the two
+/// live in different crates, accept different first arguments (`&App` here, a `Ui`
+/// there), and are deliberately kept distinct: the `canopy-ui` macro is the friendly
+/// authoring layer, this one is the no_std core it ultimately rests on. Renaming either
+/// would be a breaking change, so they coexist by design — import whichever crate's
+/// `rsx!` matches the layer you are writing at, and do not expect them to be
+/// interchangeable.
+///
 /// `rsx!` is intentionally decoupled from `canopy-paint`: it never hard-codes a
 /// [`PropId`] — style attributes are written as `(prop_expr => "value")` pairs, so the
 /// caller supplies whatever property ids their host understands. Everything it emits
