@@ -1920,13 +1920,19 @@ impl StyleEngine for StyloEngine {
         _parent: Option<&ComputedStyle>,
     ) -> Result<ComputedStyle, HostError> {
         self.resolve_styles();
-        // Capable-tier (`from_dom`): map the real Dom handle to its overlay slab.
-        // HTML/manual paths leave `node_map` empty and use slab == handle.
-        let id = self
-            .node_map
-            .get(&node.raw())
-            .copied()
-            .unwrap_or(node.raw() as usize);
+        // Capable-tier (`from_dom`/`sync_from_dom`): map the real Dom handle to its
+        // overlay slab. A populated `node_map` means we are on that path, so a handle
+        // that is NOT in the map is unknown to this tree (e.g. a node removed between
+        // frames) and must error — falling back to `node.raw() as usize` would alias
+        // whatever live slab now happens to hold that index after a re-sync renumbered
+        // the arena, silently serving a DIFFERENT node's style. Only the HTML/manual
+        // paths, which leave `node_map` empty and build the overlay with slab == handle,
+        // use the raw handle as the slab id.
+        let id = if self.node_map.is_empty() {
+            node.raw() as usize
+        } else {
+            *self.node_map.get(&node.raw()).ok_or(HostError::BadHandle)?
+        };
         self.computed_style_for(id).ok_or(HostError::BadHandle)
     }
 }
@@ -3388,6 +3394,83 @@ mod tests {
                 a: 255
             },
             "sync_from_dom re-cascaded the class swap to .b (green)"
+        );
+    }
+
+    #[test]
+    fn sync_from_dom_does_not_serve_stale_style_for_a_removed_node() {
+        // Edge the happy-path test (same node, class swap) does NOT cover: a node that
+        // EXISTED in frame 1 is REMOVED in frame 2. `sync_from_dom` must not serve that
+        // node's stale frame-1 style, and a surviving sibling that took the removed
+        // node's old slab id must resolve to ITS OWN rule, not the removed node's. The
+        // two children sit under a single top-level `wrap` element (one root child) so
+        // this isolates the re-sync reset, not the whole-document root selection.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::ElementTag;
+        use canopy_traits::OpSink;
+
+        let mut e = Emitter::new();
+        let wrap = e.create_element(ElementTag::new(1));
+        e.append(ROOT, wrap);
+        e.set_tag_name(wrap, "div");
+        // Two siblings under `wrap`: `first` (.a red) created before `second` (.b green).
+        let first = e.create_element(ElementTag::new(2));
+        e.append(wrap, first);
+        e.set_tag_name(first, "div");
+        e.set_class(first, "a");
+        let second = e.create_element(ElementTag::new(3));
+        e.append(wrap, second);
+        e.set_tag_name(second, "div");
+        e.set_class(second, "b");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let css = ".a { color:#ff0000 } .b { color:#00ff00 }";
+        let mut engine = StyloEngine::from_dom(&dom, css);
+        assert_eq!(
+            engine.resolve(first, None).unwrap().color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            },
+            "frame 1: .a (first) resolves red"
+        );
+        assert_eq!(
+            engine.resolve(second, None).unwrap().color,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "frame 1: .b (second) resolves green"
+        );
+
+        // Frame 2: remove `first` entirely; `second` is now the only child and slides
+        // into the slab id `first` used to hold.
+        e.remove(first);
+        dom.apply(&e.take_batch(1)).unwrap();
+        engine.sync_from_dom(&dom);
+
+        // The removed node must NOT resolve to a stale red — it is gone.
+        assert!(
+            engine.resolve(first, None).is_err(),
+            "the removed node must not resolve to a stale frame-1 style"
+        );
+        // The surviving sibling must resolve to its OWN green, not the removed node's red
+        // (a stale node_map slot or kept slab style would surface here).
+        assert_eq!(
+            engine.resolve(second, None).unwrap().color,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "the surviving sibling keeps its own .b (green) after the sibling removal"
         );
     }
 
