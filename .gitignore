@@ -20,3 +20,5 @@
 
 # WPT runner output
 wpt-report.txt
+
+.specs

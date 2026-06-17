@@ -1,0 +1,46 @@
+[cmake]
+version = "3.15...3.31"
+mode = "managed"
+
+[project]
+name = "canopy_cpp"
+version = "0.1.0"
+languages = ["CXX"]
+cxx = 23
+# clang-based checks read the compile DB CMake exports into the managed build dir.
+compile_commands = "build/compile_commands.json"
+
+# The canopy_cpp authoring library: a freestanding builder that emits the Canopy
+# op-stream. It reuses the machine-checked wire contract header shipped by canopy-abi
+# (crates/canopy-abi/include/canopy_protocol.h) as its single source of op tags / ids.
+[target.canopy_cpp]
+type = "static"
+sources = ["src/build_context.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+
+# Host test: builds known trees and asserts the exact wire bytes (byte-for-byte parity
+# with canopy-core::Emitter / the protocol).
+[target.canopy_cpp_test]
+type = "executable"
+sources = ["tests/encoder_test.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["canopy_cpp"]
+
+# DSL parity test: builds trees through the builder DSL and through raw encoder calls and
+# asserts the bytes are identical (the P1 cross-check), plus Component/reactive/handler behaviour.
+[target.canopy_cpp_dsl_test]
+type = "executable"
+sources = ["tests/dsl_test.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["canopy_cpp"]
+
+# inplace_function lifetime test: copy/move/self-assign/moved-from contract (header-only;
+# links the library only for a single TU, no canopy_cpp symbols needed).
+[target.canopy_cpp_inplace_test]
+type = "executable"
+sources = ["tests/inplace_function_test.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
