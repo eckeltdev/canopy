@@ -147,6 +147,89 @@ fn srgb_to_linear(byte: u8) -> f32 {
     }
 }
 
+/// The cache key for a rasterized run: the run's text plus its pixel size.
+///
+/// This is the **glyph-run identity** that determines the coverage mask. Color is
+/// deliberately *not* part of the key: the rasterizer produces a color-independent
+/// straight-alpha coverage mask (see `canopy_text_parley::TextEngine::rasterize`),
+/// so the same text at the same size yields byte-for-byte the same mask regardless
+/// of ink — and the GPU tints it at draw time. The pixel size is stored as raw
+/// bits (`f32::to_bits`) so it is hashable and exactly compared; identical layout
+/// sizes hash identically and NaN never reaches us (sizes come from layout).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    /// The run's text content.
+    text: String,
+    /// The font size in pixels, as raw `f32` bits for exact hash/eq.
+    size_bits: u32,
+}
+
+/// A persistent cache of rasterized glyph-run coverage masks, keyed by
+/// [`GlyphKey`] (text + size).
+///
+/// This is the heart of the glyph atlas: the renderer used to call
+/// [`TextEngine::rasterize`] for **every** Text run on **every** frame, re-running
+/// the (relatively expensive) shaping + swash rasterization each time, then
+/// uploading a brand-new texture per run per frame. With the cache, a run that
+/// repeats — across frames (a label that does not change) or within one frame
+/// (two runs sharing the same text/size) — is rasterized exactly **once**: the
+/// first lowering misses and inserts, every later lowering hits and clones the
+/// stored mask. The atlas lives on [`GpuRenderer`] so it survives frame to frame.
+///
+/// `hits`/`misses` are bookkeeping the headless tests assert on: a real GPU is not
+/// needed to prove the cache works, since the mask reuse is pure CPU bookkeeping.
+#[derive(Default)]
+struct GlyphAtlas {
+    /// Cached coverage masks by run identity.
+    entries: std::collections::HashMap<GlyphKey, Glyphs>,
+    /// Number of lookups served from the cache (a repeated run).
+    hits: u64,
+    /// Number of lookups that had to rasterize and insert (a first-seen run).
+    misses: u64,
+}
+
+impl GlyphAtlas {
+    /// Return the coverage mask for `text` at `size`, rasterizing with `engine`
+    /// only on a miss.
+    ///
+    /// On a hit, the stored mask is cloned and `hits` is bumped — no shaping, no
+    /// swash rasterization. On a miss, `engine.rasterize` runs once, the result is
+    /// inserted, `misses` is bumped, and the freshly rasterized mask is returned.
+    /// `color` is forwarded for API symmetry but does not affect the mask (and so
+    /// is not part of the key); the GPU tints the coverage at draw time.
+    fn rasterize(
+        &mut self,
+        engine: &mut TextEngine,
+        text: &str,
+        size: f32,
+        color: Color,
+    ) -> Glyphs {
+        let key = GlyphKey {
+            text: text.to_owned(),
+            size_bits: size.to_bits(),
+        };
+        if let Some(mask) = self.entries.get(&key) {
+            self.hits += 1;
+            return mask.clone();
+        }
+        let mask = engine.rasterize(text, size, color);
+        self.misses += 1;
+        self.entries.insert(key, mask.clone());
+        mask
+    }
+
+    /// The number of **unique** glyph runs currently cached (one entry per
+    /// distinct text+size). A repeated run does not grow this.
+    ///
+    /// Only the tests read this (it is the headless proof that a repeated run is
+    /// rasterized once); the live render path does not need to inspect the cache
+    /// size, so it is gated out of the non-test build to stay warning-clean.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// A rasterized text run ready to upload: its coverage mask plus where to place
 /// it (pixel-space top-left) and the ink color to tint it with.
 ///
@@ -376,13 +459,15 @@ fn lower_shadow(cmds: &mut Vec<DrawCmd>, rect: Rect, color: Color, blur: f32, of
 /// Lower a [`DisplayList`] into an ordered list of draw commands.
 ///
 /// [`DisplayItem::Rect`] becomes a colored quad; [`DisplayItem::Text`] is
-/// rasterized to a real antialiased coverage mask via `engine` and becomes a
-/// textured glyph run; [`DisplayItem::Border`], [`DisplayItem::Gradient`], and
-/// [`DisplayItem::Shadow`] lower to real colored quads on the rect pipeline (an
-/// edge-band frame, an interpolated slab ramp, and a softened offset quad
-/// respectively); [`DisplayItem::Glyphs`] is skipped (the pre-shaped path is not
-/// rasterized on any tier yet). Order is preserved for correct compositing.
-fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
+/// rasterized to a real antialiased coverage mask — via the `atlas` glyph cache,
+/// which rasterizes each distinct text+size once and reuses it across runs and
+/// frames — and becomes a textured glyph run; [`DisplayItem::Border`],
+/// [`DisplayItem::Gradient`], and [`DisplayItem::Shadow`] lower to real colored
+/// quads on the rect pipeline (an edge-band frame, an interpolated slab ramp, and
+/// a softened offset quad respectively); [`DisplayItem::Glyphs`] is skipped (the
+/// pre-shaped path is not rasterized on any tier yet). Order is preserved for
+/// correct compositing.
+fn lower(scene: &DisplayList, engine: &mut TextEngine, atlas: &mut GlyphAtlas) -> Vec<DrawCmd> {
     let mut cmds = Vec::new();
     for item in &scene.items {
         match item {
@@ -405,10 +490,13 @@ fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
                 box_w,
                 align,
             } => {
-                // Rasterize the run to an antialiased coverage mask once. An
-                // empty/whitespace run yields a zero-ink mask, which draws as
-                // nothing — fine to keep (a fully-transparent quad).
-                let mask = engine.rasterize(text, *size, *color);
+                // Fetch the run's antialiased coverage mask from the glyph atlas:
+                // it rasterizes a given text+size exactly once and serves every
+                // later occurrence (this frame or a future one) from cache, so a
+                // repeated label is never re-shaped/re-rasterized. An empty/
+                // whitespace run yields a zero-ink mask, which draws as nothing —
+                // fine to keep (a fully-transparent quad).
+                let mask = atlas.rasterize(engine, text, *size, *color);
                 // Center / right-align the run within its box using the run's OWN
                 // real pixel width (`mask.width`, the tight ink box) — the honest
                 // metric for these proportional glyphs, exactly as the CPU sharp-text
@@ -469,9 +557,11 @@ const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// A GPU device + pipelines that render a display list into an offscreen texture.
 ///
 /// Construct once with [`GpuRenderer::new`]; it owns the `wgpu` device/queue, the
-/// colored-quad and textured-glyph render pipelines, and a [`TextEngine`] used to
-/// rasterize Text runs. The offscreen texture is (re)allocated to match the
-/// requested size on [`render`](Renderer::render) / [`resize`](Renderer::resize).
+/// colored-quad and textured-glyph render pipelines, a [`TextEngine`] used to
+/// rasterize Text runs, and a [`GlyphAtlas`] that caches those rasterized masks so
+/// a repeated run is not re-rasterized every frame. The offscreen texture is
+/// (re)allocated to match the requested size on [`render`](Renderer::render) /
+/// [`resize`](Renderer::resize).
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -486,6 +576,10 @@ pub struct GpuRenderer {
     sampler: wgpu::Sampler,
     /// Real-glyph rasterizer, reused frame-to-frame (it caches shaped glyphs).
     text_engine: TextEngine,
+    /// GPU glyph atlas: caches each run's rasterized coverage mask by text+size so
+    /// a repeated run is rasterized once and reused across runs and frames, instead
+    /// of re-rasterizing and re-uploading a fresh texture every frame.
+    glyph_atlas: GlyphAtlas,
     width: u32,
     height: u32,
     clear: Color,
@@ -584,6 +678,7 @@ impl GpuRenderer {
             glyph_layout,
             sampler,
             text_engine: TextEngine::new(),
+            glyph_atlas: GlyphAtlas::default(),
             width: width.max(1),
             height: height.max(1),
             clear,
@@ -595,7 +690,7 @@ impl GpuRenderer {
     /// (row-major). Always allocates the target at the current size, so it is safe
     /// to call after a `resize`.
     fn render_frame(&mut self, scene: &DisplayList) -> Vec<u8> {
-        let cmds = lower(scene, &mut self.text_engine);
+        let cmds = lower(scene, &mut self.text_engine, &mut self.glyph_atlas);
         draw_frame(
             &self.device,
             &self.queue,
@@ -1195,6 +1290,7 @@ mod tests {
         // ink quads): the coverage mask carries partial-coverage edges the baked
         // path could never produce.
         let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
         let scene = DisplayList {
             items: vec![DisplayItem::Text {
                 origin: Point { x: 3.0, y: 5.0 },
@@ -1211,7 +1307,7 @@ mod tests {
                 align: 0.0,
             }],
         };
-        let cmds = lower(&scene, &mut engine);
+        let cmds = lower(&scene, &mut engine, &mut atlas);
         assert_eq!(cmds.len(), 1, "one Text item -> one draw command");
         let DrawCmd::Glyphs(run) = &cmds[0] else {
             panic!("Text must lower to a glyph run");
@@ -1238,6 +1334,7 @@ mod tests {
         // A rect then a text run must lower to a Rect command before a Glyphs
         // command, so the glyph composites on top of its background.
         let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
         let scene = DisplayList {
             items: vec![
                 DisplayItem::Rect {
@@ -1269,10 +1366,187 @@ mod tests {
                 },
             ],
         };
-        let cmds = lower(&scene, &mut engine);
+        let cmds = lower(&scene, &mut engine, &mut atlas);
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], DrawCmd::Rect(_)), "rect first");
         assert!(matches!(cmds[1], DrawCmd::Glyphs(_)), "glyphs second");
+    }
+
+    /// Build a one-Text-run scene with the given text, size, and ink color.
+    fn text_scene(text: &str, size: f32, color: Color) -> DisplayList {
+        DisplayList {
+            items: vec![DisplayItem::Text {
+                origin: Point { x: 0.0, y: 0.0 },
+                text: text.into(),
+                color,
+                size,
+                box_w: 0.0,
+                align: 0.0,
+            }],
+        }
+    }
+
+    /// THE GLYPH-ATLAS TEST (headless, no GPU): a run rasterized once and then
+    /// drawn again — across frames *and* within one frame — is rasterized exactly
+    /// once. The atlas serves every repeat from cache, so it holds exactly one
+    /// UNIQUE entry no matter how many times the run recurs.
+    ///
+    /// This needs no GPU: the whole point of the atlas is that the expensive part
+    /// (shaping + swash rasterization, the per-frame texture re-upload the review
+    /// flagged) is skipped on a hit. We assert that bookkeeping (unique entries,
+    /// hit/miss counts) directly, which is exactly what runs without an adapter.
+    #[test]
+    fn glyph_atlas_caches_a_repeated_run_across_frames_and_runs() {
+        let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
+        let ink = Color {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 255,
+        };
+
+        // Frame 1: a single "Hi" run -> a miss (first sight), one unique entry.
+        let scene = text_scene("Hi", 16.0, ink);
+        let cmds = lower(&scene, &mut engine, &mut atlas);
+        assert_eq!(cmds.len(), 1, "one Text item -> one glyph run");
+        assert_eq!(atlas.len(), 1, "first run is rasterized and cached");
+        assert_eq!(atlas.misses, 1, "first lowering of a run is a miss");
+        assert_eq!(atlas.hits, 0, "nothing cached yet, so no hit");
+
+        // Frame 2: the SAME run again (the unchanged-label case). Served from
+        // cache: a hit, still exactly one unique entry (not re-rasterized).
+        let _ = lower(&scene, &mut engine, &mut atlas);
+        assert_eq!(atlas.len(), 1, "a repeated run stays one unique entry");
+        assert_eq!(atlas.hits, 1, "the second frame hits the cache");
+        assert_eq!(atlas.misses, 1, "no new rasterization on the repeat");
+
+        // Within ONE frame: two runs sharing the same text+size. The first is a
+        // hit (already cached), the second too — still one unique entry.
+        let two_same = DisplayList {
+            items: vec![
+                DisplayItem::Text {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    text: "Hi".into(),
+                    color: ink,
+                    size: 16.0,
+                    box_w: 0.0,
+                    align: 0.0,
+                },
+                DisplayItem::Text {
+                    origin: Point { x: 40.0, y: 0.0 },
+                    text: "Hi".into(),
+                    color: ink,
+                    size: 16.0,
+                    box_w: 0.0,
+                    align: 0.0,
+                },
+            ],
+        };
+        let cmds = lower(&two_same, &mut engine, &mut atlas);
+        assert_eq!(cmds.len(), 2, "two Text items -> two glyph runs");
+        assert_eq!(
+            atlas.len(),
+            1,
+            "two runs sharing a glyph stay one unique entry"
+        );
+        assert_eq!(atlas.hits, 3, "both in-frame repeats are cache hits");
+        assert_eq!(atlas.misses, 1, "still only the one original rasterization");
+    }
+
+    /// Distinct runs (different text, or same text at a different size) each get
+    /// their OWN atlas entry — the cache keys on run identity, so it never
+    /// collapses genuinely different runs into one mask.
+    #[test]
+    fn glyph_atlas_keys_on_text_and_size() {
+        let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
+        let ink = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+
+        // Three distinct identities: "A"@16, "B"@16, "A"@24 -> three misses.
+        let _ = lower(&text_scene("A", 16.0, ink), &mut engine, &mut atlas);
+        let _ = lower(&text_scene("B", 16.0, ink), &mut engine, &mut atlas);
+        let _ = lower(&text_scene("A", 24.0, ink), &mut engine, &mut atlas);
+        assert_eq!(atlas.len(), 3, "different text/size are distinct entries");
+        assert_eq!(atlas.misses, 3, "each distinct run rasterizes once");
+        assert_eq!(atlas.hits, 0, "no repeats yet");
+
+        // Re-lower the first identity: a hit, no new entry.
+        let _ = lower(&text_scene("A", 16.0, ink), &mut engine, &mut atlas);
+        assert_eq!(atlas.len(), 3, "a repeat adds no entry");
+        assert_eq!(atlas.hits, 1, "the repeat hits the cache");
+    }
+
+    /// Ink color is NOT part of the cache key: the coverage mask is
+    /// color-independent (the GPU tints it at draw time), so the same text+size in
+    /// a different color reuses the one cached mask. Keying on color would defeat
+    /// the cache for, e.g., a hover-recolor of unchanged text.
+    #[test]
+    fn glyph_atlas_ignores_ink_color() {
+        let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let blue = Color {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+
+        let _ = lower(&text_scene("X", 18.0, red), &mut engine, &mut atlas);
+        let _ = lower(&text_scene("X", 18.0, blue), &mut engine, &mut atlas);
+        assert_eq!(
+            atlas.len(),
+            1,
+            "same text+size in two colors shares one mask"
+        );
+        assert_eq!(atlas.hits, 1, "the recolor hits the cache");
+        assert_eq!(atlas.misses, 1, "only one rasterization for both colors");
+    }
+
+    /// The cached mask is byte-for-byte the mask a fresh rasterization produces:
+    /// serving from cache must not change pixels, only skip the work. This guards
+    /// the existing draw path — the cache feeds the same coverage the renderer
+    /// always uploaded.
+    #[test]
+    fn glyph_atlas_serves_the_same_mask_as_a_fresh_rasterization() {
+        let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
+        let ink = Color {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 255,
+        };
+
+        // Ground truth: rasterize directly, bypassing the cache.
+        let direct = engine.rasterize("Word", 20.0, ink);
+
+        // First lowering through the atlas (a miss) and a second (a hit). Both
+        // must equal the direct rasterization exactly.
+        let scene = text_scene("Word", 20.0, ink);
+        let first_cmds = lower(&scene, &mut engine, &mut atlas);
+        let DrawCmd::Glyphs(first) = &first_cmds[0] else {
+            panic!("Text lowers to a glyph run");
+        };
+        assert_eq!(first.mask, direct, "the miss path matches a direct raster");
+
+        let second_cmds = lower(&scene, &mut engine, &mut atlas);
+        let DrawCmd::Glyphs(second) = &second_cmds[0] else {
+            panic!("Text lowers to a glyph run");
+        };
+        assert_eq!(second.mask, direct, "the cached hit matches byte-for-byte");
+        assert_eq!(atlas.hits, 1, "the second lowering was a hit");
     }
 
     /// `sample_gradient` interpolates between the surrounding stops and clamps at the
@@ -1331,6 +1605,7 @@ mod tests {
     fn gradient_lowers_to_a_varying_slab_ramp() {
         use canopy_traits::{GradientDirection, GradientStop, GradientStops};
         let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
         let scene = DisplayList {
             items: vec![DisplayItem::Gradient {
                 rect: Rect {
@@ -1360,7 +1635,7 @@ mod tests {
                 direction: GradientDirection::Vertical,
             }],
         };
-        let cmds = lower(&scene, &mut engine);
+        let cmds = lower(&scene, &mut engine, &mut atlas);
         assert_eq!(
             cmds.len(),
             GRADIENT_SLABS as usize,
@@ -1387,6 +1662,7 @@ mod tests {
     #[test]
     fn border_lowers_to_four_edge_bands() {
         let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
         let scene = DisplayList {
             items: vec![DisplayItem::Border {
                 rect: Rect {
@@ -1403,7 +1679,7 @@ mod tests {
                 radius: 4.0,
             }],
         };
-        let cmds = lower(&scene, &mut engine);
+        let cmds = lower(&scene, &mut engine, &mut atlas);
         assert_eq!(cmds.len(), 4, "a border is four edge bands");
         assert!(
             cmds.iter().all(|c| matches!(c, DrawCmd::Rect(_))),
@@ -1416,6 +1692,7 @@ mod tests {
     #[test]
     fn shadow_lowers_to_one_softened_quad_or_nothing() {
         let mut engine = TextEngine::new();
+        let mut atlas = GlyphAtlas::default();
         let visible = DisplayList {
             items: vec![DisplayItem::Shadow {
                 rect: Rect {
@@ -1432,7 +1709,7 @@ mod tests {
                 offset: Point { x: 2.0, y: 4.0 },
             }],
         };
-        let cmds = lower(&visible, &mut engine);
+        let cmds = lower(&visible, &mut engine, &mut atlas);
         assert_eq!(cmds.len(), 1, "a visible shadow is one quad");
         match &cmds[0] {
             DrawCmd::Rect(q) => {
@@ -1478,7 +1755,7 @@ mod tests {
             }],
         };
         assert!(
-            lower(&invisible, &mut engine).is_empty(),
+            lower(&invisible, &mut engine, &mut atlas).is_empty(),
             "a transparent shadow emits no draw commands"
         );
     }
