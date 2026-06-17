@@ -271,7 +271,11 @@ pub enum EventPayload {
     },
 }
 
-mod tags {
+/// The op **tag bytes** — the public, stable wire contract. Every encoded op begins
+/// with one of these; a non-Rust author (e.g. the C++ builder binding) reproduces them
+/// to emit batches the host accepts. Mirrored in `canopy-abi/include/canopy_protocol.h`
+/// and machine-checked against these constants by that crate's `protocol_header` test.
+pub mod tags {
     pub const BEGIN_BATCH: u8 = 0x01;
     pub const END_BATCH: u8 = 0x02;
     pub const CREATE_ELEMENT: u8 = 0x10;

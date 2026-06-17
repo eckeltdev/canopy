@@ -29,6 +29,11 @@ canopy-traits = { path = "../canopy-traits" }
 # C entry points.
 canopy-core = { path = "../canopy-core" }
 canopy-protocol = { path = "../canopy-protocol" }
+# The reference host's well-known id registries, so the protocol_header parity test can
+# machine-check include/canopy_protocol.h against the live constants (ElementTag/EventKind
+# in canopy-view, PropId in canopy-paint) and catch any header drift.
+canopy-view = { path = "../canopy-view" }
+canopy-paint = { path = "../canopy-paint" }
 
 [lints]
 workspace = true

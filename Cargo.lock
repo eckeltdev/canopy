@@ -151,8 +151,10 @@ version = "0.0.0"
 dependencies = [
  "canopy-core",
  "canopy-dom",
+ "canopy-paint",
  "canopy-protocol",
  "canopy-traits",
+ "canopy-view",
 ]
 
 [[package]]
