@@ -37,11 +37,77 @@
 //! primitives (a stroked-edge frame, a first-stop solid fill, a dropped shadow).
 
 use canopy_traits::{
-    Color, DisplayItem, DisplayList, GradientAxis, GradientDirection, GradientStop, GradientStops,
-    Point, Size,
+    Color, ComputedStyle, DisplayItem, DisplayList, GradientAxis, GradientDirection, GradientStop,
+    GradientStops, Point, Rect, Size,
 };
 
 use crate::{NodeKind, StyloEngine};
+
+/// Push the box-model display items for one element — **shadow, background, gradient,
+/// border**, in that back-to-front order — every color faded by the element's `opacity`.
+///
+/// This is the **single source of truth** for the box paint sequence: both
+/// [`StyloEngine::build_display_list`] (the GPU scene) and `paint::render` (the CPU
+/// rasterizer) build their boxes from it, so the two tiers cannot diverge on box ordering
+/// or geometry (the recurring source of CPU-vs-GPU mismatches). Text is intentionally
+/// excluded: the CPU path renders real antialiased glyphs straight from the
+/// [`ComputedStyle`] (Ahem squares vs shaped glyphs), which a flat [`DisplayItem::Text`]
+/// cannot carry, so each consumer appends its own text after the box.
+pub(crate) fn push_box_items(items: &mut Vec<DisplayItem>, rect: Rect, style: &ComputedStyle) {
+    let opacity = style.opacity;
+    let radius = style.border_radius.max(0.0);
+
+    // Shadow behind everything (composites under the box).
+    if let Some(shadow) = style.box_shadow {
+        items.push(DisplayItem::Shadow {
+            rect,
+            color: fade(shadow.color, opacity),
+            blur: shadow.blur,
+            offset: Point {
+                x: shadow.dx,
+                y: shadow.dy,
+            },
+        });
+    }
+
+    // Background-color first, then the gradient (a background-image) over it.
+    if style.background.a > 0 {
+        items.push(DisplayItem::Rect {
+            rect,
+            color: fade(style.background, opacity),
+            radius,
+        });
+    }
+    if let Some(grad) = style.gradient {
+        items.push(DisplayItem::Gradient {
+            rect,
+            stops: GradientStops::from_slice(&[
+                GradientStop {
+                    color: fade(grad.start, opacity),
+                    position: 0.0,
+                },
+                GradientStop {
+                    color: fade(grad.end, opacity),
+                    position: 1.0,
+                },
+            ]),
+            direction: match grad.axis {
+                GradientAxis::Vertical => GradientDirection::Vertical,
+                GradientAxis::Horizontal => GradientDirection::Horizontal,
+            },
+        });
+    }
+
+    // Border frame on top of the fill.
+    if style.border_width > 0.0 && style.border_color.a > 0 {
+        items.push(DisplayItem::Border {
+            rect,
+            color: fade(style.border_color, opacity),
+            width: style.border_width,
+            radius,
+        });
+    }
+}
 
 /// Scale a straight-alpha color's alpha by `opacity` (clamped to `[0, 1]`), leaving
 /// RGB intact. Mirrors `paint::with_opacity` and the Taffy path's `fade`, so the
@@ -89,68 +155,12 @@ impl StyloEngine {
             let Some(style) = self.computed_style_for(slab) else {
                 continue;
             };
+
+            // The box model (shadow → background → gradient → border) comes from the
+            // shared producer, so this GPU scene and the CPU `paint::render` path build
+            // identical boxes and cannot diverge.
+            push_box_items(&mut items, rect, &style);
             let opacity = style.opacity;
-            let radius = style.border_radius.max(0.0);
-
-            // Shadow (behind everything): emit first so it composites *under* the
-            // box. The seam's reduced `box_shadow` carries an offset, blur, and color;
-            // fade the color by opacity like every other painted color.
-            if let Some(shadow) = style.box_shadow {
-                items.push(DisplayItem::Shadow {
-                    rect,
-                    color: fade(shadow.color, opacity),
-                    blur: shadow.blur,
-                    offset: Point {
-                        x: shadow.dx,
-                        y: shadow.dy,
-                    },
-                });
-            }
-
-            // Background fill. CSS layers a `background-image` (the gradient) OVER the
-            // `background-color`, so the flat background paints first and the gradient
-            // composites on top — matching the CPU paint path, so a translucent gradient
-            // lets the background color show through on both tiers. Both faded by opacity.
-            if style.background.a > 0 {
-                items.push(DisplayItem::Rect {
-                    rect,
-                    color: fade(style.background, opacity),
-                    radius,
-                });
-            }
-            if let Some(grad) = style.gradient {
-                items.push(DisplayItem::Gradient {
-                    rect,
-                    stops: GradientStops::from_slice(&[
-                        GradientStop {
-                            color: fade(grad.start, opacity),
-                            position: 0.0,
-                        },
-                        GradientStop {
-                            color: fade(grad.end, opacity),
-                            position: 1.0,
-                        },
-                    ]),
-                    direction: match grad.axis {
-                        GradientAxis::Vertical => GradientDirection::Vertical,
-                        GradientAxis::Horizontal => GradientDirection::Horizontal,
-                    },
-                });
-            }
-
-            // Border frame (on top of the background): emit a stroked rounded rect
-            // when the element has a visible border (`border_width > 0` and a
-            // non-transparent color), faded by opacity. The Taffy path still has no
-            // border primitive, but the display-list vocabulary now does, so the
-            // GPU path can frame the box.
-            if style.border_width > 0.0 && style.border_color.a > 0 {
-                items.push(DisplayItem::Border {
-                    rect,
-                    color: fade(style.border_color, opacity),
-                    width: style.border_width,
-                    radius,
-                });
-            }
 
             // Text: a direct-text leaf emits one Text run at the box origin, in the
             // element's resolved foreground `color` at its `font_size`, faded by

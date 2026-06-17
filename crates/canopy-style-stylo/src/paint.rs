@@ -18,7 +18,10 @@
 //! element's resolved foreground `color` and `font_size`.
 
 use canopy_render_soft::Buffer;
-use canopy_traits::{BoxShadow, Color, GradientAxis, LinearGradient, Point, Rect, Size};
+use canopy_traits::{
+    BoxShadow, Color, DisplayItem, GradientAxis, GradientDirection, LinearGradient, Point, Rect,
+    Size,
+};
 
 use crate::text_measure::{self, RasterizedRun};
 use crate::{NodeKind, StyloEngine};
@@ -36,23 +39,6 @@ fn with_opacity(c: Color, opacity: f32) -> Color {
         g: c.g,
         b: c.b,
         a: (c.a as f32 * o).round() as u8,
-    }
-}
-
-/// Shrink `rect` by `edge` logical px on every side (the content/padding box
-/// inside a uniform `edge`-wide border frame). The size is clamped at `0.0`, so a
-/// border thicker than the box yields an empty interior instead of an inverted
-/// (negative-size) rect.
-fn inset_rect(rect: Rect, edge: f32) -> Rect {
-    Rect {
-        origin: Point {
-            x: rect.origin.x + edge,
-            y: rect.origin.y + edge,
-        },
-        size: Size {
-            w: (rect.size.w - 2.0 * edge).max(0.0),
-            h: (rect.size.h - 2.0 * edge).max(0.0),
-        },
     }
 }
 
@@ -308,6 +294,62 @@ fn paint_box_shadow(buffer: &mut Buffer, box_rect: Rect, shadow: BoxShadow, opac
     }
 }
 
+/// Rasterize one **box-model** [`DisplayItem`] (as produced by
+/// [`push_box_items`](crate::display_list::push_box_items)) into `buffer`.
+///
+/// Colors arrive already faded by the element's opacity (the shared producer applies it),
+/// so the gradient/shadow helpers are reused with `opacity == 1.0`. `Text`/`Glyphs` items
+/// are intentionally skipped here — `render` draws text in its own real-glyph/Ahem pass,
+/// which a flat `DisplayItem::Text` cannot reproduce.
+fn rasterize_box_item(buffer: &mut Buffer, item: &DisplayItem) {
+    match item {
+        DisplayItem::Rect {
+            rect,
+            color,
+            radius,
+        } => buffer.fill_round_rect(*rect, *color, *radius),
+        DisplayItem::Border {
+            rect,
+            color,
+            width,
+            radius,
+        } => buffer.stroke_rect(*rect, *color, *width, *radius),
+        DisplayItem::Gradient {
+            rect,
+            stops,
+            direction,
+        } => {
+            // Reconstruct the two-stop gradient the helper takes; colors are pre-faded.
+            let s = stops.as_slice();
+            let grad = LinearGradient {
+                start: s.first().map_or(Color::default(), |st| st.color),
+                end: s.last().map_or(Color::default(), |st| st.color),
+                axis: match direction {
+                    GradientDirection::Vertical => GradientAxis::Vertical,
+                    GradientDirection::Horizontal => GradientAxis::Horizontal,
+                },
+            };
+            fill_linear_gradient(buffer, *rect, grad, 1.0);
+        }
+        DisplayItem::Shadow {
+            rect,
+            color,
+            blur,
+            offset,
+        } => {
+            let shadow = BoxShadow {
+                dx: offset.x,
+                dy: offset.y,
+                blur: *blur,
+                color: *color,
+            };
+            paint_box_shadow(buffer, *rect, shadow, 1.0);
+        }
+        // Text/Glyphs are drawn by `render`'s real-glyph pass; future variants skipped.
+        _ => {}
+    }
+}
+
 impl StyloEngine {
     /// Render the cascaded + laid-out tree into an RGBA8 [`Buffer`] of size
     /// `viewport`.
@@ -334,6 +376,9 @@ impl StyloEngine {
             a: 255,
         });
 
+        // Reused per element: the box-model item buffer.
+        let mut items: Vec<DisplayItem> = Vec::new();
+
         // DFS order is parent-before-child, the correct back-to-front order for
         // opaque backgrounds.
         for (&slab, &rect) in order.iter().zip(rects.iter()) {
@@ -341,59 +386,14 @@ impl StyloEngine {
                 continue;
             };
 
-            let bw = style.border_width.max(0.0);
-            let has_border = bw > 0.0 && style.border_color.a > 0;
-            let radius = style.border_radius.max(0.0);
-
-            // Box-shadow first: a soft outset shadow sits BEHIND the box, so paint it
-            // before the border/background fill (which then draws over the shadow's
-            // core under the box).
-            if let Some(shadow) = style.box_shadow {
-                paint_box_shadow(&mut buffer, rect, shadow, style.opacity);
-            }
-
-            // Border + background. The border is a *frame*: fill the full border-box
-            // in the border color (rounded to `radius`), then fill the inset
-            // content/padding box in the background — so the border color survives
-            // only in the `bw`-wide ring between the two rects. With no border we
-            // fill the background directly. Both fills run through `with_opacity`,
-            // so the element's `opacity` fades every painted pixel uniformly.
-            if has_border {
-                buffer.fill_round_rect(
-                    rect,
-                    with_opacity(style.border_color, style.opacity),
-                    radius,
-                );
-                // Inset rect: shrink by `bw` on every edge (clamped so a border
-                // thicker than the box collapses to an empty interior rather than
-                // wrapping to a huge size).
-                let inset = inset_rect(rect, bw);
-                if style.background.a > 0 && inset.size.w > 0.0 && inset.size.h > 0.0 {
-                    // Inner corner radius shrinks with the border, but never below 0.
-                    let inner_r = (radius - bw).max(0.0);
-                    buffer.fill_round_rect(
-                        inset,
-                        with_opacity(style.background, style.opacity),
-                        inner_r,
-                    );
-                }
-            } else if style.background.a > 0 {
-                // No border: paint the background directly (skip fully transparent
-                // fills so they don't clobber what is behind them at alpha 0).
-                buffer.fill_round_rect(rect, with_opacity(style.background, style.opacity), radius);
-            }
-
-            // Gradient background: a two-stop `linear-gradient` paints OVER the flat
-            // background color (it's the more specific paint), filling the content
-            // box (inset inside a border) or the whole border-box. Square corners
-            // only — the strip fill doesn't carve the rounded corner.
-            if let Some(grad) = style.gradient {
-                let fill_rect = if has_border {
-                    inset_rect(rect, bw)
-                } else {
-                    rect
-                };
-                fill_linear_gradient(&mut buffer, fill_rect, grad, style.opacity);
+            // Box model (shadow → background → gradient → border) from the SHARED
+            // producer — the *same* items the GPU `build_display_list` scene uses — then
+            // rasterized with the CPU primitives. One source of truth, so the CPU and GPU
+            // tiers cannot diverge on box ordering or geometry.
+            items.clear();
+            crate::display_list::push_box_items(&mut items, rect, &style);
+            for item in &items {
+                rasterize_box_item(&mut buffer, item);
             }
 
             // Text: only a *text-bearing leaf* (an element whose children are all
