@@ -219,6 +219,12 @@ pub enum NodeKind {
         id_attr: Option<Atom>,
         /// `class` attribute tokens, interned.
         classes: Vec<Atom>,
+        /// Generic attributes beyond `id`/`class`, keyed by interned local name
+        /// (e.g. `data-state`). Carried so presence (`[data-state]`) and equality
+        /// (`[data-state="open"]`) attribute selectors can match. `id`/`class` are
+        /// stored separately (above) because the selector engine has dedicated fast
+        /// paths for them (`has_id`/`has_class`).
+        attrs: Vec<(LocalName, String)>,
         /// Parsed inline `style` attribute, if any.
         style_attribute: Option<StyleArc<Locked<PropertyDeclarationBlock>>>,
     },
@@ -378,7 +384,10 @@ impl AttributeProvider for &Node {
     ) -> Option<String> {
         match &self.kind {
             NodeKind::Element {
-                id_attr, classes, ..
+                id_attr,
+                classes,
+                attrs,
+                ..
             } => {
                 if attr.0 == local_name!("id") {
                     id_attr.as_ref().map(|a| a.to_string())
@@ -395,7 +404,11 @@ impl AttributeProvider for &Node {
                         )
                     }
                 } else {
-                    None
+                    // Generic attribute (e.g. `data-state`).
+                    attrs
+                        .iter()
+                        .find(|(name, _)| *name == attr.0)
+                        .map(|(_, value)| value.clone())
                 }
             }
             _ => None,
@@ -482,11 +495,17 @@ impl selectors::Element for &Node {
         local_name: &GenericAtomIdent<LocalNameStaticSet>,
         operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
-        // Minimal: only id/class are stored explicitly. We reconstruct their
-        // string forms; other attributes are not supported.
+        // `id`/`class` are stored separately (the selector engine has dedicated
+        // fast paths, but a `[class]`/`[id]` *attribute* selector still routes
+        // here); everything else lives in the generic `attrs` map. `eval_str`
+        // resolves both presence (`Exists`, used by `[data-state]` via the trait's
+        // default `has_attr_in_no_namespace`) and equality/operator selectors.
         match &self.kind {
             NodeKind::Element {
-                id_attr, classes, ..
+                id_attr,
+                classes,
+                attrs,
+                ..
             } => {
                 if local_name.0 == local_name!("id") {
                     if let Some(id) = id_attr {
@@ -504,7 +523,14 @@ impl selectors::Element for &Node {
                         .join(" ");
                     operation.eval_str(&joined)
                 } else {
-                    false
+                    // Generic attribute (e.g. `data-state`): a present attribute
+                    // matches a presence selector and is tested against the operator
+                    // for a value selector; an absent one never matches.
+                    attrs
+                        .iter()
+                        .find(|(name, _)| *name == local_name.0)
+                        .map(|(_, value)| operation.eval_str(value))
+                        .unwrap_or(false)
                 }
             }
             _ => false,
@@ -802,7 +828,10 @@ impl<'a> TElement for &'a Node {
         F: FnMut(&GenericAtomIdent<LocalNameStaticSet>),
     {
         if let NodeKind::Element {
-            id_attr, classes, ..
+            id_attr,
+            classes,
+            attrs,
+            ..
         } = &self.kind
         {
             if id_attr.is_some() {
@@ -810,6 +839,15 @@ impl<'a> TElement for &'a Node {
             }
             if !classes.is_empty() {
                 callback(&GenericAtomIdent(local_name!("class")));
+            }
+            // Generic attributes (e.g. `data-state`). Stylo buckets attribute-
+            // selector rules by attribute name and only checks a bucket for an
+            // element that yields the matching name here — so an attribute selector
+            // never even reaches `attr_matches`/`has_attr_in_no_namespace` unless the
+            // name is enumerated. Previously only id/class were yielded, so generic
+            // attribute selectors silently never matched.
+            for (name, _) in attrs {
+                callback(GenericAtomIdent::cast(name));
             }
         }
     }
@@ -1165,6 +1203,7 @@ impl Document {
             name,
             id_attr: id_attr.map(Atom::from),
             classes: classes.iter().map(|c| Atom::from(*c)).collect(),
+            attrs: Vec::new(),
             style_attribute: None,
         };
         self.nodes.push(Node::new(id, Some(parent), kind));
@@ -1199,6 +1238,21 @@ impl Document {
         } = &mut self.nodes[node_id].kind
         {
             *style_attribute = Some(StyleArc::new(locked));
+        }
+    }
+
+    /// Set a generic attribute (anything other than `id`/`class`, which have their
+    /// own storage) on an element node, so presence (`[name]`) and equality
+    /// (`[name="value"]`) attribute selectors match it. A repeated `name` overwrites
+    /// the previous value (last-write-wins, matching a real attribute set).
+    pub fn set_attribute(&mut self, node_id: usize, name: &str, value: &str) {
+        if let NodeKind::Element { attrs, .. } = &mut self.nodes[node_id].kind {
+            let key = LocalName::from(name);
+            if let Some(slot) = attrs.iter_mut().find(|(n, _)| *n == key) {
+                slot.1 = value.to_string();
+            } else {
+                attrs.push((key, value.to_string()));
+            }
         }
     }
 
@@ -1283,7 +1337,7 @@ body { margin: 8px }
         // global atomic; idempotent) so the cascade keeps grid declarations.
         static_prefs::set_pref!("layout.grid.enabled", true);
 
-        let device = Self::make_device();
+        let device = Self::make_device(Self::DEFAULT_VIEWPORT, 1.0);
         let mut stylist = Stylist::new(device, QuirksMode::NoQuirks);
 
         // The user-agent sheet first (lowest cascade origin), then the author sheet.
@@ -1371,9 +1425,22 @@ body { margin: 8px }
         Self::with_document(doc, &css)
     }
 
-    fn make_device() -> style::device::Device {
-        let viewport_size = euclid::Size2D::new(800.0, 600.0);
-        let device_pixel_ratio = euclid::Scale::new(1.0);
+    /// The default viewport the cascade resolves against until
+    /// [`set_viewport`](StyloEngine::set_viewport) overrides it: a 800x600 screen at
+    /// device-pixel-ratio 1.0. Viewport-relative units (`vw`/`vh`/`vmin`/`vmax`) and
+    /// `@media (width: …)` queries cascade against these dimensions.
+    pub const DEFAULT_VIEWPORT: canopy_traits::Size = canopy_traits::Size { w: 800.0, h: 600.0 };
+
+    /// Build a Stylo [`Device`](style::device::Device) for the given CSS-pixel
+    /// `viewport` at `device_pixel_ratio`. The viewport drives viewport-relative
+    /// units and `@media` width/height queries; the DPR drives `resolution` /
+    /// device-pixel media features.
+    fn make_device(
+        viewport: canopy_traits::Size,
+        device_pixel_ratio: f32,
+    ) -> style::device::Device {
+        let viewport_size = euclid::Size2D::new(viewport.w, viewport.h);
+        let device_pixel_ratio = euclid::Scale::new(device_pixel_ratio);
         style::device::Device::new(
             MediaType::screen(),
             QuirksMode::NoQuirks,
@@ -1508,13 +1575,22 @@ body { margin: 8px }
             }
         }
 
-        // Force the next resolve to re-run the full cascade: drop the resolved
-        // flag AND every element's cached Stylo `ElementData`, so the traversal
-        // re-cascades the whole tree against the updated element state.
-        //
-        // SAFETY: we hold `&mut self`, so there are no outstanding borrows of any
-        // node's `stylo_element_data` (no traversal is in flight), satisfying
-        // `StyloData::clear`'s contract.
+        // Force the next resolve to re-run the full cascade against the updated
+        // element state.
+        self.invalidate_cascade();
+    }
+
+    /// Force the next [`resolve_styles`] to re-run the full whole-tree cascade:
+    /// drop the `resolved` flag AND every element's cached Stylo `ElementData`, so
+    /// the traversal re-cascades from scratch. Used whenever something the cascade
+    /// already baked in changes — an element-state flip ([`set_hover`]) or a device
+    /// change ([`set_viewport`]) — since this DOM carries no Stylo snapshots, so
+    /// Stylo's normal incremental invalidation can't notice the change on its own.
+    ///
+    /// SAFETY: callers hold `&mut self`, so there are no outstanding borrows of any
+    /// node's `stylo_element_data` (no traversal is in flight), satisfying
+    /// `StyloData::clear`'s contract.
+    fn invalidate_cascade(&mut self) {
         for node in &self.doc.nodes {
             if node.is_element() {
                 unsafe { node.stylo_element_data.clear() };
@@ -1524,6 +1600,41 @@ body { margin: 8px }
             node.snapshot_handled.store(false, Ordering::SeqCst);
         }
         self.resolved = false;
+    }
+
+    /// Set the CSS-pixel `viewport` the cascade resolves against (at
+    /// device-pixel-ratio 1.0); see [`set_viewport_with_dpr`](StyloEngine::set_viewport_with_dpr)
+    /// to also set the DPR.
+    ///
+    /// The default is [`DEFAULT_VIEWPORT`](StyloEngine::DEFAULT_VIEWPORT) (800x600).
+    /// Viewport-relative lengths (`vw`/`vh`/`vmin`/`vmax`) and `@media` width/height
+    /// queries cascade against this size, so a host must set it to the real surface
+    /// before resolving or those units/queries resolve against the wrong box.
+    pub fn set_viewport(&mut self, viewport: canopy_traits::Size) {
+        self.set_viewport_with_dpr(viewport, 1.0);
+    }
+
+    /// Set the cascade `viewport` and `device_pixel_ratio`, rebuilding the Stylist's
+    /// [`Device`](style::device::Device) and forcing a full re-cascade on the next
+    /// resolve so viewport-relative units and media queries recompute against the new
+    /// dimensions.
+    pub fn set_viewport_with_dpr(
+        &mut self,
+        viewport: canopy_traits::Size,
+        device_pixel_ratio: f32,
+    ) {
+        let device = Self::make_device(viewport, device_pixel_ratio);
+        let guard = GLOBAL_GUARD.read();
+        let guards = StylesheetGuards {
+            author: &guard,
+            ua_or_user: &guard,
+        };
+        // Swap in the new device; the returned `OriginSet` is the origins whose rules
+        // a media-feature change made (in)applicable. We don't need to act on it: the
+        // subsequent full re-cascade re-flushes every origin regardless.
+        let _ = self.stylist.set_device(device, &guards);
+        drop(guard);
+        self.invalidate_cascade();
     }
 
     /// Read the computed style for a node by slab id (after resolving).
@@ -1556,7 +1667,16 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
     // font-size in px
     let font_size = style.get_font().font_size.used_size().px();
 
-    // padding-top -> px
+    // padding-top -> px.
+    //
+    // LOSSY REDUCTION (asserted contract — see `percentage_padding_collapses_to_zero`
+    // / `calc_padding_collapses_to_zero` in the tests). The flat `ComputedStyle` seam
+    // carries `padding` as a single resolved `f32` px, but a percentage or `calc()`
+    // padding can only be resolved against the element's containing-block *width*,
+    // which is a layout output not known at cascade time. Rather than guess, we
+    // deliberately collapse the non-length cases to `0.0`. A consumer that needs the
+    // real percentage/`calc()` padding must read it off the laid-out Taffy box, not
+    // this flat style. Plain `<length>` paddings (the common case) are exact.
     let padding = match style.get_padding().padding_top.0.unpack() {
         Unpacked::Length(l) => l.px(),
         Unpacked::Percentage(_) => 0.0,
@@ -1597,8 +1717,14 @@ fn map_computed_style(style: &ComputedValues) -> ComputedStyle {
     );
     // `border-top-left-radius` computes to a `BorderCornerRadius<LengthPercentage>`
     // = `Size2D<LengthPercentage>`; take the horizontal (`.0.width`) component and
-    // resolve a bare length to px (percentages have no box to resolve against here,
-    // so they fall back to 0.0 like `padding` does above).
+    // resolve a bare length to px.
+    //
+    // LOSSY REDUCTION (asserted contract — see
+    // `percentage_border_radius_collapses_to_zero` /
+    // `calc_border_radius_collapses_to_zero` in the tests). Exactly like `padding`
+    // above: a percentage or `calc()` corner radius resolves against the border-box
+    // dimensions, which are a layout output unavailable at cascade time, so the
+    // non-length cases collapse to `0.0`. Plain `<length>` radii are exact.
     let border_radius = match border.border_top_left_radius.0.width.0.unpack() {
         Unpacked::Length(l) => l.px(),
         Unpacked::Percentage(_) => 0.0,
@@ -1784,9 +1910,52 @@ impl StyleEngine for StyloEngine {
     }
 }
 
+/// The CSS property name a `canopy_dom` inline-style [`PropId`] serializes to, or
+/// `None` for paint-only props with no Stylo longhand (the two animation translates).
+///
+/// The numeric ids are `canopy_paint`'s `PropId` constants (`BG = 1`, `FG = 2`, …);
+/// the names mirror `canopy-style-css`'s `map_property` so the inline-style path and
+/// the class path agree on what each property means. We avoid a `canopy-paint`
+/// dependency (it would pull a new crate into this excluded-lockfile crate) by naming
+/// the ids inline; they are a stable wire contract.
+fn inline_prop_css_name(prop: canopy_protocol::PropId) -> Option<&'static str> {
+    match prop.raw() {
+        1 => Some("background"),
+        2 => Some("color"),
+        3 => Some("width"),
+        4 => Some("height"),
+        5 => Some("gap"),
+        6 => Some("padding"),
+        7 => Some("flex-direction"),
+        8 => Some("border-radius"),
+        9 => Some("opacity"),
+        12 => Some("align-items"),
+        13 => Some("justify-content"),
+        14 => Some("text-align"),
+        // 10/11 are `translate-x`/`translate-y` — paint-only animation props with no
+        // direct Stylo longhand in this seam; they never reach the cascade.
+        _ => None,
+    }
+}
+
+/// The HTML attribute name a `canopy_dom` [`AttrId`] carries into the overlay, for
+/// attribute selectors. [`AttrId::ID`] is `id` (already applied via `add_element`);
+/// any other id is application-minted with no public name registry, so it is exposed
+/// under a stable synthetic `data-attr-<n>` name. That keeps the mapping lossless and
+/// collision-free (every distinct id gets a distinct, valid attribute name) so a
+/// stylesheet can target it; well-known names land once the protocol grows a registry.
+fn overlay_attr_name(attr: canopy_protocol::AttrId) -> String {
+    if attr == canopy_protocol::AttrId::ID {
+        "id".to_string()
+    } else {
+        format!("data-attr-{}", attr.raw())
+    }
+}
+
 /// Recursively mirror the `canopy_dom` subtree under `parent_canopy` into the Stylo
 /// overlay [`Document`] under `parent_slab`, reading each element's CSS identity
-/// (tag-name / id / classes) off the real Dom and recording the handle->slab mapping.
+/// (tag-name / id / classes), its **inline styles**, and its **attributes** off the
+/// real Dom and recording the handle->slab mapping.
 fn build_overlay(
     dom: &canopy_dom::Dom,
     parent_canopy: NodeId,
@@ -1802,6 +1971,32 @@ fn build_overlay(
             let id = dom.id(child);
             let classes: Vec<&str> = dom.classes(child).iter().map(String::as_str).collect();
             let slab = doc.add_element(parent_slab, tag, id, &classes);
+
+            // Inline styles: serialize the node's `(PropId, value)` map into a CSS
+            // declaration string and parse it as the element's inline `style`, so an
+            // inline style beats any lower-specificity rule (inline declarations sit
+            // at the top of the cascade, exactly as `style=""` does in a browser).
+            // Previously these were silently dropped — only tag/id/class were mirrored.
+            let inline = dom
+                .styles(child)
+                .filter_map(|(prop, value)| {
+                    inline_prop_css_name(prop).map(|name| format!("{name}:{value}"))
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            if !inline.is_empty() {
+                doc.set_inline_style(slab, &inline);
+            }
+
+            // Attributes beyond `id` (already applied above): carry the whole map so
+            // presence/equality attribute selectors can match against the real tree.
+            for (attr, value) in dom.attrs(child) {
+                if attr == canopy_protocol::AttrId::ID {
+                    continue;
+                }
+                doc.set_attribute(slab, &overlay_attr_name(attr), value);
+            }
+
             node_map.insert(child.raw(), slab);
             build_overlay(dom, child, slab, doc, node_map);
         } else if n.text.is_some() {
@@ -3814,6 +4009,267 @@ mod tests {
             cleared.origin.y >= 50.0 - 1.0,
             "clear:left sibling should drop BELOW the float (y >= ~50), got y={}",
             cleared.origin.y
+        );
+    }
+
+    // === D1: inline styles flow into the overlay (and beat lower-specificity rules) ===
+
+    #[test]
+    fn from_dom_inline_style_beats_class_rule() {
+        // A capable-tier guest sets BOTH a class (`.box { background:#111111 }`) AND an
+        // inline `background` via the op-stream. Inline declarations sit at the top of
+        // the cascade, so the inline color must win over the class rule. Before D1,
+        // `build_overlay` mirrored only tag/id/class and silently dropped inline styles,
+        // so the class color would have leaked through.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::{ElementTag, PropId};
+        use canopy_traits::OpSink;
+
+        // `canopy_paint::BG` is PropId(1) (the `background` paint prop); named inline
+        // to avoid a `canopy-paint` dependency in this excluded-lockfile crate.
+        const BG: PropId = PropId::new(1);
+
+        let mut e = Emitter::new();
+        let node = e.create_element(ElementTag::new(1));
+        e.append(ROOT, node);
+        e.set_tag_name(node, "div");
+        e.set_class(node, "box");
+        e.set_inline_style(node, BG, "#00ff00");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let mut engine = StyloEngine::from_dom(&dom, ".box { background:#111111 }");
+        let style = engine.resolve(node, None).unwrap();
+        assert_eq!(
+            style.background,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "inline background (#00ff00) must beat the lower-specificity .box class rule"
+        );
+    }
+
+    #[test]
+    fn from_dom_inline_padding_flows_into_cascade() {
+        // A second inline property (padding) proves the serializer maps every supported
+        // PropId, not just `background`. `5px` is a plain length, so it resolves exactly.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::{ElementTag, PropId};
+        use canopy_traits::OpSink;
+
+        // `canopy_paint::PADDING` is PropId(6); named inline (see BG above).
+        const PADDING: PropId = PropId::new(6);
+
+        let mut e = Emitter::new();
+        let node = e.create_element(ElementTag::new(1));
+        e.append(ROOT, node);
+        e.set_tag_name(node, "div");
+        e.set_inline_style(node, PADDING, "5px");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let mut engine = StyloEngine::from_dom(&dom, "");
+        let style = engine.resolve(node, None).unwrap();
+        assert_eq!(style.padding, 5.0, "inline padding:5px cascaded as 5.0");
+    }
+
+    // === D2: attribute selectors (presence + equality) ===
+
+    #[test]
+    fn attribute_presence_and_equality_selectors_match() {
+        // `[data-state] { color:#ff0000 }` (presence) and
+        // `[data-state="open"] { background:#00ff00 }` (equality) both match an element
+        // carrying `data-state="open"`; a sibling without the attribute matches neither.
+        let mut engine = StyloEngine::new(
+            "[data-state] { color:#ff0000 } [data-state=\"open\"] { background:#00ff00 }",
+        );
+        let with;
+        let without;
+        {
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            with = doc.add_element(html, "div", None, &[]);
+            doc.set_attribute(with, "data-state", "open");
+            without = doc.add_element(html, "div", None, &[]);
+        }
+
+        let with_style = resolve(&mut engine, with);
+        assert_eq!(
+            with_style.color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            },
+            "presence selector [data-state] should match"
+        );
+        assert_eq!(
+            with_style.background,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "equality selector [data-state=\"open\"] should match"
+        );
+
+        let without_style = resolve(&mut engine, without);
+        assert_ne!(
+            without_style.color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            },
+            "element without data-state must NOT match the presence selector"
+        );
+    }
+
+    #[test]
+    fn from_dom_attribute_selector_matches_over_real_tree() {
+        // The capable-tier path: a non-id attribute carried through the op-stream into
+        // the overlay is matchable by an attribute selector. The attribute's overlay
+        // name is the synthetic `data-attr-<id>` for an app-minted AttrId.
+        use canopy_core::Emitter;
+        use canopy_dom::{Dom, ROOT};
+        use canopy_protocol::{AttrId, ElementTag};
+        use canopy_traits::OpSink;
+
+        let state_attr = AttrId::new(7);
+        let mut e = Emitter::new();
+        let node = e.create_element(ElementTag::new(1));
+        e.append(ROOT, node);
+        e.set_tag_name(node, "div");
+        e.set_attribute(node, state_attr, "open");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        // The overlay names AttrId(7) as `data-attr-7`; target it by presence + value.
+        let css = "[data-attr-7] { color:#ff0000 } [data-attr-7=\"open\"] { background:#0000ff }";
+        let mut engine = StyloEngine::from_dom(&dom, css);
+        let style = engine.resolve(node, None).unwrap();
+        assert_eq!(
+            style.color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            },
+            "presence attribute selector matched over the real Dom"
+        );
+        assert_eq!(
+            style.background,
+            Color {
+                r: 0,
+                g: 0,
+                b: 255,
+                a: 255
+            },
+            "equality attribute selector matched over the real Dom"
+        );
+    }
+
+    // === D3: parameterized viewport ===
+
+    #[test]
+    fn viewport_relative_length_resolves_against_viewport_size() {
+        // `font-size:10vw` is 10% of the viewport WIDTH. At width 1000 it is 100px; at
+        // width 500 it is 50px. Resolving the same cascade at two viewport sizes must
+        // therefore yield different `font_size`s — proof the device viewport actually
+        // drives viewport-relative units (it was hard-coded to 800x600 before D3).
+        fn font_at(width: f32) -> f32 {
+            let mut engine = StyloEngine::new("div { font-size:10vw }");
+            engine.set_viewport(canopy_traits::Size { w: width, h: 600.0 });
+            let doc = engine.document_mut();
+            let html = doc.add_element(0, "html", None, &[]);
+            let el = doc.add_element(html, "div", None, &[]);
+            resolve(&mut engine, el).font_size
+        }
+
+        let wide = font_at(1000.0);
+        let narrow = font_at(500.0);
+        assert!(
+            (wide - 100.0).abs() < 0.5,
+            "10vw at viewport width 1000 should be ~100px, got {wide}"
+        );
+        assert!(
+            (narrow - 50.0).abs() < 0.5,
+            "10vw at viewport width 500 should be ~50px, got {narrow}"
+        );
+        assert!(
+            (wide - narrow).abs() > 1.0,
+            "the resolved viewport-relative length must DIFFER at the two viewport sizes"
+        );
+    }
+
+    // === D4: pinned lossy reductions (percentage / calc padding + border-radius) ===
+    //
+    // These tests PIN the current lossy behavior at the `map_computed_style` reduction
+    // sites: a percentage or calc() padding / border-radius collapses to 0.0 in the flat
+    // `ComputedStyle` because there is no containing block at cascade time. They make the
+    // reduction an ASSERTED CONTRACT — if a future change starts resolving these, these
+    // tests fail loudly and must be revisited (along with the doc comments at the sites).
+
+    #[test]
+    fn percentage_padding_collapses_to_zero() {
+        let mut engine = StyloEngine::new("div { padding:25% }");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let el = doc.add_element(html, "div", None, &[]);
+        let style = resolve(&mut engine, el);
+        assert_eq!(
+            style.padding, 0.0,
+            "percentage padding currently collapses to 0.0 (no containing block at cascade time)"
+        );
+    }
+
+    #[test]
+    fn calc_padding_collapses_to_zero() {
+        // A calc() that mixes a percentage with a length is still non-`Length` after the
+        // cascade (the percentage can't resolve), so it collapses to 0.0.
+        let mut engine = StyloEngine::new("div { padding:calc(10px + 10%) }");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let el = doc.add_element(html, "div", None, &[]);
+        let style = resolve(&mut engine, el);
+        assert_eq!(
+            style.padding, 0.0,
+            "calc() padding with a percentage currently collapses to 0.0"
+        );
+    }
+
+    #[test]
+    fn percentage_border_radius_collapses_to_zero() {
+        let mut engine = StyloEngine::new("div { border-radius:50% }");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let el = doc.add_element(html, "div", None, &[]);
+        let style = resolve(&mut engine, el);
+        assert_eq!(
+            style.border_radius, 0.0,
+            "percentage border-radius currently collapses to 0.0"
+        );
+    }
+
+    #[test]
+    fn calc_border_radius_collapses_to_zero() {
+        let mut engine = StyloEngine::new("div { border-radius:calc(4px + 25%) }");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let el = doc.add_element(html, "div", None, &[]);
+        let style = resolve(&mut engine, el);
+        assert_eq!(
+            style.border_radius, 0.0,
+            "calc() border-radius with a percentage currently collapses to 0.0"
         );
     }
 }

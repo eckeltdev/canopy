@@ -88,6 +88,18 @@ impl Dom {
         self.nodes.get(&node)?.styles.get(&prop).map(String::as_str)
     }
 
+    /// All inline styles set on `node`, as `(prop, value)` pairs in [`PropId`]
+    /// order. Empty if `node` is absent or has no inline styles. A host-side
+    /// cascade (e.g. Stylo) uses this to fold the guest's inline `style` into the
+    /// overlay it matches selectors against — `style()` answers for one known
+    /// property; this enumerates them all.
+    pub fn styles(&self, node: NodeId) -> impl Iterator<Item = (PropId, &str)> {
+        self.nodes
+            .get(&node)
+            .into_iter()
+            .flat_map(|n| n.styles.iter().map(|(p, v)| (*p, v.as_str())))
+    }
+
     /// The node's CSS local name (e.g. `"div"`), if the guest declared one.
     pub fn tag_name(&self, node: NodeId) -> Option<&str> {
         self.nodes.get(&node)?.tag_name.as_deref()
@@ -104,6 +116,18 @@ impl Dom {
     /// The resolved value of `node`'s attribute `attr`, if set.
     pub fn attr(&self, node: NodeId, attr: AttrId) -> Option<&str> {
         self.nodes.get(&node)?.attrs.get(&attr).map(String::as_str)
+    }
+
+    /// All attributes set on `node`, as `(attr, value)` pairs in [`AttrId`] order
+    /// (so `attrs[AttrId::ID]` is the element id). Empty if `node` is absent or
+    /// has no attributes. A host-side cascade (e.g. Stylo) uses this to carry the
+    /// whole attribute map into its overlay so attribute selectors can match —
+    /// `attr()` answers for one known id; this enumerates them all.
+    pub fn attrs(&self, node: NodeId) -> impl Iterator<Item = (AttrId, &str)> {
+        self.nodes
+            .get(&node)
+            .into_iter()
+            .flat_map(|n| n.attrs.iter().map(|(a, v)| (*a, v.as_str())))
     }
 
     /// The node's CSS id ([`AttrId::ID`]), if set.
@@ -366,6 +390,38 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&e.take_batch(0)).unwrap();
         assert_eq!(dom.style(n, BG), Some("#202830"));
+    }
+
+    #[test]
+    fn styles_and_attrs_enumerate_the_whole_map() {
+        // A host-side cascade needs every inline style / attribute, not just one by
+        // known id. `styles()` / `attrs()` yield the full maps in id order, so the
+        // overlay builder can fold them all in.
+        use canopy_protocol::PropId;
+        const BG: PropId = PropId::new(1);
+        const PADDING: PropId = PropId::new(6);
+        let custom = AttrId::new(7);
+
+        let mut e = Emitter::new();
+        let n = e.create_element(ElementTag::new(1));
+        e.append(ROOT, n);
+        e.set_inline_style(n, BG, "#202830");
+        e.set_inline_style(n, PADDING, "5px");
+        e.set_attribute(n, AttrId::ID, "submit");
+        e.set_attribute(n, custom, "open");
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+
+        let styles: Vec<(PropId, &str)> = dom.styles(n).collect();
+        assert_eq!(styles, alloc::vec![(BG, "#202830"), (PADDING, "5px")]);
+
+        let attrs: Vec<(AttrId, &str)> = dom.attrs(n).collect();
+        assert_eq!(attrs, alloc::vec![(AttrId::ID, "submit"), (custom, "open")]);
+
+        // An unknown node enumerates to nothing.
+        let ghost = NodeId::new(9999);
+        assert_eq!(dom.styles(ghost).count(), 0);
+        assert_eq!(dom.attrs(ghost).count(), 0);
     }
 
     #[test]
