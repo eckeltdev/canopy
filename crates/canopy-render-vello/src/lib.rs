@@ -173,13 +173,207 @@ enum DrawCmd {
     Glyphs(GlyphRun),
 }
 
+/// The number of solid slabs a [`DisplayItem::Gradient`] is lowered into on the GPU.
+///
+/// We approximate a smooth gradient with this many adjacent constant-color quads,
+/// each colored at its midpoint along the axis. It is a real, visible ramp (the CPU
+/// tiers degrade to a single solid), and at 32 slabs across a typical box the banding
+/// is below one slab per few pixels — smooth enough without a dedicated shader.
+const GRADIENT_SLABS: u32 = 32;
+
+/// Sample a [`GradientStops`] set at normalized position `t` in `[0, 1]`, linearly
+/// interpolating between the two surrounding stops.
+///
+/// Stops are assumed sorted by `position` (the lowering emits them in axis order). A
+/// `t` before the first stop clamps to the first color; after the last, to the last.
+/// An empty set yields transparent black. This is the per-slab color the GPU gradient
+/// lowering paints.
+fn sample_gradient(stops: &canopy_traits::GradientStops, t: f32) -> Color {
+    let s = stops.as_slice();
+    match s.first() {
+        None => Color::default(),
+        Some(first) => {
+            if t <= first.position {
+                return first.color;
+            }
+            // Walk to the segment containing `t`.
+            for pair in s.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if t <= b.position {
+                    let span = (b.position - a.position).max(f32::EPSILON);
+                    let f = ((t - a.position) / span).clamp(0.0, 1.0);
+                    return lerp_color(a.color, b.color, f);
+                }
+            }
+            // Past the last stop.
+            s[s.len() - 1].color
+        }
+    }
+}
+
+/// Linearly interpolate two straight-alpha colors channel-wise at fraction `f`.
+fn lerp_color(a: Color, b: Color, f: f32) -> Color {
+    let mix = |x: u8, y: u8| -> u8 {
+        (x as f32 + (y as f32 - x as f32) * f)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color {
+        r: mix(a.r, b.r),
+        g: mix(a.g, b.g),
+        b: mix(a.b, b.b),
+        a: mix(a.a, b.a),
+    }
+}
+
+/// Lower a [`DisplayItem::Gradient`] into [`GRADIENT_SLABS`] adjacent solid quads
+/// across `direction`, each colored at its slab midpoint — a real GPU ramp.
+fn lower_gradient(
+    cmds: &mut Vec<DrawCmd>,
+    rect: Rect,
+    stops: &canopy_traits::GradientStops,
+    direction: canopy_traits::GradientDirection,
+) {
+    use canopy_traits::GradientDirection;
+    let n = GRADIENT_SLABS;
+    for i in 0..n {
+        // Midpoint of slab `i` along the axis, in [0, 1].
+        let t = (i as f32 + 0.5) / n as f32;
+        let color = sample_gradient(stops, t);
+        let slab = match direction {
+            GradientDirection::Vertical => {
+                let h = rect.size.h / n as f32;
+                Rect {
+                    origin: Point {
+                        x: rect.origin.x,
+                        y: rect.origin.y + i as f32 * h,
+                    },
+                    size: Size { w: rect.size.w, h },
+                }
+            }
+            GradientDirection::Horizontal => {
+                let w = rect.size.w / n as f32;
+                Rect {
+                    origin: Point {
+                        x: rect.origin.x + i as f32 * w,
+                        y: rect.origin.y,
+                    },
+                    size: Size { w, h: rect.size.h },
+                }
+            }
+        };
+        // Slabs are square-cornered fills; rounding (if any) belongs to the box's
+        // own background/border, not the gradient ramp.
+        cmds.push(DrawCmd::Rect(QuadInstance::rect(slab, color, 0.0)));
+    }
+}
+
+/// Lower a [`DisplayItem::Border`] into four edge-band quads (top, bottom, left,
+/// right) drawn through the rect pipeline.
+///
+/// The bands are stroked *inside* `rect`, `width` px thick; top/bottom span the full
+/// width and left/right fill the gap between them, so no corner is double-painted. The
+/// corner `radius` is carried onto the corner-touching bands via the SDF so the outer
+/// corners round on the GPU (the CPU tiers keep square corners). A non-positive width
+/// emits nothing.
+fn lower_border(cmds: &mut Vec<DrawCmd>, rect: Rect, color: Color, width: f32, radius: f32) {
+    if width <= 0.0 {
+        return;
+    }
+    let w = width.min(0.5 * rect.size.w.min(rect.size.h));
+    if w <= 0.0 {
+        return;
+    }
+    let Rect { origin, size } = rect;
+    // Top and bottom bands (full width). Carry the radius so the GPU SDF rounds the
+    // outer corners of these bands; the inner straight edge stays crisp.
+    let top = Rect {
+        origin,
+        size: Size { w: size.w, h: w },
+    };
+    let bottom = Rect {
+        origin: Point {
+            x: origin.x,
+            y: origin.y + size.h - w,
+        },
+        size: Size { w: size.w, h: w },
+    };
+    let left = Rect {
+        origin: Point {
+            x: origin.x,
+            y: origin.y + w,
+        },
+        size: Size {
+            w,
+            h: size.h - 2.0 * w,
+        },
+    };
+    let right = Rect {
+        origin: Point {
+            x: origin.x + size.w - w,
+            y: origin.y + w,
+        },
+        size: Size {
+            w,
+            h: size.h - 2.0 * w,
+        },
+    };
+    // The thin bands are narrower than `2*radius`, so the SDF clamps the radius to
+    // half each band's shorter side; passing the box radius keeps the rounding intent
+    // without overflowing (the QuadInstance clamps it per band).
+    cmds.push(DrawCmd::Rect(QuadInstance::rect(top, color, radius)));
+    cmds.push(DrawCmd::Rect(QuadInstance::rect(bottom, color, radius)));
+    cmds.push(DrawCmd::Rect(QuadInstance::rect(left, color, 0.0)));
+    cmds.push(DrawCmd::Rect(QuadInstance::rect(right, color, 0.0)));
+}
+
+/// Lower a [`DisplayItem::Shadow`] into a single translucent, offset, rounded quad
+/// behind the box — a real (if simplified) GPU drop shadow.
+///
+/// The shadow box is `rect` translated by `offset`; we round its corners generously
+/// (radius ≈ `blur`) and scale the color's alpha down by a blur-dependent factor so a
+/// larger blur reads as a softer, fainter shadow. This is a single-quad approximation
+/// of a gaussian blur (no separable blur pass), but it is a genuine GPU draw — unlike
+/// the CPU tiers, which drop the shadow entirely. A fully-transparent shadow color or
+/// a zero-area box emits nothing.
+fn lower_shadow(cmds: &mut Vec<DrawCmd>, rect: Rect, color: Color, blur: f32, offset: Point) {
+    if color.a == 0 || rect.size.w <= 0.0 || rect.size.h <= 0.0 {
+        return;
+    }
+    let shadow_rect = Rect {
+        origin: Point {
+            x: rect.origin.x + offset.x,
+            y: rect.origin.y + offset.y,
+        },
+        size: rect.size,
+    };
+    // Soften: a bigger blur fades the shadow (alpha falls off as the energy spreads).
+    // Clamp so even a large blur keeps a faint, visible shadow.
+    let softness = 1.0 / (1.0 + (blur * 0.15).max(0.0));
+    let a = (color.a as f32 * softness).round().clamp(0.0, 255.0) as u8;
+    if a == 0 {
+        return;
+    }
+    let soft_color = Color { a, ..color };
+    // Round the corners by roughly the blur radius so the shadow has soft-looking
+    // rounded edges (the SDF clamps an oversized radius to half the shorter side).
+    let radius = blur.max(0.0);
+    cmds.push(DrawCmd::Rect(QuadInstance::rect(
+        shadow_rect,
+        soft_color,
+        radius,
+    )));
+}
+
 /// Lower a [`DisplayList`] into an ordered list of draw commands.
 ///
 /// [`DisplayItem::Rect`] becomes a colored quad; [`DisplayItem::Text`] is
 /// rasterized to a real antialiased coverage mask via `engine` and becomes a
-/// textured glyph run; [`DisplayItem::Glyphs`] is skipped (the pre-shaped path
-/// is not rasterized on any tier yet). Order is preserved for correct
-/// compositing.
+/// textured glyph run; [`DisplayItem::Border`], [`DisplayItem::Gradient`], and
+/// [`DisplayItem::Shadow`] lower to real colored quads on the rect pipeline (an
+/// edge-band frame, an interpolated slab ramp, and a softened offset quad
+/// respectively); [`DisplayItem::Glyphs`] is skipped (the pre-shaped path is not
+/// rasterized on any tier yet). Order is preserved for correct compositing.
 fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
     let mut cmds = Vec::new();
     for item in &scene.items {
@@ -223,7 +417,38 @@ fn lower(scene: &DisplayList, engine: &mut TextEngine) -> Vec<DrawCmd> {
                     color: *color,
                 }));
             }
+            // A drop shadow lowers to a single softened, offset, rounded quad behind
+            // the box. Emitted in place, so a display list that puts the shadow before
+            // its box paints it underneath.
+            DisplayItem::Shadow {
+                rect,
+                color,
+                blur,
+                offset,
+            } => {
+                lower_shadow(&mut cmds, *rect, *color, *blur, *offset);
+            }
+            // A gradient lowers to a real interpolated slab ramp across its axis.
+            DisplayItem::Gradient {
+                rect,
+                stops,
+                direction,
+            } => {
+                lower_gradient(&mut cmds, *rect, stops, *direction);
+            }
+            // A border lowers to four edge-band quads (a stroked frame).
+            DisplayItem::Border {
+                rect,
+                color,
+                width,
+                radius,
+            } => {
+                lower_border(&mut cmds, *rect, *color, *width, *radius);
+            }
             DisplayItem::Glyphs { .. } => {}
+            // `DisplayItem` is `#[non_exhaustive]`: a future primitive lands in this
+            // forward-compat arm and is skipped (paint nothing rather than panic).
+            _ => {}
         }
     }
     cmds
@@ -1040,6 +1265,203 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], DrawCmd::Rect(_)), "rect first");
         assert!(matches!(cmds[1], DrawCmd::Glyphs(_)), "glyphs second");
+    }
+
+    /// `sample_gradient` interpolates between the surrounding stops and clamps at the
+    /// ends — the per-slab color the GPU gradient ramp paints.
+    #[test]
+    fn gradient_sampling_interpolates_and_clamps() {
+        use canopy_traits::{GradientStop, GradientStops};
+        let black = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let white = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        let stops = GradientStops::from_slice(&[
+            GradientStop {
+                color: black,
+                position: 0.0,
+            },
+            GradientStop {
+                color: white,
+                position: 1.0,
+            },
+        ]);
+        // Endpoints clamp to the stop colors.
+        assert_eq!(sample_gradient(&stops, 0.0), black);
+        assert_eq!(sample_gradient(&stops, 1.0), white);
+        // Before/after the range clamps too.
+        assert_eq!(sample_gradient(&stops, -1.0), black);
+        assert_eq!(sample_gradient(&stops, 2.0), white);
+        // The midpoint is the channel-wise average (~128).
+        let mid = sample_gradient(&stops, 0.5);
+        assert!(
+            mid.r > 120 && mid.r < 136,
+            "midpoint is ~half-gray, got {}",
+            mid.r
+        );
+        assert_eq!(mid.r, mid.g);
+        assert_eq!(mid.g, mid.b);
+        // An empty set degrades to transparent black, never panicking.
+        assert_eq!(
+            sample_gradient(&GradientStops::default(), 0.5),
+            Color::default()
+        );
+    }
+
+    /// A `DisplayItem::Gradient` lowers to exactly `GRADIENT_SLABS` colored quads
+    /// whose colors actually vary across the axis (a real ramp), and the slabs tile
+    /// the box along the gradient direction.
+    #[test]
+    fn gradient_lowers_to_a_varying_slab_ramp() {
+        use canopy_traits::{GradientDirection, GradientStop, GradientStops};
+        let mut engine = TextEngine::new();
+        let scene = DisplayList {
+            items: vec![DisplayItem::Gradient {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 64.0, h: 32.0 },
+                },
+                stops: GradientStops::from_slice(&[
+                    GradientStop {
+                        color: Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 255,
+                        },
+                        position: 0.0,
+                    },
+                    GradientStop {
+                        color: Color {
+                            r: 255,
+                            g: 255,
+                            b: 255,
+                            a: 255,
+                        },
+                        position: 1.0,
+                    },
+                ]),
+                direction: GradientDirection::Vertical,
+            }],
+        };
+        let cmds = lower(&scene, &mut engine);
+        assert_eq!(
+            cmds.len(),
+            GRADIENT_SLABS as usize,
+            "one quad per gradient slab"
+        );
+        // Every command is a rect; the first and last slabs differ in color (a real
+        // ramp, not a flat fill).
+        let first_color = match &cmds[0] {
+            DrawCmd::Rect(q) => q.color,
+            _ => panic!("gradient slabs are rects"),
+        };
+        let last_color = match cmds.last().unwrap() {
+            DrawCmd::Rect(q) => q.color,
+            _ => panic!("gradient slabs are rects"),
+        };
+        assert_ne!(
+            first_color, last_color,
+            "the ramp's ends must differ (the slabs interpolate)"
+        );
+    }
+
+    /// A `DisplayItem::Border` lowers to four edge-band quads — a stroked frame, not a
+    /// fill.
+    #[test]
+    fn border_lowers_to_four_edge_bands() {
+        let mut engine = TextEngine::new();
+        let scene = DisplayList {
+            items: vec![DisplayItem::Border {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 40.0, h: 30.0 },
+                },
+                color: Color {
+                    r: 200,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                width: 3.0,
+                radius: 4.0,
+            }],
+        };
+        let cmds = lower(&scene, &mut engine);
+        assert_eq!(cmds.len(), 4, "a border is four edge bands");
+        assert!(
+            cmds.iter().all(|c| matches!(c, DrawCmd::Rect(_))),
+            "every band is a rect quad"
+        );
+    }
+
+    /// A `DisplayItem::Shadow` lowers to a single softened, offset quad — and a fully
+    /// transparent shadow emits nothing.
+    #[test]
+    fn shadow_lowers_to_one_softened_quad_or_nothing() {
+        let mut engine = TextEngine::new();
+        let visible = DisplayList {
+            items: vec![DisplayItem::Shadow {
+                rect: Rect {
+                    origin: Point { x: 10.0, y: 10.0 },
+                    size: Size { w: 20.0, h: 20.0 },
+                },
+                color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 200,
+                },
+                blur: 6.0,
+                offset: Point { x: 2.0, y: 4.0 },
+            }],
+        };
+        let cmds = lower(&visible, &mut engine);
+        assert_eq!(cmds.len(), 1, "a visible shadow is one quad");
+        match &cmds[0] {
+            DrawCmd::Rect(q) => {
+                // Offset applied: the shadow's origin is the box origin + offset.
+                assert_eq!(q.origin, [12.0, 14.0], "shadow is offset behind the box");
+                // Softened: a blurred shadow's alpha is below the source alpha.
+                assert!(
+                    q.color[3] < 200.0 / 255.0,
+                    "blur softens (fades) the shadow alpha"
+                );
+                // Rounded by the blur radius.
+                assert!(q.radius > 0.0, "shadow corners are rounded by the blur");
+            }
+            _ => panic!("shadow lowers to a rect quad"),
+        }
+
+        // A fully transparent shadow draws nothing.
+        let invisible = DisplayList {
+            items: vec![DisplayItem::Shadow {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 10.0, h: 10.0 },
+                },
+                color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                },
+                blur: 2.0,
+                offset: Point { x: 0.0, y: 0.0 },
+            }],
+        };
+        assert!(
+            lower(&invisible, &mut engine).is_empty(),
+            "a transparent shadow emits no draw commands"
+        );
     }
 
     #[test]

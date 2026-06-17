@@ -232,8 +232,95 @@ pub struct ShapedGlyphs {
     pub glyphs: Vec<Glyph>,
 }
 
+/// The axis a [`DisplayItem::Gradient`] interpolates along.
+///
+/// Mirrors [`GradientAxis`] but is named distinctly for the display-list seam; the
+/// two common orthogonal CSS directions are all a renderer ever has to fill along
+/// (see [`GradientAxis`] for how off-axis angles are snapped before they reach here).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GradientDirection {
+    /// Top → bottom: the first stop is at the top edge, the last at the bottom.
+    #[default]
+    Vertical,
+    /// Left → right: the first stop is at the left edge, the last at the right.
+    Horizontal,
+}
+
+/// The maximum number of color stops a [`DisplayItem::Gradient`] carries.
+///
+/// The display-list gradient is a fixed-size, `Copy`-friendly stand-in for a CSS
+/// `linear-gradient`: it holds up to this many stops inline (no heap), so the whole
+/// item stays plain-data and the `no_std` tiers can lower and degrade it without an
+/// allocator. A CSS gradient with more stops is truncated to the first
+/// `MAX_GRADIENT_STOPS`; one with fewer leaves the tail of [`GradientStops::stops`]
+/// unused (the [`GradientStops::len`] count is authoritative).
+pub const MAX_GRADIENT_STOPS: usize = 8;
+
+/// One color stop of a [`DisplayItem::Gradient`]: a color at a normalized
+/// `position` along the gradient axis.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct GradientStop {
+    /// The stop's color.
+    pub color: Color,
+    /// Position along the axis in `[0.0, 1.0]` (`0.0` = start edge, `1.0` = end).
+    pub position: f32,
+}
+
+/// A small, fixed-capacity, inline set of gradient color stops.
+///
+/// Carries up to [`MAX_GRADIENT_STOPS`] stops in an inline array so a
+/// [`DisplayItem::Gradient`] stays `Copy` plain-data with no heap — the constrained
+/// `no_std` tiers can hold and degrade it without an allocator. Only the first
+/// [`len`](Self::len) entries of [`stops`](Self::stops) are meaningful; the rest are
+/// `Default` padding. Build one with [`from_slice`](Self::from_slice), which clamps
+/// to the capacity.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct GradientStops {
+    /// The stop storage; only the first [`len`](Self::len) are meaningful.
+    pub stops: [GradientStop; MAX_GRADIENT_STOPS],
+    /// How many entries of [`stops`](Self::stops) are in use (`<= MAX_GRADIENT_STOPS`).
+    pub len: u8,
+}
+
+impl GradientStops {
+    /// Build from a slice of stops, copying at most [`MAX_GRADIENT_STOPS`] of them
+    /// (a longer slice is truncated to the first `MAX_GRADIENT_STOPS`).
+    #[must_use]
+    pub fn from_slice(src: &[GradientStop]) -> Self {
+        let mut stops = [GradientStop::default(); MAX_GRADIENT_STOPS];
+        let n = src.len().min(MAX_GRADIENT_STOPS);
+        stops[..n].copy_from_slice(&src[..n]);
+        Self {
+            stops,
+            len: n as u8,
+        }
+    }
+
+    /// The meaningful stops (the first [`len`](Self::len) entries).
+    #[must_use]
+    pub fn as_slice(&self) -> &[GradientStop] {
+        &self.stops[..self.len as usize]
+    }
+
+    /// The first stop's color, or transparent black if the set is empty. Useful as
+    /// the degraded solid fill for a renderer that does not interpolate gradients.
+    #[must_use]
+    pub fn first_color(&self) -> Color {
+        self.as_slice()
+            .first()
+            .map_or(Color::default(), |s| s.color)
+    }
+}
+
 /// One drawable primitive in a resolved display list.
+///
+/// `#[non_exhaustive]` so adding a new primitive (the way [`Border`](Self::Border),
+/// [`Gradient`](Self::Gradient), and [`Shadow`](Self::Shadow) were added) is not a
+/// breaking change for an out-of-tree [`Renderer`]: external `match`es must carry a
+/// wildcard arm, and a renderer that does not yet understand a primitive simply
+/// skips it. In-tree renderers handle every variant explicitly.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum DisplayItem {
     /// A filled rectangle.
     Rect {
@@ -291,6 +378,60 @@ pub enum DisplayItem {
         /// renderer offsets the run's start x by `(box_w - run_width) * align`,
         /// clamped to `>= 0` so a box narrower than the run never pushes ink left.
         align: f32,
+    },
+    /// A **stroked rounded rectangle** — an element's border frame.
+    ///
+    /// The stroke is drawn *inside* `rect` (the border-box), `width` logical px
+    /// thick, in `color`, with the corners rounded to `radius` (the same clamp the
+    /// fill primitive uses: `radius` is pinned to half the rect's shorter side). It
+    /// is a frame, not a fill: only the `width`-thick band around the perimeter is
+    /// painted, leaving the interior untouched. A renderer that does not draw frames
+    /// may skip this item (it is purely decorative); the CPU tiers stroke it as a
+    /// degraded set of edge fills.
+    Border {
+        /// The border-box to frame.
+        rect: Rect,
+        /// Stroke color.
+        color: Color,
+        /// Stroke thickness in logical px; `0.0` draws nothing.
+        width: f32,
+        /// Corner radius in logical px (clamped to half the shorter side); `0.0` =
+        /// square corners.
+        radius: f32,
+    },
+    /// A **gradient-filled rectangle**: `rect` filled by interpolating `stops` along
+    /// `direction`.
+    ///
+    /// The display-list analog of a CSS `linear-gradient` background. `stops` is a
+    /// small inline set (up to [`MAX_GRADIENT_STOPS`]) carried by value, so the item
+    /// stays plain-data for the `no_std` tiers. A renderer that interpolates fills
+    /// `rect` by blending the stops across `direction`; one that does not (the CPU
+    /// tiers) degrades to a **solid fill** of the first stop's color (see
+    /// [`GradientStops::first_color`]) so the box is still painted.
+    Gradient {
+        /// The box to fill.
+        rect: Rect,
+        /// The color stops, in axis order (first = start edge, last = end edge).
+        stops: GradientStops,
+        /// The axis the gradient interpolates along.
+        direction: GradientDirection,
+    },
+    /// A **drop shadow**: a soft rectangle behind an element's box.
+    ///
+    /// The display-list analog of an outset CSS `box-shadow`. The shadow is a `rect`
+    /// the size of the element's border-box, translated by `offset` and feathered by
+    /// `blur` logical px, painted in `color`. A capable renderer blurs it; a renderer
+    /// that does not support soft shadows (the CPU tiers) may treat this as a no-op —
+    /// dropping the shadow is a faithful degradation that never panics.
+    Shadow {
+        /// The element box the shadow falls behind (before `offset` is applied).
+        rect: Rect,
+        /// Shadow color (typically translucent).
+        color: Color,
+        /// Blur radius in logical px (`0.0` = a hard-edged offset rect).
+        blur: f32,
+        /// Offset of the shadow from the box (positive `x` = right, `y` = down).
+        offset: Point,
     },
 }
 
@@ -474,5 +615,123 @@ mod tests {
         use alloc::format;
         assert_eq!(format!("{}", HostError::BadHandle), "bad node handle");
         assert_eq!(format!("{}", TransportError::Closed), "transport closed");
+    }
+
+    /// `GradientStops::from_slice` copies up to the capacity, tracks `len`, and
+    /// truncates an over-long slice to the first `MAX_GRADIENT_STOPS`.
+    #[test]
+    fn gradient_stops_pack_and_truncate() {
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let blue = Color {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+        let two = [
+            GradientStop {
+                color: red,
+                position: 0.0,
+            },
+            GradientStop {
+                color: blue,
+                position: 1.0,
+            },
+        ];
+        let g = GradientStops::from_slice(&two);
+        assert_eq!(g.len, 2);
+        assert_eq!(g.as_slice().len(), 2);
+        // The first stop's color is the degraded solid fill the CPU tiers use.
+        assert_eq!(g.first_color(), red);
+        assert_eq!(g.as_slice()[1].color, blue);
+
+        // An over-long slice truncates to the inline capacity, never panicking.
+        let many = [GradientStop {
+            color: red,
+            position: 0.5,
+        }; MAX_GRADIENT_STOPS + 4];
+        let clamped = GradientStops::from_slice(&many);
+        assert_eq!(clamped.len as usize, MAX_GRADIENT_STOPS);
+        assert_eq!(clamped.as_slice().len(), MAX_GRADIENT_STOPS);
+
+        // An empty set degrades to transparent black (never indexes out of bounds).
+        assert_eq!(GradientStops::default().first_color(), Color::default());
+    }
+
+    /// The enriched primitives are plain-data: a `Border`, a `Gradient`, and a
+    /// `Shadow` can be built and pushed into a `DisplayList` (clone-able, holds its
+    /// data). This is the compile + smoke proof for the new variants.
+    #[test]
+    fn enriched_display_items_carry_their_data() {
+        let frame = Color {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 255,
+        };
+        let rect = Rect {
+            origin: Point { x: 1.0, y: 2.0 },
+            size: Size { w: 8.0, h: 6.0 },
+        };
+        let list = DisplayList {
+            items: alloc::vec![
+                DisplayItem::Border {
+                    rect,
+                    color: frame,
+                    width: 2.0,
+                    radius: 3.0,
+                },
+                DisplayItem::Gradient {
+                    rect,
+                    stops: GradientStops::from_slice(&[
+                        GradientStop {
+                            color: frame,
+                            position: 0.0,
+                        },
+                        GradientStop {
+                            color: Color::default(),
+                            position: 1.0,
+                        },
+                    ]),
+                    direction: GradientDirection::Horizontal,
+                },
+                DisplayItem::Shadow {
+                    rect,
+                    color: frame,
+                    blur: 4.0,
+                    offset: Point { x: 0.0, y: 2.0 },
+                },
+            ],
+        };
+        assert_eq!(list.items.len(), 3);
+        // Each variant round-trips its fields through a match.
+        match &list.clone().items[0] {
+            DisplayItem::Border { width, radius, .. } => {
+                assert_eq!(*width, 2.0);
+                assert_eq!(*radius, 3.0);
+            }
+            _ => panic!("first item is a Border"),
+        }
+        match &list.items[1] {
+            DisplayItem::Gradient {
+                stops, direction, ..
+            } => {
+                assert_eq!(stops.len, 2);
+                assert_eq!(*direction, GradientDirection::Horizontal);
+            }
+            _ => panic!("second item is a Gradient"),
+        }
+        match &list.items[2] {
+            DisplayItem::Shadow { blur, offset, .. } => {
+                assert_eq!(*blur, 4.0);
+                assert_eq!(offset.y, 2.0);
+            }
+            _ => panic!("third item is a Shadow"),
+        }
     }
 }

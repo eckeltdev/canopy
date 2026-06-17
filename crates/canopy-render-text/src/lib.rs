@@ -199,8 +199,34 @@ pub fn paint_display_list(buffer: &mut Buffer, engine: &mut TextEngine, scene: &
                     *color,
                 );
             }
+            DisplayItem::Border {
+                rect,
+                color,
+                width,
+                radius,
+            } => {
+                // Reuse the software buffer's degraded edge-band stroke so the
+                // capable-tier frame matches the constrained tier's. The radius is
+                // accepted but not carved (square corners) on this CPU path.
+                buffer.stroke_rect(*rect, *color, *width, *radius);
+            }
+            DisplayItem::Gradient {
+                rect,
+                stops,
+                direction: _,
+            } => {
+                // Degraded fill: this CPU path does not interpolate, so fill the box
+                // with the first stop's solid color (transparent if the set is empty).
+                buffer.fill_rect(*rect, stops.first_color());
+            }
+            // A soft shadow needs a blur this path doesn't implement; dropping it is a
+            // faithful degradation (it is purely decorative) and never panics.
+            DisplayItem::Shadow { .. } => {}
             // Canopy's layout never emits pre-shaped glyph runs; nothing to do.
             DisplayItem::Glyphs { .. } => {}
+            // `DisplayItem` is `#[non_exhaustive]`: a future primitive lands in this
+            // forward-compat arm. Skip an unknown item rather than panic.
+            _ => {}
         }
     }
 }
@@ -584,5 +610,103 @@ mod tests {
             intermediate > 0,
             "Renderer impl must produce antialiased pixels too"
         );
+    }
+
+    /// A `DisplayItem::Border` strokes a frame on the capable tier: edge bands take
+    /// the border color, the interior keeps what was painted under it — and a
+    /// `DisplayItem::Gradient` degrades to a solid fill of its first stop. Both run
+    /// through `paint_display_list`, the capable-tier lowering entry point.
+    #[test]
+    fn paints_border_frame_and_degraded_gradient() {
+        use canopy_traits::{GradientDirection, GradientStop, GradientStops};
+        let bg = color(0, 0, 0);
+        let grad_first = color(0x20, 0x40, 0x60);
+        let frame = color(0xff, 0x00, 0x00);
+
+        let mut engine = TextEngine::new();
+        let mut buf = Buffer::new(24, 24);
+        buf.clear(bg);
+        let scene = DisplayList {
+            items: vec![
+                // A gradient fills the whole box: degrades to the first stop's solid.
+                DisplayItem::Gradient {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 24.0, h: 24.0 },
+                    },
+                    stops: GradientStops::from_slice(&[
+                        GradientStop {
+                            color: grad_first,
+                            position: 0.0,
+                        },
+                        GradientStop {
+                            color: color(0xa0, 0xc0, 0xe0),
+                            position: 1.0,
+                        },
+                    ]),
+                    direction: GradientDirection::Vertical,
+                },
+                // A 3px border frames it.
+                DisplayItem::Border {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 24.0, h: 24.0 },
+                    },
+                    color: frame,
+                    width: 3.0,
+                    radius: 0.0,
+                },
+            ],
+        };
+        paint_display_list(&mut buf, &mut engine, &scene);
+
+        let frame_px = [frame.r, frame.g, frame.b, frame.a];
+        let grad_px = [grad_first.r, grad_first.g, grad_first.b, grad_first.a];
+        // The frame band is the border color on all four edges.
+        assert_eq!(buf.pixel(0, 12), frame_px, "left edge is the border");
+        assert_eq!(buf.pixel(12, 0), frame_px, "top edge is the border");
+        // The interior shows the degraded gradient (the first stop's solid color),
+        // not the second stop and not a ramp.
+        assert_eq!(
+            buf.pixel(12, 12),
+            grad_px,
+            "interior is the first-stop solid fill"
+        );
+    }
+
+    /// A `DisplayItem::Shadow` is a no-op on the capable CPU path: it never panics and
+    /// leaves the buffer untouched.
+    #[test]
+    fn shadow_is_a_no_op_on_capable_cpu() {
+        let bg = color(3, 5, 7);
+        let mut engine = TextEngine::new();
+        let mut buf = Buffer::new(8, 8);
+        buf.clear(bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Shadow {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 8.0, h: 8.0 },
+                },
+                color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 128,
+                },
+                blur: 4.0,
+                offset: Point { x: 2.0, y: 2.0 },
+            }],
+        };
+        paint_display_list(&mut buf, &mut engine, &scene);
+        for y in 0..buf.height() {
+            for x in 0..buf.width() {
+                assert_eq!(
+                    buf.pixel(x, y),
+                    [bg.r, bg.g, bg.b, bg.a],
+                    "shadow must leave ({x},{y}) untouched"
+                );
+            }
+        }
     }
 }

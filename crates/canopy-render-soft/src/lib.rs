@@ -232,6 +232,67 @@ impl Buffer {
         }
     }
 
+    /// Stroke a `width`-thick frame **inside** `rect` in `c`, src-over blended,
+    /// clipped to the buffer.
+    ///
+    /// This is the CPU tier's degraded [`DisplayItem::Border`] rasterization: the
+    /// four edge bands (top, bottom, left, right) are filled as solid rectangles so
+    /// the box reads as framed. A non-positive `width` paints nothing; `width` is
+    /// clamped to half the rect's shorter side so the bands never overlap into a
+    /// solid fill. `radius` is accepted for signature parity with the rounded fill
+    /// but **not** carved here — the corners stay square, a faithful approximation
+    /// (the GPU tier draws true rounded strokes). Each band reuses
+    /// [`fill_rect`](Buffer::fill_rect), so a translucent border color blends.
+    pub fn stroke_rect(&mut self, rect: Rect, c: Color, width: f32, radius: f32) {
+        let _ = radius; // square-cornered approximation on the CPU tier.
+        if width <= 0.0 {
+            return;
+        }
+        // Clamp the stroke to half the shorter side so opposite bands can't overlap.
+        let w = width.min(0.5 * rect.size.w.min(rect.size.h));
+        if w <= 0.0 {
+            return;
+        }
+        let Rect { origin, size } = rect;
+        // Top and bottom bands span the full width; left/right fill the gap between
+        // them, so no corner pixel is painted twice.
+        let top = Rect {
+            origin,
+            size: Size { w: size.w, h: w },
+        };
+        let bottom = Rect {
+            origin: Point {
+                x: origin.x,
+                y: origin.y + size.h - w,
+            },
+            size: Size { w: size.w, h: w },
+        };
+        let left = Rect {
+            origin: Point {
+                x: origin.x,
+                y: origin.y + w,
+            },
+            size: Size {
+                w,
+                h: size.h - 2.0 * w,
+            },
+        };
+        let right = Rect {
+            origin: Point {
+                x: origin.x + size.w - w,
+                y: origin.y + w,
+            },
+            size: Size {
+                w,
+                h: size.h - 2.0 * w,
+            },
+        };
+        self.fill_rect(top, c);
+        self.fill_rect(bottom, c);
+        self.fill_rect(left, c);
+        self.fill_rect(right, c);
+    }
+
     /// Paint one opaque pixel, clipped to the buffer.
     fn put_pixel(&mut self, x: usize, y: usize, c: Color) {
         if x >= self.width || y >= self.height {
@@ -357,8 +418,36 @@ impl Renderer for SoftwareRenderer {
                     };
                     self.buffer.blit_text(origin, text, *color, *size)
                 }
+                DisplayItem::Border {
+                    rect,
+                    color,
+                    width,
+                    radius,
+                } => {
+                    // Degraded frame: stroke the four edge bands. The CPU tier has no
+                    // rounded-corner stroke, so a positive radius is not carved (the
+                    // corners stay square) — a faithful, never-panicking approximation.
+                    self.buffer.stroke_rect(*rect, *color, *width, *radius);
+                }
+                DisplayItem::Gradient {
+                    rect,
+                    stops,
+                    direction: _,
+                } => {
+                    // Degraded fill: the CPU tier does not interpolate, so fill the box
+                    // with the first stop's solid color (transparent if the set is
+                    // empty). The direction is irrelevant to a flat fill.
+                    self.buffer.fill_rect(*rect, stops.first_color());
+                }
+                // A soft shadow needs a blur the CPU tier doesn't implement; dropping
+                // it is a faithful degradation (it is purely decorative) and never panics.
+                DisplayItem::Shadow { .. } => {}
                 // Shaped-glyph rasterization arrives with the capable-tier text backend.
                 DisplayItem::Glyphs { .. } => {}
+                // `DisplayItem` is `#[non_exhaustive]`: a future primitive added to
+                // the seam reaches this out-of-tree-style arm. Skipping an unknown
+                // item is the safe degradation — paint nothing rather than panic.
+                _ => {}
             }
         }
         Ok(())
@@ -795,5 +884,142 @@ mod tests {
             [fill.r, fill.g, fill.b, fill.a],
             "mid-edge on circle"
         );
+    }
+
+    /// THE degraded-border proof: a `DisplayItem::Border` strokes a frame — the
+    /// edge bands take the border color while the interior keeps the background, so
+    /// the box reads as framed, not filled.
+    #[test]
+    fn border_strokes_a_frame_keeps_interior() {
+        let bg = Color {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+            a: 255,
+        };
+        let frame = Color {
+            r: 0xff,
+            g: 0x00,
+            b: 0x00,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(20, 20, bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Border {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 20.0, h: 20.0 },
+                },
+                color: frame,
+                width: 3.0,
+                radius: 0.0,
+            }],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let frame_px = [frame.r, frame.g, frame.b, frame.a];
+        let bg_px = [bg.r, bg.g, bg.b, bg.a];
+        // Edge pixels (within the 3px band) are the frame color.
+        assert_eq!(buf.pixel(0, 10), frame_px, "left edge is the border");
+        assert_eq!(buf.pixel(19, 10), frame_px, "right edge is the border");
+        assert_eq!(buf.pixel(10, 0), frame_px, "top edge is the border");
+        assert_eq!(buf.pixel(10, 19), frame_px, "bottom edge is the border");
+        // The interior (well inside the 3px band) keeps the background — a frame,
+        // not a fill.
+        assert_eq!(buf.pixel(10, 10), bg_px, "interior stays background");
+    }
+
+    /// A `DisplayItem::Gradient` degrades to a **solid fill of the first stop's
+    /// color** on the CPU tier (no interpolation), so the whole box is painted with
+    /// that color regardless of the gradient direction.
+    #[test]
+    fn gradient_degrades_to_first_stop_solid_fill() {
+        use canopy_traits::{GradientDirection, GradientStop, GradientStops};
+        let bg = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let first = Color {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+            a: 255,
+        };
+        let last = Color {
+            r: 0xab,
+            g: 0xcd,
+            b: 0xef,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(16, 16, bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Gradient {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 16.0, h: 16.0 },
+                },
+                stops: GradientStops::from_slice(&[
+                    GradientStop {
+                        color: first,
+                        position: 0.0,
+                    },
+                    GradientStop {
+                        color: last,
+                        position: 1.0,
+                    },
+                ]),
+                direction: GradientDirection::Vertical,
+            }],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let first_px = [first.r, first.g, first.b, first.a];
+        // Every probed pixel is the first stop's color — a flat fill, not a ramp.
+        assert_eq!(buf.pixel(0, 0), first_px, "top is the first stop");
+        assert_eq!(buf.pixel(8, 8), first_px, "center is the first stop");
+        assert_eq!(buf.pixel(15, 15), first_px, "bottom is the first stop");
+    }
+
+    /// A `DisplayItem::Shadow` is a no-op on the CPU tier: it never panics and leaves
+    /// the background untouched (a faithful degradation of a soft shadow).
+    #[test]
+    fn shadow_is_a_no_op_on_cpu() {
+        let bg = Color {
+            r: 7,
+            g: 8,
+            b: 9,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(8, 8, bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Shadow {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { w: 8.0, h: 8.0 },
+                },
+                color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 128,
+                },
+                blur: 4.0,
+                offset: Point { x: 2.0, y: 2.0 },
+            }],
+        };
+        r.render(&scene).unwrap();
+        // The whole surface is still the clear background — the shadow drew nothing.
+        let buf = r.buffer();
+        for y in 0..buf.height() {
+            for x in 0..buf.width() {
+                assert_eq!(
+                    buf.pixel(x, y),
+                    [bg.r, bg.g, bg.b, bg.a],
+                    "shadow must leave ({x},{y}) untouched"
+                );
+            }
+        }
     }
 }

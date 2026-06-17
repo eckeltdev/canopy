@@ -12,11 +12,16 @@
 //!
 //! Walking [`StyloEngine::element_dfs_order`] (pre-order, parent-before-child, the
 //! correct back-to-front order for opaque backgrounds), for each element it emits, in
-//! this order:
+//! this back-to-front order:
 //!
-//! * a [`DisplayItem::Rect`] for a **non-transparent background** (`background.a > 0`),
-//!   carrying the element's `border_radius` as the corner radius — same as the Taffy
-//!   path's per-element background fill; and
+//! * a [`DisplayItem::Shadow`] **behind the box** when the element has a `box_shadow`,
+//!   so it composites under the fill;
+//! * the background fill — a [`DisplayItem::Gradient`] when the element has a
+//!   `gradient` (the more specific paint), otherwise a [`DisplayItem::Rect`] for a
+//!   **non-transparent background** (`background.a > 0`), carrying the element's
+//!   `border_radius` as the corner radius;
+//! * a [`DisplayItem::Border`] frame **on top of the fill** when the element has a
+//!   visible border (`border_width > 0` and a non-transparent border color); and
 //! * a [`DisplayItem::Text`] for an element with **direct text** (a leaf whose only
 //!   children are text), at the box origin, in the element's resolved foreground
 //!   `color` at its `font_size`, sized to the box width with left alignment.
@@ -26,12 +31,15 @@
 //! lowers to translucent primitives the renderer blends. At full opacity (the common
 //! case) the bytes are unchanged.
 //!
-//! Borders are intentionally *not* lowered here: the [`DisplayItem`] vocabulary has no
-//! frame primitive (the Taffy path emits no borders either), so this matches the
-//! constrained scene exactly. The CPU [`crate::paint`] path, which owns its own
-//! rasterizer, still draws borders.
+//! The border, gradient, and shadow primitives are now part of the [`DisplayItem`]
+//! vocabulary, so the GPU `canopy-render-vello` path draws a true framed, gradient-
+//! filled, shadowed box from this list; the constrained CPU renderers degrade those
+//! primitives (a stroked-edge frame, a first-stop solid fill, a dropped shadow).
 
-use canopy_traits::{Color, DisplayItem, DisplayList, Size};
+use canopy_traits::{
+    Color, DisplayItem, DisplayList, GradientAxis, GradientDirection, GradientStop, GradientStops,
+    Point, Size,
+};
 
 use crate::{NodeKind, StyloEngine};
 
@@ -82,16 +90,63 @@ impl StyloEngine {
                 continue;
             };
             let opacity = style.opacity;
+            let radius = style.border_radius.max(0.0);
 
-            // Background: emit a filled (optionally rounded) rect only when the
-            // background is non-transparent, faded by the element's opacity. This is
-            // the per-element fill the Taffy path emits; borders have no display-item
-            // primitive, so they are not lowered here.
-            if style.background.a > 0 {
+            // Shadow (behind everything): emit first so it composites *under* the
+            // box. The seam's reduced `box_shadow` carries an offset, blur, and color;
+            // fade the color by opacity like every other painted color.
+            if let Some(shadow) = style.box_shadow {
+                items.push(DisplayItem::Shadow {
+                    rect,
+                    color: fade(shadow.color, opacity),
+                    blur: shadow.blur,
+                    offset: Point {
+                        x: shadow.dx,
+                        y: shadow.dy,
+                    },
+                });
+            }
+
+            // Background fill. A `gradient` is the more specific paint and replaces the
+            // flat background; otherwise the non-transparent flat `background` fills.
+            // Both are faded by the element's opacity.
+            if let Some(grad) = style.gradient {
+                items.push(DisplayItem::Gradient {
+                    rect,
+                    stops: GradientStops::from_slice(&[
+                        GradientStop {
+                            color: fade(grad.start, opacity),
+                            position: 0.0,
+                        },
+                        GradientStop {
+                            color: fade(grad.end, opacity),
+                            position: 1.0,
+                        },
+                    ]),
+                    direction: match grad.axis {
+                        GradientAxis::Vertical => GradientDirection::Vertical,
+                        GradientAxis::Horizontal => GradientDirection::Horizontal,
+                    },
+                });
+            } else if style.background.a > 0 {
                 items.push(DisplayItem::Rect {
                     rect,
                     color: fade(style.background, opacity),
-                    radius: style.border_radius.max(0.0),
+                    radius,
+                });
+            }
+
+            // Border frame (on top of the background): emit a stroked rounded rect
+            // when the element has a visible border (`border_width > 0` and a
+            // non-transparent color), faded by opacity. The Taffy path still has no
+            // border primitive, but the display-list vocabulary now does, so the
+            // GPU path can frame the box.
+            if style.border_width > 0.0 && style.border_color.a > 0 {
+                items.push(DisplayItem::Border {
+                    rect,
+                    color: fade(style.border_color, opacity),
+                    width: style.border_width,
+                    radius,
                 });
             }
 
@@ -287,5 +342,137 @@ mod tests {
         // 255 * 0.5 rounds to 128; RGB untouched (straight-alpha fade).
         assert_eq!(color.a, 128, "alpha is scaled to ~half by opacity");
         assert_eq!((color.r, color.g, color.b), (0x31, 0x32, 0x44));
+    }
+
+    /// A `border` lowers to a [`DisplayItem::Border`] frame carrying the resolved
+    /// width, color, and the element's corner radius.
+    #[test]
+    fn border_lowers_to_a_border_frame() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let card = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            card,
+            "width:40px;height:40px;border:2px solid #ff0000;border-radius:6px",
+        );
+
+        let scene = engine.build_display_list(Size { w: 100.0, h: 100.0 });
+        let (width, color, radius) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Border {
+                    width,
+                    color,
+                    radius,
+                    ..
+                } => Some((*width, *color, *radius)),
+                _ => None,
+            })
+            .expect("a Border frame was emitted");
+        assert_eq!(width, 2.0, "the border carries the resolved width");
+        assert_eq!(
+            (color.r, color.g, color.b, color.a),
+            (0xff, 0x00, 0x00, 0xff),
+            "the border carries the resolved red"
+        );
+        assert_eq!(
+            radius, 6.0,
+            "the border carries the element's corner radius"
+        );
+    }
+
+    /// A `linear-gradient` background lowers to a [`DisplayItem::Gradient`] with two
+    /// stops (the reduced start/end) and the matching axis direction, *replacing* the
+    /// flat background rect.
+    #[test]
+    fn linear_gradient_lowers_to_a_gradient_item() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let card = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            card,
+            "width:80px;height:80px;background:linear-gradient(to right, #ff0000, #0000ff)",
+        );
+
+        let scene = engine.build_display_list(Size { w: 120.0, h: 120.0 });
+        let (stops, direction) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Gradient {
+                    stops, direction, ..
+                } => Some((*stops, *direction)),
+                _ => None,
+            })
+            .expect("a Gradient item was emitted");
+        assert_eq!(
+            direction,
+            GradientDirection::Horizontal,
+            "to right -> horizontal"
+        );
+        let s = stops.as_slice();
+        assert_eq!(s.len(), 2, "the reduced gradient carries two stops");
+        assert_eq!(
+            (s[0].color.r, s[0].color.g, s[0].color.b),
+            (0xff, 0x00, 0x00),
+            "first stop is red"
+        );
+        assert_eq!(
+            (s[1].color.r, s[1].color.g, s[1].color.b),
+            (0x00, 0x00, 0xff),
+            "last stop is blue"
+        );
+        // The gradient replaces the flat background: no opaque background Rect remains.
+        assert!(
+            !scene
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Rect { color, .. } if color.a == 255)),
+            "the gradient replaces the flat background rect"
+        );
+    }
+
+    /// A `box-shadow` lowers to a [`DisplayItem::Shadow`] emitted **before** the
+    /// background fill (so it composites behind the box), carrying the offset, blur,
+    /// and color.
+    #[test]
+    fn box_shadow_lowers_to_a_shadow_behind_the_box() {
+        let mut engine = StyloEngine::new("");
+        let doc = engine.document_mut();
+        let html = doc.add_element(0, "html", None, &[]);
+        let card = doc.add_element(html, "div", None, &[]);
+        engine.document_mut().set_inline_style(
+            card,
+            "width:40px;height:40px;background:#313244;box-shadow:4px 6px 8px #000000",
+        );
+
+        let scene = engine.build_display_list(Size { w: 100.0, h: 100.0 });
+        // The shadow exists and carries the offset + blur.
+        let shadow_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Shadow { .. }))
+            .expect("a Shadow item was emitted");
+        if let DisplayItem::Shadow { blur, offset, .. } = &scene.items[shadow_idx] {
+            assert_eq!(*blur, 8.0, "the shadow carries the blur radius");
+            assert_eq!(
+                (offset.x, offset.y),
+                (4.0, 6.0),
+                "the shadow carries the offset"
+            );
+        }
+        // The background rect for this box comes AFTER the shadow (drawn over it).
+        let bg_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { color, .. } if color.a == 255))
+            .expect("the box's background rect");
+        assert!(
+            shadow_idx < bg_idx,
+            "the shadow ({shadow_idx}) is emitted behind the background ({bg_idx})"
+        );
     }
 }
