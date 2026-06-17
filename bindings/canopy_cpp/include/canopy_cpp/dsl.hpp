@@ -48,6 +48,28 @@ namespace canopy {
         click_handler handler;
     };
 
+    // The element's CSS id (the host's reserved AttrId::ID slot).
+    struct id_attribute {
+        std::string value;
+    };
+
+    // An arbitrary host attribute (a host-minted AttrId) with a string value.
+    struct attribute {
+        std::uint16_t attr;
+        std::string value;
+    };
+
+    // An inline style declaration: a PropId (e.g. `wire::prop_bg`) with a string value.
+    struct inline_style {
+        std::uint16_t prop;
+        std::string value;
+    };
+
+    // An overriding tag name the host retains for tag/attribute selectors.
+    struct tag_name {
+        std::string name;
+    };
+
     // ---- concepts --------------------------------------------------------------------------
 
     namespace detail {
@@ -96,6 +118,22 @@ namespace canopy {
 
         inline void apply(build_context& ctx, node_id parent, const click_listener& listener) {
             ctx.add_listener(parent, listener.event, listener.handler);
+        }
+
+        inline void apply(build_context& ctx, node_id parent, const id_attribute& mod) {
+            ctx.set_attribute(parent, wire::attr_id, mod.value);
+        }
+
+        inline void apply(build_context& ctx, node_id parent, const attribute& mod) {
+            ctx.set_attribute(parent, mod.attr, mod.value);
+        }
+
+        inline void apply(build_context& ctx, node_id parent, const inline_style& mod) {
+            ctx.set_inline_style(parent, mod.prop, mod.value);
+        }
+
+        inline void apply(build_context& ctx, node_id parent, const tag_name& mod) {
+            ctx.set_tag_name(parent, mod.name);
         }
 
         template <Component C> void apply(build_context& ctx, node_id parent, const C& comp) {
@@ -170,6 +208,26 @@ namespace canopy {
     }
 
     inline auto cls(std::string_view name) -> class_modifier {
+        return {.name = std::string(name)};
+    }
+
+    // The element's CSS id (`id("main")` -> SetAttribute on the reserved id slot).
+    inline auto id(std::string_view value) -> id_attribute {
+        return {.value = std::string(value)};
+    }
+
+    // An arbitrary attribute (`attr(some_attr_id, "v")` -> SetAttribute).
+    inline auto attr(std::uint16_t kind, std::string_view value) -> attribute {
+        return {.attr = kind, .value = std::string(value)};
+    }
+
+    // An inline style (`style(wire::prop_bg, "#fff")` -> SetInlineStyle).
+    inline auto style(std::uint16_t prop, std::string_view value) -> inline_style {
+        return {.prop = prop, .value = std::string(value)};
+    }
+
+    // An overriding tag name (`tag("section")` -> SetTagName).
+    inline auto tag(std::string_view name) -> tag_name {
         return {.name = std::string(name)};
     }
 

@@ -43,6 +43,15 @@ namespace canopy::wire {
     inline constexpr std::uint16_t prop_fg = CANOPY_PROP_FG;
     inline constexpr std::uint16_t prop_width = CANOPY_PROP_WIDTH;
     inline constexpr std::uint16_t prop_height = CANOPY_PROP_HEIGHT;
+    inline constexpr std::uint16_t prop_gap = CANOPY_PROP_GAP;
     inline constexpr std::uint16_t prop_padding = CANOPY_PROP_PADDING;
+    inline constexpr std::uint16_t prop_direction = CANOPY_PROP_DIRECTION;
+    inline constexpr std::uint16_t prop_radius = CANOPY_PROP_RADIUS;
+    inline constexpr std::uint16_t prop_opacity = CANOPY_PROP_OPACITY;
+    inline constexpr std::uint16_t prop_translate_x = CANOPY_PROP_TRANSLATE_X;
+    inline constexpr std::uint16_t prop_translate_y = CANOPY_PROP_TRANSLATE_Y;
+    inline constexpr std::uint16_t prop_align = CANOPY_PROP_ALIGN;
+    inline constexpr std::uint16_t prop_justify = CANOPY_PROP_JUSTIFY;
+    inline constexpr std::uint16_t prop_text_align = CANOPY_PROP_TEXT_ALIGN;
 
 } // namespace canopy::wire

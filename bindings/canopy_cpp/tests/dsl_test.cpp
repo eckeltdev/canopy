@@ -240,6 +240,47 @@ namespace {
         return true;
     }
 
+    // id/tag/style/attr modifiers are exact sugar over the build_context setters, applied in
+    // source order.
+    bool id_tag_style_attr_modifiers_match_raw() {
+        canopy::build_context dsl;
+        canopy::mount(dsl, canopy::div(canopy::id("main"), canopy::tag("section"),
+                                       canopy::style(canopy::wire::prop_bg, "#fff"),
+                                       canopy::attr(2, "v"), "hi"));
+
+        canopy::build_context raw;
+        const canopy::node_id col = raw.create_element(canopy::wire::el_column);
+        raw.set_attribute(col, canopy::wire::attr_id, "main");
+        raw.set_tag_name(col, "section");
+        raw.set_inline_style(col, canopy::wire::prop_bg, "#fff");
+        raw.set_attribute(col, 2, "v");
+        raw.append(col, raw.create_text("hi"));
+        raw.append(canopy::root, col);
+
+        return same(dsl.take_batch(0), raw.take_batch(0), "id/tag/style/attr modifiers");
+    }
+
+    // Independent byte anchor for the SetAttribute + SetInlineStyle ops (not pinned elsewhere),
+    // including their intern order. div(id("a"), style(prop_bg, "b")).
+    bool id_and_style_tree_is_byte_exact() {
+        canopy::build_context ctx;
+        canopy::mount(ctx, canopy::div(canopy::id("a"), canopy::style(canopy::wire::prop_bg, "b")));
+        const bytes want = {
+            0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,                   // BeginBatch v1 seq0
+            0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, // CreateElement n1 COLUMN
+            0x1b, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x61, // InternString s0 "a"
+            0x15, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00,                                                       // SetAttribute n1 attr=1 s0
+            0x1b, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x62, // InternString s1 "b"
+            0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0x00,                                                       // SetInlineStyle n1 prop=1 s1
+            0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // InsertBefore(root,n1,NULL)
+            0x02,                                                       // EndBatch
+        };
+        return same(ctx.take_batch(0), want, "id+style tree byte-exact");
+    }
+
 } // namespace
 
 int main() {
@@ -257,6 +298,8 @@ int main() {
         on_click_emits_add_listener_on_the_right_node(),
         handlers_route_to_their_own_closures(),
         a_callable_less_listener_does_not_misroute_ids(),
+        id_tag_style_attr_modifiers_match_raw(),
+        id_and_style_tree_is_byte_exact(),
     };
     for (const bool passed : results) {
         if (!passed) {

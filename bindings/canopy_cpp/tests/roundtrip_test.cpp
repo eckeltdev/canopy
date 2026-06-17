@@ -57,11 +57,34 @@ namespace {
         return true;
     }
 
+    // The id/style modifiers reach the real engine, and the host returns styles in ascending
+    // PropId order (a BTreeMap) regardless of the source order they were authored in — wire-byte
+    // order (source) is NOT the host-visible snapshot order.
+    bool modifiers_round_trip_in_host_sorted_order() {
+        canopy::build_context ctx;
+        // width (PropId 3) is authored BEFORE bg (PropId 1); the host re-sorts by id.
+        canopy::mount(ctx, canopy::div(canopy::id("main"),
+                                       canopy::style(canopy::wire::prop_width, "10"),
+                                       canopy::style(canopy::wire::prop_bg, "#fff")));
+
+        const std::string got = snapshot_of(ctx.take_batch(0));
+        const std::string want = "el tag=1 style=1:#fff;3:10 attr=1:main\n";
+        if (got != want) {
+            std::cerr << "FAIL: modifiers round-trip\n--- got ---\n"
+                      << got << "--- want ---\n"
+                      << want;
+            return false;
+        }
+        return true;
+    }
+
 } // namespace
 
 int main() {
-    if (dsl_tree_round_trips_through_the_real_engine()) {
-        std::cerr << "ok: DSL tree round-trips through the real engine\n";
+    const bool all_passed =
+        dsl_tree_round_trips_through_the_real_engine() && modifiers_round_trip_in_host_sorted_order();
+    if (all_passed) {
+        std::cerr << "ok: DSL trees round-trip through the real engine\n";
         return 0;
     }
     return 1;
