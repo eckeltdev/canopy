@@ -146,8 +146,10 @@ version = "0.0.0"
 name = "canopy-style-css"
 version = "0.0.0"
 dependencies = [
+ "canopy-dom",
  "canopy-paint",
  "canopy-protocol",
+ "canopy-traits",
  "canopy-view",
 ]
 

@@ -1,35 +1,36 @@
 //! **The tiered StyleEngine, proven end to end.**
 //!
-//! One Canopy UI tree, authored *once* with the [`Ui`] layer ([`build_app`]), is styled
-//! two ways — and the difference is the whole thesis of the project:
+//! One Canopy UI tree, authored *once* with the [`Ui`] layer ([`build_app`]) in
+//! identity-carrying mode ([`Ui::capable`]), so the retained [`Dom`] carries real element
+//! identity (tag-name / class / id). That single Dom is then cascaded **two ways**, by two
+//! different host engines bound behind the *same* [`StyleEngine`](canopy_traits::StyleEngine)
+//! trait:
 //!
-//! - **Lite tier** ([`Ui::with_css`]): the constrained-tier engine ([`canopy_style_css`])
-//!   expands class rules to inline styles *author-side*. Its language is flat — class →
-//!   declarations, no combinators, no inheritance. The op-batch it produces carries the
-//!   resolved styles, so the [`Dom`] ends up with inline `background`/`color` per node.
+//! - **Lite tier** — [`canopy_style_css::LiteEngine`]: the constrained-tier resolver. Its
+//!   language is the flat class subset — class → declarations, no combinators, no
+//!   selector-driven inheritance. `no_std`, embeddable.
+//! - **Capable tier** — `StyloEngine` ([`canopy_style_stylo`]): the full **Servo-Stylo**
+//!   cascade — inheritance, specificity, and **descendant combinators**.
 //!
-//! - **Capable tier** ([`Ui::capable`]): the authored tree carries *real element identity*
-//!   (tag-name / class / id) to the host. The host then runs the full **Servo-Stylo**
-//!   cascade ([`canopy_style_stylo`]) over the *actual* retained [`Dom`] via
-//!   [`StyloEngine::from_dom`] — inheritance, specificity, and **descendant combinators**.
-//!
-//! Same tree, same authoring code; swap the engine. The headline contrast is a single
-//! rule — `.card .title { color: gold }` — that the lite language *cannot represent*: the
-//! `.title` nested inside `.card` resolves gold under Stylo and plain under lite. Both
-//! tiers are rasterized by the *same* CPU renderer, so the only variable is the cascade.
+//! The unification is literal: both tiers resolve through the one
+//! [`resolve_tree`]`(&mut dyn StyleEngine, &dom)` call — that shared call site *is* the
+//! tiered seam, and the only thing that varies is which engine is plugged in. The headline
+//! contrast is a single rule — `.card .title { color: gold }` — that the lite language
+//! *cannot represent*: the `.title` nested inside `.card` resolves gold under Stylo and
+//! plain under lite. Both tiers are rasterized by the *same* CPU renderer, so the only
+//! variable is the cascade.
 //!
 //! Run: `cargo run` → writes `capable-lite.ppm` + `capable-stylo.ppm` and prints the
 //! resolved-color contrast to the terminal.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use canopy_dom::Dom;
-use canopy_paint::{BG, FG, PADDING};
 use canopy_protocol::NodeId;
 use canopy_render_soft::Buffer;
 use canopy_style_stylo::StyloEngine;
-use canopy_traits::{Color, ComputedStyle, OpSink, Point, Rect, Size, StyleEngine};
-use canopy_ui::{Classes, Ui};
+use canopy_traits::{Color, ComputedStyle, OpSink, Point, Rect, Size};
+use canopy_ui::prelude::{resolve_tree, Classes, LiteEngine, Ui};
 
 /// Logical canvas size for each tier's PPM.
 const VIEW_W: usize = 380;
@@ -82,10 +83,11 @@ struct Authored {
     nested_title: NodeId,
 }
 
-/// Author the demo tree **once**. Identical for both tiers: the lite tier resolves the
-/// classes to inline styles here; the capable tier records `tag`/`class` as identity to
-/// carry to the host. Because both start from a fresh `App`, the handle ids match across
-/// tiers, so a single contrast table lines up by node.
+/// Author the demo tree **once**. Identical for both tiers: both author in
+/// identity-carrying mode (`Ui::capable`), so the Dom records each node's `tag`/`class`
+/// identity for the host engine to cascade — only the engine and CSS differ. Because
+/// both start from a fresh `App`, the handle ids match across tiers, so a single contrast
+/// table lines up by node.
 fn build_app(ui: &Ui) -> Authored {
     let mut items = Vec::new();
 
@@ -124,7 +126,7 @@ fn build_app(ui: &Ui) -> Authored {
 /// no children yet (filled in by [`set_kids`] once the tree is wired).
 fn container(ui: &Ui, items: &mut Vec<Item>, classes: Classes) -> NodeId {
     let el = ui.column();
-    ui.tag(el, "div"); // capable tier: real CSS local name; no-op on lite
+    ui.tag(el, "div"); // CSS local name carried to the host engine (both tiers author in capable mode)
     ui.class(el, classes);
     items.push(Item {
         node: el,
@@ -160,82 +162,42 @@ fn main() {
     let out = std::env::args().nth(1).unwrap_or_default();
     let dir = if out.is_empty() { "." } else { out.as_str() };
 
-    // ---- Lite tier: classes → inline styles author-side. -----------------------------
-    let lite = Ui::with_css(LITE_CSS);
+    // Both tiers resolve through the SAME `resolve_tree(&mut dyn StyleEngine, &dom)`
+    // helper — that single call site is the unified seam; only the engine differs.
+
+    // ---- Lite tier: the constrained-tier StyleEngine over the class subset. -----------
+    // Author in identity-carrying mode so the Dom carries class names for the host
+    // engine to cascade — the *same* shape the capable tier uses; only the engine and
+    // CSS differ.
+    let lite = Ui::capable(LITE_CSS);
     let authored = build_app(&lite);
     let mut ldom = Dom::new();
     ldom.apply(&lite.take_batch(0)).expect("apply lite ops");
-    let lite_styles: HashMap<NodeId, ComputedStyle> = authored
-        .items
-        .iter()
-        .map(|it| (it.node, lite_style(&ldom, it.node)))
-        .collect();
+    let mut lite_engine = LiteEngine::from_dom(&ldom, LITE_CSS);
+    let lite_styles = resolve_tree(&mut lite_engine, &ldom);
     let lite_buf = render_tier(&authored, &lite_styles);
     write_ppm(dir, "capable-lite.ppm", &lite_buf);
 
-    // ---- Capable tier: real Stylo cascade over the real Dom. -------------------------
+    // ---- Capable tier: the real Stylo cascade over the same real Dom. -----------------
     let cap = Ui::capable(CAPABLE_CSS);
     let authored = build_app(&cap); // identical tree → identical handle ids
     let mut cdom = Dom::new();
     cdom.apply(&cap.take_batch(0)).expect("apply capable ops");
-    let mut engine = StyloEngine::from_dom(&cdom, cap.css_source());
-    engine.resolve_styles();
-    let cap_styles: HashMap<NodeId, ComputedStyle> = authored
-        .items
-        .iter()
-        .map(|it| {
-            let s = engine
-                .resolve(it.node, None)
-                .expect("resolve over the real Dom");
-            (it.node, s)
-        })
-        .collect();
+    let mut stylo = StyloEngine::from_dom(&cdom, cap.css_source());
+    let cap_styles = resolve_tree(&mut stylo, &cdom);
     let cap_buf = render_tier(&authored, &cap_styles);
     write_ppm(dir, "capable-stylo.ppm", &cap_buf);
 
     print_contrast(&authored, &lite_styles, &cap_styles);
 }
 
-/// Synthesize a [`ComputedStyle`] for the **lite** tier by reading the inline styles the
-/// class engine resolved onto the [`Dom`] (background / color / padding). This is exactly
-/// what the lite render pipeline consumes — here distilled to the fields we paint.
-fn lite_style(dom: &Dom, node: NodeId) -> ComputedStyle {
-    let mut s = ComputedStyle::default();
-    if let Some(bg) = dom.style(node, BG).and_then(parse_hex) {
-        s.background = bg;
-    }
-    if let Some(fg) = dom.style(node, FG).and_then(parse_hex) {
-        s.color = fg;
-    }
-    if let Some(p) = dom
-        .style(node, PADDING)
-        .and_then(|v| v.trim().parse::<f32>().ok())
-    {
-        s.padding = p;
-    }
-    s
-}
-
-/// Parse a `#rrggbb` color (the format both tiers carry); `None` on anything else.
-fn parse_hex(s: &str) -> Option<Color> {
-    let hex = s.trim().strip_prefix('#')?;
-    if hex.len() != 6 {
-        return None;
-    }
-    Some(Color {
-        r: u8::from_str_radix(&hex[0..2], 16).ok()?,
-        g: u8::from_str_radix(&hex[2..4], 16).ok()?,
-        b: u8::from_str_radix(&hex[4..6], 16).ok()?,
-        a: 255,
-    })
-}
-
 /// Rasterize the authored tree into a fresh [`Buffer`], reading each node's style from
-/// `styles` (the only thing that differs between tiers).
-fn render_tier(app: &Authored, styles: &HashMap<NodeId, ComputedStyle>) -> Buffer {
+/// `styles` (the only thing that differs between tiers — both are produced by the same
+/// [`resolve_tree`] call over a `&mut dyn StyleEngine`).
+fn render_tier(app: &Authored, styles: &Styles) -> Buffer {
     let mut buf = Buffer::new(VIEW_W, VIEW_H);
     buf.clear(CLEAR);
-    let lookup: HashMap<NodeId, (&'static str, Vec<NodeId>)> = app
+    let lookup: Lookup = app
         .items
         .iter()
         .map(|it| (it.node, (it.label, it.kids.clone())))
@@ -254,7 +216,9 @@ fn render_tier(app: &Authored, styles: &HashMap<NodeId, ComputedStyle>) -> Buffe
 }
 
 type Lookup = HashMap<NodeId, (&'static str, Vec<NodeId>)>;
-type Styles = HashMap<NodeId, ComputedStyle>;
+/// Resolved styles keyed by node — a `BTreeMap` because that is what [`resolve_tree`]
+/// returns.
+type Styles = BTreeMap<NodeId, ComputedStyle>;
 
 /// A tiny block flow: a container stacks its children (inset by its padding) and paints
 /// its background behind them; a leaf paints its background band and draws its label in
@@ -392,22 +356,25 @@ mod tests {
     use super::*;
 
     /// Build both tiers over the same authored tree and return the nested `.title`'s
-    /// resolved foreground color under each.
+    /// resolved foreground color under each — both resolved through the *same*
+    /// `resolve_tree(&mut dyn StyleEngine, ..)` seam, so the test also exercises the
+    /// unified consume path.
     fn nested_title_colors() -> (Color, Color) {
         // Lite tier.
-        let lite = Ui::with_css(LITE_CSS);
+        let lite = Ui::capable(LITE_CSS);
         let a = build_app(&lite);
         let mut dom = Dom::new();
         dom.apply(&lite.take_batch(0)).unwrap();
-        let lite_color = lite_style(&dom, a.nested_title).color;
+        let mut lite_engine = LiteEngine::from_dom(&dom, LITE_CSS);
+        let lite_color = resolve_tree(&mut lite_engine, &dom)[&a.nested_title].color;
 
         // Capable tier (Stylo over the real Dom).
         let cap = Ui::capable(CAPABLE_CSS);
         let a2 = build_app(&cap);
         let mut cdom = Dom::new();
         cdom.apply(&cap.take_batch(0)).unwrap();
-        let mut engine = StyloEngine::from_dom(&cdom, cap.css_source());
-        let cap_color = engine.resolve(a2.nested_title, None).unwrap().color;
+        let mut stylo = StyloEngine::from_dom(&cdom, cap.css_source());
+        let cap_color = resolve_tree(&mut stylo, &cdom)[&a2.nested_title].color;
 
         (lite_color, cap_color)
     }
