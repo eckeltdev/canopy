@@ -1,0 +1,37 @@
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  misc-*,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -modernize-use-trailing-return-type,
+  -portability-avoid-pragma-once,
+  -bugprone-easily-swappable-parameters,
+  -readability-inconsistent-declaration-parameter-name
+
+# Only diagnose this unit's own C++ headers. canopy_platform.h is the pure-C ABI seam
+# (kept C-compatible for the Rust side), out of C++-tidy scope like canopy_protocol.h.
+HeaderFilterRegex: 'canopy_rt/include/canopy_rt/[a-z_]+\.hpp'
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: lower_case
+  - key: readability-identifier-naming.StructCase
+    value: lower_case
+  - key: readability-identifier-naming.ConceptCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: _
+  - key: misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true

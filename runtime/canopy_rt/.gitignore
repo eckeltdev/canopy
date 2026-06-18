@@ -1,0 +1,9 @@
+# cpp-doctor / CMake
+/build/
+compile_commands.json
+
+# cpp-doctor generated reports
+/.cpp-doctor/
+
+# clangd index cache
+/.cache/

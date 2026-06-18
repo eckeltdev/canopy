@@ -1,0 +1,59 @@
+version: 1
+
+profile: strict-systems
+
+project:
+  name: canopy_rt
+  language_standard: c++23
+  build_dir: build
+  compile_commands: build/compile_commands.json
+
+paths:
+  include:
+    - src
+    - include
+  exclude:
+    - build
+    - third_party
+    - vendor
+    - generated
+
+format:
+  enabled: true
+  style_file: .clang-format
+
+tidy:
+  enabled: true
+  config_file: .clang-tidy
+  warnings_as_errors: false
+  fix: false
+  jobs: auto
+
+rules:
+  naming:
+    enabled: true
+  headers:
+    enabled: true
+  ownership:
+    # canopy-rt IS the allocator: new_delete.cpp deliberately DEFINES the global operator
+    # new/delete set and the backends manage raw memory. The "no raw new/delete, prefer RAII"
+    # family is for consumer code, not the runtime that implements allocation. (The binding
+    # keeps ownership enabled.)
+    enabled: false
+  dangerous_patterns:
+    enabled: true
+  concurrency:
+    enabled: true
+  comments:
+    enabled: true
+  layout:
+    enabled: true
+
+doctor:
+  require_compile_commands: true
+  require_sanitizer_targets: false
+  require_ci: false
+
+output:
+  default_format: rich
+  reports_dir: .cpp-doctor/reports
