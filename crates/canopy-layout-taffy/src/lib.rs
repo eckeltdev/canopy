@@ -27,8 +27,9 @@
 //! - [`WIDTH`]/[`HEIGHT`] -> `size` of [`Dimension::length`] when set, else `auto`.
 //!
 //! Text leaves get a Taffy size from the requested pixel height: `height` is [`HEIGHT`]
-//! (or `16`) exactly, and `width` is [`WIDTH`] when set, else a proportional estimate
-//! (`chars * height * 0.6`). The renderer bakes the exact font size from that height.
+//! (or `16`) exactly, and `width` is [`WIDTH`] when set, else `chars * (8 * scale)` — the
+//! baked renderer's exact glyph advance (an 8px cell at integer `scale = floor(height/8)`),
+//! so the layout box is as wide as the drawn glyphs and the renderer's clip never truncates.
 //!
 //! [Taffy]: https://docs.rs/taffy
 //! Stays `no_std` + `alloc`: Taffy is pulled with `default-features = false` and
@@ -57,6 +58,9 @@ use taffy::{
 
 /// Default text size (px) when no [`HEIGHT`] is set.
 const TEXT_HEIGHT: u32 = 16;
+/// The baked font's square cell size in px (`canopy_text_baked::CELL_W == CELL_H == 8`). A
+/// text run's width estimate steps by this so the layout box matches the renderer's advance.
+const BAKED_CELL_PX: f32 = 8.0;
 /// Default foreground ink (light gray) when no [`FG`] is set.
 const DEFAULT_FG: Color = Color {
     r: 0xe6,
@@ -262,14 +266,19 @@ fn style_justify(dom: &Dom, id: NodeId) -> Option<JustifyContent> {
 /// collapsing to 8px. The capable renderer rasterizes at exactly this size; the
 /// constrained baked renderer floors it to its nearest 8px scale internally.
 ///
-/// Width is an estimate: a monospace advance proportional to the size (the bundled
-/// DejaVu Sans Mono advances ≈ `0.6 em`). It is only a layout slot — the renderer
-/// measures the real run, and `text-align` absorbs any slack between this box and the
-/// drawn glyphs — so an over/under estimate shifts neighbors slightly but never
-/// mis-centers the text.
+/// Width matches the constrained baked renderer's glyph advance EXACTLY, so a text run's
+/// layout box is as wide as the glyphs drawn into it. `canopy-render-soft` now clips text
+/// to this box, so an under-estimate (the old `0.6 em` proportional guess) would truncate
+/// the run; the baked font is a fixed `CELL_W = CELL_H = 8` cell drawn at integer
+/// `scale = max(1, floor(h / 8))`, advancing `8 * scale` px per glyph — mirror that here.
+/// `text-align` still absorbs any slack within the box.
 fn text_size(dom: &Dom, id: NodeId, text: &str) -> Size {
     let h = style_px(dom, id, HEIGHT).unwrap_or(TEXT_HEIGHT) as f32;
-    let advance = h * 0.6;
+    // The baked-font cell (canopy_text_baked CELL_W == CELL_H == 8) and the renderer's
+    // integer scale; keep these in lockstep with canopy_render_soft::blit_text's advance.
+    // Cast-truncation (not f32::floor, which needs std/libm) mirrors the renderer exactly.
+    let scale = ((h / BAKED_CELL_PX) as u32).max(1) as f32;
+    let advance = BAKED_CELL_PX * scale;
     let w = style_px(dom, id, WIDTH)
         .map(|w| w as f32)
         .unwrap_or(text.chars().count() as f32 * advance);
@@ -1032,10 +1041,10 @@ mod tests {
         let dom = dom_from(e);
         let (scene, lay) = layout(&dom, Size { w: 100.0, h: 50.0 });
 
-        // Height is the requested 20px exactly; width is the proportional estimate
-        // (2 chars * 20 * 0.6 = 24).
+        // Height is the requested 20px exactly; width matches the renderer's baked advance:
+        // scale = floor(20 / 8) = 2, advance = 8 * 2 = 16 px/glyph, 2 chars -> 32.
         let t_rect = lay.rects.iter().find(|(id, _)| *id == t).unwrap().1;
-        assert_eq!(t_rect.size, Size { w: 24.0, h: 20.0 });
+        assert_eq!(t_rect.size, Size { w: 32.0, h: 20.0 });
 
         // The text leaf emits a Text run carrying the content, foreground, and the
         // snapped cell height.
