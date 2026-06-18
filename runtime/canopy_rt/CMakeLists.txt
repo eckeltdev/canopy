@@ -58,3 +58,17 @@ target_sources(canopy_rt_platform_test PRIVATE "tests/platform_host_test.cpp")
 target_link_libraries(canopy_rt_platform_test PRIVATE canopy_rt)
 target_include_directories(canopy_rt_platform_test PRIVATE include)
 target_compile_features(canopy_rt_platform_test PRIVATE cxx_std_23)
+
+# Target: canopy_rt_surface_test
+add_executable(canopy_rt_surface_test)
+target_sources(canopy_rt_surface_test PRIVATE "tests/rt_surface_smoke.cpp")
+target_link_libraries(canopy_rt_surface_test PRIVATE canopy_rt)
+target_include_directories(canopy_rt_surface_test PRIVATE include)
+target_compile_features(canopy_rt_surface_test PRIVATE cxx_std_23)
+target_compile_options(
+	canopy_rt_surface_test
+	PRIVATE
+	-fno-exceptions
+	-fno-rtti
+	-DCANOPY_RT_FREESTANDING=1
+)

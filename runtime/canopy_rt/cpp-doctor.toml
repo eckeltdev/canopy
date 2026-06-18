@@ -40,3 +40,18 @@ include-directories = ["include"]
 compile-features = ["cxx_std_23"]
 compile-options = ["-DCANOPY_RT_OWN_NEW_DELETE"]
 link-libraries = ["canopy_rt"]
+
+# M2 STL-surface smoke: the developer-facing header surface (containers.hpp / stl.hpp /
+# config.hpp), compiled in the FREESTANDING configuration. -fno-exceptions / -fno-rtti +
+# -DCANOPY_RT_FREESTANDING=1 fire config.hpp's static_asserts (exceptions and RTTI must be off),
+# so the TU compiling proves the policy; the test body proves fixed_vector overflow returns false
+# (no throw) and the arena bumps/resets. The surface is header-only; it links canopy_rt purely so
+# the platform seam (canopy_platform_panic, behind CANOPY_RT_PANIC) resolves — exactly how a
+# backend supplies that C ABI floor symbol on the device.
+[target.canopy_rt_surface_test]
+type = "executable"
+sources = ["tests/rt_surface_smoke.cpp"]
+include-directories = ["include"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-fno-exceptions", "-fno-rtti", "-DCANOPY_RT_FREESTANDING=1"]
+link-libraries = ["canopy_rt"]
