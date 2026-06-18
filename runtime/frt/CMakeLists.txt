@@ -67,6 +67,14 @@ target_include_directories(frt_surface_test PRIVATE include)
 target_compile_features(frt_surface_test PRIVATE cxx_std_23)
 target_compile_options(frt_surface_test PRIVATE -fno-exceptions -fno-rtti -DFRT_FREESTANDING=1)
 
+# Target: frt_xstd_platform_test
+add_executable(frt_xstd_platform_test)
+target_sources(frt_xstd_platform_test PRIVATE "tests/xstd_platform_test.cpp")
+target_link_libraries(frt_xstd_platform_test PRIVATE frt)
+target_include_directories(frt_xstd_platform_test PRIVATE include "vendor/xstd")
+target_compile_features(frt_xstd_platform_test PRIVATE cxx_std_23)
+target_compile_options(frt_xstd_platform_test PRIVATE -fno-exceptions -fno-rtti)
+
 # Target: frt_xstd_test
 add_executable(frt_xstd_test)
 target_sources(frt_xstd_test PRIVATE "tests/xstd_surface_smoke.cpp")

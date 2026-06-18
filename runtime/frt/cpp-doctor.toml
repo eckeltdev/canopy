@@ -65,3 +65,19 @@ sources = ["tests/xstd_surface_smoke.cpp"]
 include-directories = ["include", "vendor/xstd"]
 compile-features = ["cxx_std_23"]
 compile-options = ["-fno-exceptions", "-fno-rtti"]
+
+# xstd platform-HOOK routing proof: frt/xstd.hpp binds xstd's monotonic clock to
+# frt_platform_ticks() and xstd's fatal/error path (XSTD_CON_ERROR_REDIRECT) to
+# frt_platform_panic. This test installs an instrumented frt backend that RECORDS what flows
+# through the seam, then drives xstd: the clock read must echo the backend's ticks, and an xstd
+# fatal diagnostic must land on the backend's panic (captured via longjmp, honouring the
+# redirect's [[noreturn]] without aborting). Links frt for the seam symbols
+# (frt_platform_ticks / frt_platform_panic / install_platform / host_ops); -fno-exceptions
+# -fno-rtti to match the freestanding policy.
+[target.frt_xstd_platform_test]
+type = "executable"
+sources = ["tests/xstd_platform_test.cpp"]
+include-directories = ["include", "vendor/xstd"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-fno-exceptions", "-fno-rtti"]
+link-libraries = ["frt"]
