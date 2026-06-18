@@ -74,15 +74,18 @@ namespace {
                             button(style(wire::prop_width, "80"), style(wire::prop_height, "72"),
                                    style(wire::prop_bg, "#f38ba8"), style(wire::prop_radius, "12"),
                                    style(wire::prop_fg, "#11111b"),
+                                   style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
                                    on_click([this] { count.set(count.get() - 1); }), "-"),
-                            div( // count readout (reactive text)
+                            div( // count readout (reactive text), centered both axes
                                 style(wire::prop_width, "184"), style(wire::prop_height, "72"),
                                 style(wire::prop_bg, "#45475a"), style(wire::prop_radius, "12"),
-                                style(wire::prop_padding, "24"), style(wire::prop_fg, "#f9e2af"),
+                                style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
+                                style(wire::prop_fg, "#f9e2af"),
                                 text([this] { return std::to_string(count.get()); })),
                             button(style(wire::prop_width, "80"), style(wire::prop_height, "72"),
                                    style(wire::prop_bg, "#a6e3a1"), style(wire::prop_radius, "12"),
                                    style(wire::prop_fg, "#11111b"),
+                                   style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
                                    on_click([this] { count.set(count.get() + 1); }), "+")),
                         text("click + / - to count"),
                         text("auto-ticks (no input):"),
@@ -90,10 +93,11 @@ namespace {
                             style(wire::prop_width, "376"), style(wire::prop_height, "56"),
                             style(wire::prop_direction, "row"), style(wire::prop_gap, "16"),
                             style(wire::prop_fg, "#cdd6f4"),
-                            div( // animated value readout (reactive text, timer-driven)
+                            div( // animated value readout (reactive text, timer-driven), centered
                                 style(wire::prop_width, "376"), style(wire::prop_height, "56"),
                                 style(wire::prop_bg, "#585b70"), style(wire::prop_radius, "12"),
-                                style(wire::prop_padding, "16"), style(wire::prop_fg, "#89dceb"),
+                                style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
+                                style(wire::prop_fg, "#89dceb"),
                                 text([this] { return std::to_string(ticks.get()); }))))));
 
             engine.apply(ctx.take_batch(seq++));
