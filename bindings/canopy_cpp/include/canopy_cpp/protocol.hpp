@@ -63,5 +63,13 @@ namespace canopy::wire {
     inline constexpr std::uint16_t prop_align = CANOPY_PROP_ALIGN;
     inline constexpr std::uint16_t prop_justify = CANOPY_PROP_JUSTIFY;
     inline constexpr std::uint16_t prop_text_align = CANOPY_PROP_TEXT_ALIGN;
+    inline constexpr std::uint16_t prop_margin = CANOPY_PROP_MARGIN;
+    inline constexpr std::uint16_t prop_min_width = CANOPY_PROP_MIN_WIDTH;
+    inline constexpr std::uint16_t prop_min_height = CANOPY_PROP_MIN_HEIGHT;
+    inline constexpr std::uint16_t prop_max_width = CANOPY_PROP_MAX_WIDTH;
+    inline constexpr std::uint16_t prop_max_height = CANOPY_PROP_MAX_HEIGHT;
+    inline constexpr std::uint16_t prop_flex_grow = CANOPY_PROP_FLEX_GROW;
+    inline constexpr std::uint16_t prop_border_width = CANOPY_PROP_BORDER_WIDTH;
+    inline constexpr std::uint16_t prop_border_color = CANOPY_PROP_BORDER_COLOR;
 
 } // namespace canopy::wire

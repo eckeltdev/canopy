@@ -135,6 +135,35 @@ fn header_matches_the_rust_constants() {
             "CANOPY_PROP_TEXT_ALIGN",
             u64::from(canopy_paint::TEXT_ALIGN.raw()),
         ),
+        ("CANOPY_PROP_MARGIN", u64::from(canopy_paint::MARGIN.raw())),
+        (
+            "CANOPY_PROP_MIN_WIDTH",
+            u64::from(canopy_paint::MIN_WIDTH.raw()),
+        ),
+        (
+            "CANOPY_PROP_MIN_HEIGHT",
+            u64::from(canopy_paint::MIN_HEIGHT.raw()),
+        ),
+        (
+            "CANOPY_PROP_MAX_WIDTH",
+            u64::from(canopy_paint::MAX_WIDTH.raw()),
+        ),
+        (
+            "CANOPY_PROP_MAX_HEIGHT",
+            u64::from(canopy_paint::MAX_HEIGHT.raw()),
+        ),
+        (
+            "CANOPY_PROP_FLEX_GROW",
+            u64::from(canopy_paint::FLEX_GROW.raw()),
+        ),
+        (
+            "CANOPY_PROP_BORDER_WIDTH",
+            u64::from(canopy_paint::BORDER_WIDTH.raw()),
+        ),
+        (
+            "CANOPY_PROP_BORDER_COLOR",
+            u64::from(canopy_paint::BORDER_COLOR.raw()),
+        ),
     ]);
 
     let header = header_defines();

@@ -67,9 +67,9 @@
 #![allow(unsafe_code)]
 
 use canopy_dom::{Dom, ROOT};
-use canopy_protocol::{EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
+use canopy_protocol::{AttrId, EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
-use canopy_style_css::Stylesheet;
+use canopy_style_css::{MatchTarget, Stylesheet};
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
@@ -175,9 +175,19 @@ impl CanopyHost {
         let mut stack: Vec<NodeId> = dom.children(ROOT).to_vec();
         while let Some(node) = stack.pop() {
             let Some(n) = dom.node(node) else { continue };
-            if !n.classes.is_empty() {
+            // Match the full lite selector model (type / id / class / compound, with specificity)
+            // against this node's identity. Skip bare text nodes: they aren't elements, so only an
+            // element-ish node (a tag, a declared name, classes, or an id) participates in matching.
+            let id = n.attrs.get(&AttrId::ID).map(String::as_str);
+            let type_name = element_type_name(n);
+            if type_name.is_some() || id.is_some() || !n.classes.is_empty() {
                 let classes: Vec<&str> = n.classes.iter().map(String::as_str).collect();
-                for (prop, value) in sheet.resolve(&classes, hover_path.contains(&node)) {
+                let target = MatchTarget {
+                    type_name,
+                    id,
+                    classes: &classes,
+                };
+                for (prop, value) in sheet.resolve_for(&target, hover_path.contains(&node)) {
                     // Author inline styles win over class rules (CSS specificity: inline beats
                     // a class selector), so only fold in a property the node didn't set itself.
                     if !n.styles.contains_key(&prop) {
@@ -373,6 +383,26 @@ impl CanopyHost {
         }
         out
     }
+}
+
+/// The CSS type/tag name a node matches against in the lite cascade. Prefers the
+/// guest-declared [`canopy_dom::Node::tag_name`] (the capable tiers set it); otherwise
+/// falls back to the canonical name of the well-known [`canopy_protocol::ElementTag`] the
+/// reference host assigns, so a constrained author who only emitted `CreateElement(BUTTON)`
+/// still matches a `button { … }` rule. Text nodes (no tag, no name) → `None`.
+fn element_type_name(node: &canopy_dom::Node) -> Option<&str> {
+    if let Some(name) = node.tag_name.as_deref() {
+        return Some(name);
+    }
+    // The reference-host ElementTag ids (canopy-view): COLUMN=1, ROW=2, BUTTON=3, INPUT=4.
+    // COLUMN is the generic flex/block container, so its CSS name is the familiar `div`.
+    Some(match node.tag?.raw() {
+        1 => "div",
+        2 => "row",
+        3 => "button",
+        4 => "input",
+        _ => return None,
+    })
 }
 
 /// Render one node and its subtree into `out` (see [`CanopyHost::debug_snapshot`]).
@@ -1164,6 +1194,63 @@ mod tests {
             !host.set_hover(500.0, 500.0),
             "no change reported when hover stays out"
         );
+    }
+
+    #[test]
+    fn type_id_and_compound_selectors_resolve_through_styled_dom() {
+        use canopy_paint::{BG, BORDER_COLOR, BORDER_WIDTH, MARGIN};
+        // <div id="hero" class="card primary"> with a <button> child. Exercises every new
+        // selector shape (type / id / compound) and all three color spellings (named, #rgb, rgb()).
+        let mut e = Emitter::new();
+        let div = e.create_element(ElementTag::new(1)); // COLUMN -> CSS type name "div"
+        e.append(ROOT, div);
+        e.set_attribute(div, AttrId::ID, "hero");
+        e.set_class(div, "card");
+        e.set_class(div, "primary");
+        let btn = e.create_element(ElementTag::new(3)); // BUTTON -> CSS type name "button"
+        e.append(div, btn);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(
+            "div { background: navy } \
+             #hero { border-width: 2; border-color: #f80 } \
+             .card.primary { margin: 8 } \
+             button { background: rgb(10, 20, 30) }",
+        );
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        fn prop(dom: &Dom, node: NodeId, p: PropId) -> Option<&str> {
+            dom.node(node)
+                .and_then(|n| n.styles.get(&p))
+                .map(String::as_str)
+        }
+
+        // Type selector `div` and id selector `#hero` both target the container.
+        assert_eq!(prop(&styled, div, BG), Some("#000080"), "div type -> navy");
+        assert_eq!(
+            prop(&styled, div, BORDER_WIDTH),
+            Some("2"),
+            "#hero id -> border-width"
+        );
+        assert_eq!(
+            prop(&styled, div, BORDER_COLOR),
+            Some("#ff8800"),
+            "#hero id -> #rgb expands to #rrggbb"
+        );
+        // Compound `.card.primary` matches only because BOTH classes are present.
+        assert_eq!(
+            prop(&styled, div, MARGIN),
+            Some("8"),
+            "compound .card.primary -> margin"
+        );
+        // The `button` type selector targets the child, and rgb() normalizes to hex.
+        assert_eq!(
+            prop(&styled, btn, BG),
+            Some("#0a141e"),
+            "button type -> rgb() folds to #rrggbb"
+        );
+        // The div is NOT a button, so it never picked up the button rule.
+        assert_eq!(prop(&styled, div, BG), Some("#000080"), "div bg unchanged");
     }
 
     #[test]

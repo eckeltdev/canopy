@@ -1,48 +1,67 @@
 //! Canopy CSS-lite: a tiny, dependency-free CSS subset that lets authors style
-//! with **class rules** instead of per-node inline calls.
+//! with **selector rules** instead of per-node inline calls.
 //!
-//! A stylesheet is a sequence of class rules:
+//! A stylesheet is a sequence of rules, each a selector list and a declaration block:
 //!
 //! ```text
-//! .name  { prop: value; prop: value }
-//! .other { prop: value }
+//! button, .btn      { background: navy; border-width: 2 }
+//! #hero .card.lead  { margin: 8; color: #f80 }
 //! ```
 //!
 //! [`parse`] turns that string into a [`Stylesheet`]. Each declaration's property
 //! *name* is mapped to the matching [`canopy_paint`] [`PropId`] const and its value
-//! is normalized (a trailing `px` is stripped, colors and directions pass through),
+//! is normalized (a trailing `px` is stripped; colors fold to canonical `#rrggbb`),
 //! so the resolved pairs feed the **existing inline-style path unchanged**:
 //! [`Stylesheet::apply`] simply replays them through [`canopy_view::App::style`].
 //!
-//! # Selectors and the `:hover` cascade
+//! # Selectors and specificity
 //!
-//! The only selector is a single class, optionally with a `:hover` pseudo-class:
+//! A selector is a single **compound** of simple selectors — an optional leading
+//! type/tag name followed by any run of `.class` and `#id` parts — plus an optional
+//! `:hover` pseudo-class. `*` is the universal (matches anything). Commas group
+//! several selectors onto one declaration block.
 //!
 //! ```text
-//! .btn       { background: #313244 }
-//! .btn:hover { background: #585b70 }
+//! div                   /* type            */
+//! #hero                 /* id              */
+//! .card                 /* class           */
+//! button.primary#go     /* compound: all parts must match */
+//! .btn:hover            /* class + state   */
+//! *                     /* universal       */
 //! ```
 //!
-//! A selector parses into `(class, Option<state>)`. Base rules (no state) always
-//! apply; `:hover` rules apply only when a node is hovered. [`Stylesheet::resolve`]
-//! is the **cascade resolver**: for each class in the list, in order, it appends the
-//! class's base declarations and then (when `hovered`) its `:hover` declarations,
-//! with **last-wins** semantics on each [`PropId`] — a later rule overrides an
-//! earlier one on the same property, while properties no rule touches are preserved.
-//! [`Stylesheet::apply_state`] replays that resolution onto an [`App`]; the host
-//! re-calls it whenever a node's hover state flips.
+//! Matching is resolved against a [`MatchTarget`] (the element's type name, id, and
+//! class list). [`Stylesheet::resolve_for`] is the **cascade resolver**: it gathers
+//! every rule whose selector matches, orders them by CSS **specificity** (id = 100,
+//! class/pseudo = 10, type = 1; ties broken by source order), and folds their
+//! declarations **last-wins** per [`PropId`] — a higher-specificity (or later) rule
+//! overrides an earlier one on the same property, while untouched properties are
+//! preserved. `:hover` rules join the cascade only when `hovered` is set.
+//! [`Stylesheet::resolve`] is the legacy class-only entry point (a [`MatchTarget`]
+//! with no type/id); [`Stylesheet::apply_state`] replays a resolution onto an
+//! [`App`], which the host re-calls whenever a node's hover state flips.
+//!
+//! # Supported properties and colors
+//!
+//! Box / flex / paint properties map to their [`canopy_paint`] ids: `background`,
+//! `color`, `width`/`height`, `min-width`/`min-height`/`max-width`/`max-height`,
+//! `margin`, `padding`, `gap`, `flex-grow`, `border-width`, `border-color`,
+//! `radius`, `opacity`, `direction`, `align`, `justify`, `text-align`, and the
+//! `translate-x`/`translate-y` offsets. Lengths accept a bare number or a `px`
+//! suffix. Colors accept a named keyword (`navy`, `red`, …), `#rgb`, `#rrggbb`, or
+//! `rgb(r, g, b)` — all normalized to `#rrggbb` (`transparent` is intentionally
+//! absent, so it falls through to paint-nothing).
 //!
 //! # What this is *not*
 //!
-//! This is a deliberate subset, not a CSS engine:
+//! This is a deliberate subset, not a full CSS engine:
 //!
-//! - The only selectors are a bare class (`.name`) and `.name:hover`. No element,
-//!   id, descendant, or compound selectors; no pseudo-classes beyond `:hover`; no
-//!   media queries.
-//! - There is **no cascade across the tree** and no specificity. [`apply`] and
-//!   [`apply_state`] expand a node's classes into inline-style ops on *that node
-//!   only*; "later overrides earlier" applies within the class list you pass,
-//!   exactly like writing those inline styles by hand in that order.
+//! - Selectors are a single compound only — no **descendant/child/sibling
+//!   combinators**, no attribute selectors, and no pseudo-classes beyond `:hover`;
+//!   no media queries, `!important`, or shorthand expansion.
+//! - The cascade matches each node against its own identity; there is no inheritance
+//!   here (the host folds matched rules in as inline styles, and author inline styles
+//!   win, mirroring CSS specificity where inline beats a selector).
 //! - Unknown properties are silently ignored (skipped, never an error), as is any
 //!   malformed fragment, so a partial stylesheet still yields the rules it could
 //!   parse.
@@ -60,7 +79,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use canopy_paint::{
-    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
+    ALIGN, BG, BORDER_COLOR, BORDER_WIDTH, DIRECTION, FG, FLEX_GROW, GAP, HEIGHT, JUSTIFY, MARGIN,
+    MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
     TRANSLATE_X, TRANSLATE_Y, WIDTH,
 };
 use canopy_protocol::{NodeId, PropId};
@@ -77,21 +97,53 @@ type Decl = (PropId, String);
 /// (`.name:hover`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// A plain class rule with no pseudo-class; always applies.
+    /// A plain selector with no pseudo-class; always applies.
     Base,
     /// A `:hover` rule; applies only when the node is hovered.
     Hover,
 }
 
-/// One parsed class rule: the class name, its interaction state, and its resolved
-/// declarations.
-struct Rule {
-    /// The class selector, without the leading `.`.
-    class: String,
-    /// Whether this rule is a base rule or a `:hover` rule.
+/// One part of a **compound** selector. A compound is an AND of these against a single
+/// element: `button.primary#go` is `[Type("button"), Class("primary"), Id("go")]`. There are
+/// no combinators (descendant/child) in this lite subset — each rule targets one element.
+#[derive(Clone, PartialEq, Eq)]
+enum Simple {
+    /// A type/tag selector (`button`, `div`) — matches the element's type name.
+    Type(String),
+    /// An id selector (`#go`) — matches the element's id.
+    Id(String),
+    /// A class selector (`.primary`) — matches if the element carries that class.
+    Class(String),
+}
+
+/// A compound selector plus its pseudo-state and CSS **specificity**. Specificity is
+/// `ids*100 + (classes + pseudos)*10 + types*1`, the standard `(a, b, c)` collapsed to one
+/// number (no part exceeds 99 for any realistic lite stylesheet); ties break on source order.
+struct Selector {
+    simples: Vec<Simple>,
     state: State,
+    specificity: u32,
+}
+
+/// One parsed rule: a compound selector and the declarations it sets. Selector grouping
+/// (`.a, .b { … }`) expands at parse time to one `Rule` per selector, sharing the decls.
+struct Rule {
+    selector: Selector,
     /// Declarations whose property name mapped to a known [`PropId`], in order.
     decls: Vec<Decl>,
+}
+
+/// The element a stylesheet is resolved against: its type/tag name, id, and class list. A
+/// `Type`/`Id` simple selector only matches when the corresponding field is `Some` and equal,
+/// so the legacy class-only [`Stylesheet::resolve`] (which leaves both `None`) keeps matching
+/// exactly the pure-class rules it always did.
+pub struct MatchTarget<'a> {
+    /// The element's type/tag name (e.g. `"button"`), or `None`.
+    pub type_name: Option<&'a str>,
+    /// The element's id, or `None`.
+    pub id: Option<&'a str>,
+    /// The element's classes.
+    pub classes: &'a [&'a str],
 }
 
 /// A parsed CSS-lite stylesheet: a set of class rules, each resolved to
@@ -121,68 +173,72 @@ impl Stylesheet {
     /// [`resolve`]: Stylesheet::resolve
     pub fn declarations(&self, class: &str) -> &[Decl] {
         for rule in &self.rules {
-            if rule.class == class && rule.state == State::Base {
+            if rule.selector.state == State::Base
+                && rule.selector.simples.len() == 1
+                && matches!(&rule.selector.simples[0], Simple::Class(c) if c == class)
+            {
                 return &rule.decls;
             }
         }
         &[]
     }
 
-    /// Resolve the final declarations for a node from its `classes`, applying the
-    /// **last-wins cascade**.
-    ///
-    /// For each class in `classes`, in order, this layers in:
-    /// 1. that class's base (`.name`) rules, then
-    /// 2. its `:hover` (`.name:hover`) rules, but only when `hovered` is `true`.
-    ///
-    /// Within that sequence a later declaration overrides an earlier one on the same
-    /// [`PropId`] (so a `:hover` rule overrides the base rule for the property it
-    /// sets, while leaving other properties from the base intact), and later classes
-    /// override earlier classes. Properties no matching rule touches are absent from
-    /// the result. Classes with no matching rule contribute nothing; an empty or
-    /// all-unknown `classes` list yields an empty `Vec`.
-    ///
-    /// The returned pairs are ordered by first appearance of each property, which is
-    /// the order the inline-style ops are replayed in [`apply_state`].
-    pub fn resolve(&self, classes: &[&str], hovered: bool) -> Vec<Decl> {
+    /// Resolve the final declarations for an element from its full [`MatchTarget`] (type, id,
+    /// classes), applying CSS **specificity + source order**: every rule whose compound selector
+    /// matches the element (and whose `:hover` state is satisfied by `hovered`) is collected, the
+    /// matches are ordered by `(specificity, source position)`, and their declarations are folded
+    /// last-wins — so a higher-specificity rule (or, at equal specificity, a later one) wins each
+    /// property. Properties no matching rule touches are absent. The returned pairs are in first-
+    /// appearance order (the order [`apply_state`] replays inline-style ops).
+    pub fn resolve_for(&self, target: &MatchTarget, hovered: bool) -> Vec<Decl> {
+        // Collect matching rules with their (specificity, source index) so we can order the
+        // cascade correctly regardless of the order classes appear on the element.
+        let mut matched: Vec<(u32, usize)> = Vec::new();
+        for (idx, rule) in self.rules.iter().enumerate() {
+            let state_ok = match rule.selector.state {
+                State::Base => true,
+                State::Hover => hovered,
+            };
+            if state_ok && selector_matches(&rule.selector.simples, target) {
+                matched.push((rule.selector.specificity, idx));
+            }
+        }
+        matched.sort_unstable(); // ascending (specificity, idx): lowest precedence applied first
         let mut resolved: Vec<Decl> = Vec::new();
-        for class in classes {
-            // Base rules first, then `:hover` rules, both in source order, so a
-            // `:hover` declaration overrides the base for the same property.
-            for rule in &self.rules {
-                if rule.class != *class {
-                    continue;
-                }
-                let matches = match rule.state {
-                    State::Base => true,
-                    State::Hover => hovered,
-                };
-                if !matches {
-                    continue;
-                }
-                for (prop, value) in &rule.decls {
-                    cascade(&mut resolved, *prop, value);
-                }
+        for (_, idx) in matched {
+            for (prop, value) in &self.rules[idx].decls {
+                cascade(&mut resolved, *prop, value);
             }
         }
         resolved
     }
 
+    /// The legacy class-only resolve: a [`resolve_for`](Self::resolve_for) with no type/id, so it
+    /// matches exactly the pure-class rules it always did. Kept for `canopy-ui` / `LiteEngine`.
+    pub fn resolve(&self, classes: &[&str], hovered: bool) -> Vec<Decl> {
+        self.resolve_for(
+            &MatchTarget {
+                type_name: None,
+                id: None,
+                classes,
+            },
+            hovered,
+        )
+    }
+
     /// Whether any of `classes` has a `:hover` rule, i.e. the node would restyle when
-    /// the pointer enters or leaves it.
-    ///
-    /// A host uses this to decide which nodes are worth tracking for hover: a node
-    /// whose classes carry no `:hover` rule never changes under the cursor, so there is
-    /// no point re-resolving it on every pointer move. It is the cheap, allocation-free
-    /// predicate behind a "hoverables" registry (compare [`resolve`] with both states,
-    /// which this avoids the cost of).
-    ///
-    /// [`resolve`]: Stylesheet::resolve
+    /// the pointer enters or leaves it. A class-only predicate (type/id `:hover` rules are not
+    /// considered) — the cheap "is this node worth tracking for hover" check `canopy-ui` uses.
     #[must_use]
     pub fn reacts_to_hover(&self, classes: &[&str]) -> bool {
-        self.rules
-            .iter()
-            .any(|rule| rule.state == State::Hover && classes.contains(&rule.class.as_str()))
+        self.rules.iter().any(|rule| {
+            rule.selector.state == State::Hover
+                && rule
+                    .selector
+                    .simples
+                    .iter()
+                    .any(|s| matches!(s, Simple::Class(c) if classes.contains(&c.as_str())))
+        })
     }
 
     /// Apply `classes` to `node` on `app`, in order, by replaying each resolved
@@ -245,41 +301,22 @@ pub fn parse(css: &str) -> Stylesheet {
     let mut i = 0;
 
     while i < bytes.len() {
-        // Find the next selector start `.`.
-        if bytes[i] != b'.' {
+        // Read the selector-list (everything up to `{`); a stray `}`/`;` is skipped.
+        if bytes[i] == b'}' || bytes[i] == b';' || bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
-        i += 1; // consume the dot
-
-        // Read the selector (class plus optional `:state`) up to whitespace or `{`.
-        let name_start = i;
-        while i < bytes.len() && bytes[i] != b'{' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let selector = &css[name_start..i];
-        // Split the selector into a class and an optional pseudo-class state.
-        let (class, state) = match selector.split_once(':') {
-            Some((class, "hover")) => (class.to_string(), State::Hover),
-            // An unknown pseudo-class (`:focus`, `::before`, …) is outside this subset:
-            // drop the whole rule so it can't masquerade as a base rule.
-            Some(_) => {
-                skip_rule(bytes, &mut i);
-                continue;
-            }
-            None => (selector.to_string(), State::Base),
-        };
-
-        // Skip to the opening brace; bail if the rule is truncated.
+        let sel_start = i;
         while i < bytes.len() && bytes[i] != b'{' {
             i += 1;
         }
         if i >= bytes.len() {
-            break;
+            break; // a trailing selector with no block — drop it
         }
+        let selector_list = css[sel_start..i].trim();
         i += 1; // consume `{`
 
-        // Capture the block body up to the matching `}`.
+        // Capture the block body up to `}`.
         let body_start = i;
         while i < bytes.len() && bytes[i] != b'}' {
             i += 1;
@@ -289,33 +326,108 @@ pub fn parse(css: &str) -> Stylesheet {
             i += 1; // consume `}`
         }
 
-        if class.is_empty() {
-            continue;
-        }
         let decls = parse_block(body);
-        rules.push(Rule {
-            class,
-            state,
-            decls,
-        });
+        if decls.is_empty() {
+            continue; // a rule with no known declarations contributes nothing
+        }
+        // Selector grouping: `.a, button#b { … }` expands to one Rule per selector, sharing decls.
+        for sel in selector_list.split(',') {
+            if let Some(selector) = parse_selector(sel.trim()) {
+                rules.push(Rule {
+                    selector,
+                    decls: decls.clone(),
+                });
+            }
+        }
     }
 
     Stylesheet { rules }
 }
 
-/// Advance `i` past the rest of the current rule's block: skip to the opening `{`,
-/// then to and past the matching `}`. Used to drop a rule whose selector is outside
-/// this subset without mis-parsing its body as a fresh rule.
-fn skip_rule(bytes: &[u8], i: &mut usize) {
-    while *i < bytes.len() && bytes[*i] != b'{' {
-        *i += 1;
+/// Parse one selector — a compound (`button.primary#go`) plus an optional `:hover` — into a
+/// [`Selector`] with its specificity. Returns `None` for an empty selector or one carrying an
+/// unsupported pseudo-class (`:focus`, `::before`, …) so it is dropped (not mistaken for a base).
+fn parse_selector(sel: &str) -> Option<Selector> {
+    if sel.is_empty() {
+        return None;
     }
-    while *i < bytes.len() && bytes[*i] != b'}' {
-        *i += 1;
+    let (compound, state) = match sel.split_once(':') {
+        Some((compound, "hover")) => (compound, State::Hover),
+        Some(_) => return None, // unsupported pseudo-class -> drop this selector
+        None => (sel, State::Base),
+    };
+    let simples = parse_compound(compound)?;
+    let (mut ids, mut tens, mut types) = (0u32, 0u32, 0u32);
+    for simple in &simples {
+        match simple {
+            Simple::Id(_) => ids += 1,
+            Simple::Class(_) => tens += 1,
+            Simple::Type(_) => types += 1,
+        }
     }
-    if *i < bytes.len() {
-        *i += 1; // consume `}`
+    if state == State::Hover {
+        tens += 1; // a pseudo-class counts at the class level of specificity
     }
+    Some(Selector {
+        simples,
+        state,
+        specificity: ids * 100 + tens * 10 + types,
+    })
+}
+
+/// Parse a compound selector into its simple parts: an optional leading **type** name, then a run
+/// of `.class` / `#id`. A bare `*` (universal) yields an empty list (matches every element).
+/// Returns `None` on a malformed identifier.
+fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
+    let mut simples = Vec::new();
+    let bytes = compound.as_bytes();
+    let mut i = 0;
+    // Optional leading type/tag name (anything before the first `.`/`#`).
+    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+        i += 1;
+    }
+    let head = &compound[..i];
+    if !head.is_empty() && head != "*" {
+        if !is_ident(head) {
+            return None;
+        }
+        simples.push(Simple::Type(head.to_string()));
+    }
+    // Then a run of `.class` / `#id` parts.
+    while i < bytes.len() {
+        let kind = bytes[i];
+        i += 1;
+        let name_start = i;
+        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+            i += 1;
+        }
+        let name = &compound[name_start..i];
+        if !is_ident(name) {
+            return None;
+        }
+        match kind {
+            b'.' => simples.push(Simple::Class(name.to_string())),
+            b'#' => simples.push(Simple::Id(name.to_string())),
+            _ => return None,
+        }
+    }
+    Some(simples)
+}
+
+/// A valid (lite) CSS identifier: non-empty, only `[A-Za-z0-9_-]`.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Whether a compound selector's simple parts all match `target` (an AND).
+fn selector_matches(simples: &[Simple], target: &MatchTarget) -> bool {
+    simples.iter().all(|simple| match simple {
+        Simple::Type(t) => target.type_name == Some(t.as_str()),
+        Simple::Id(id) => target.id == Some(id.as_str()),
+        Simple::Class(c) => target.classes.contains(&c.as_str()),
+    })
 }
 
 /// Remove `/* … */` comments, replacing each with a single space so adjacent tokens
@@ -387,6 +499,16 @@ fn map_property(name: &str) -> Option<PropId> {
         "justify-content" | "justify" => Some(JUSTIFY),
         // Text alignment keyword (left/center/right; passes through verbatim).
         "text-align" => Some(TEXT_ALIGN),
+        // Box model: outer margin + min/max sizing (all px lengths).
+        "margin" => Some(MARGIN),
+        "min-width" => Some(MIN_WIDTH),
+        "min-height" => Some(MIN_HEIGHT),
+        "max-width" => Some(MAX_WIDTH),
+        "max-height" => Some(MAX_HEIGHT),
+        // Flex grow factor (unitless) + a border frame (width px + color).
+        "flex-grow" => Some(FLEX_GROW),
+        "border-width" => Some(BORDER_WIDTH),
+        "border-color" => Some(BORDER_COLOR),
         _ => None,
     }
 }
@@ -402,19 +524,124 @@ fn map_property(name: &str) -> Option<PropId> {
 /// so a stray `px` is *not* stripped (an authoring slip like `opacity: 0.5px` is left
 /// intact to fail the float parse rather than silently becoming `0.5`).
 fn normalize_value(prop: PropId, value: &str) -> String {
+    // Colors (background / color / border-color): expand to `#rrggbb` so the renderers' hex
+    // `parse_color` accepts named colors, `#rgb`, and `rgb()` too. An unrecognized value is left
+    // verbatim (the renderer then ignores it — e.g. `background: transparent` paints nothing).
+    if prop == BG || prop == FG || prop == BORDER_COLOR {
+        return normalize_color(value);
+    }
     let is_length = prop == WIDTH
         || prop == HEIGHT
         || prop == GAP
         || prop == PADDING
         || prop == RADIUS
         || prop == TRANSLATE_X
-        || prop == TRANSLATE_Y;
+        || prop == TRANSLATE_Y
+        || prop == MARGIN
+        || prop == MIN_WIDTH
+        || prop == MIN_HEIGHT
+        || prop == MAX_WIDTH
+        || prop == MAX_HEIGHT
+        || prop == BORDER_WIDTH;
     if is_length {
         if let Some(num) = value.strip_suffix("px") {
             return num.trim().to_string();
         }
     }
     value.to_string()
+}
+
+/// Normalize a CSS color to `#rrggbb`: a 6-digit hex passes through, `#rgb` expands, `rgb(r,g,b)`
+/// / `rgb(r g b)` converts, and a CSS named color maps via a small table. An unrecognized value is
+/// returned verbatim so the renderer's `parse_color` simply rejects it (no paint).
+fn normalize_color(value: &str) -> String {
+    let value = value.trim();
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return value.to_string();
+        }
+        if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut out = String::with_capacity(7);
+            out.push('#');
+            for ch in hex.chars() {
+                out.push(ch); // `#abc` -> `#aabbcc`: each nibble doubled
+                out.push(ch);
+            }
+            return out;
+        }
+    }
+    if let Some(inner) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+        let mut chans = inner
+            .split([',', ' ', '/'])
+            .filter(|p| !p.trim().is_empty());
+        if let (Some(r), Some(g), Some(b), None) =
+            (chans.next(), chans.next(), chans.next(), chans.next())
+        {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                r.trim().parse::<u8>(),
+                g.trim().parse::<u8>(),
+                b.trim().parse::<u8>(),
+            ) {
+                let mut out = String::with_capacity(7);
+                out.push('#');
+                push_hex_byte(&mut out, r);
+                push_hex_byte(&mut out, g);
+                push_hex_byte(&mut out, b);
+                return out;
+            }
+        }
+    }
+    if let Some(hex) = named_color(value) {
+        return hex.to_string();
+    }
+    value.to_string()
+}
+
+/// Append `byte` as two lowercase hex digits (no `format!`, to stay `no_std`-clean).
+fn push_hex_byte(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0f) as usize] as char);
+}
+
+/// Map a CSS named color (case-insensitive) to its `#rrggbb` hex. The 16 HTML basic colors plus a
+/// handful of common extras. `transparent` is intentionally absent — the lite `#rrggbb` color has
+/// no alpha, so it falls through to verbatim and paints nothing (the right result for a background).
+fn named_color(name: &str) -> Option<&'static str> {
+    // ASCII-lowercase compare without allocating.
+    let eq = |kw: &str| {
+        name.len() == kw.len()
+            && name
+                .bytes()
+                .zip(kw.bytes())
+                .all(|(a, b)| a.to_ascii_lowercase() == b)
+    };
+    let table: &[(&str, &str)] = &[
+        ("black", "#000000"),
+        ("white", "#ffffff"),
+        ("red", "#ff0000"),
+        ("green", "#008000"),
+        ("lime", "#00ff00"),
+        ("blue", "#0000ff"),
+        ("yellow", "#ffff00"),
+        ("cyan", "#00ffff"),
+        ("aqua", "#00ffff"),
+        ("magenta", "#ff00ff"),
+        ("fuchsia", "#ff00ff"),
+        ("gray", "#808080"),
+        ("grey", "#808080"),
+        ("silver", "#c0c0c0"),
+        ("maroon", "#800000"),
+        ("olive", "#808000"),
+        ("teal", "#008080"),
+        ("navy", "#000080"),
+        ("purple", "#800080"),
+        ("orange", "#ffa500"),
+        ("pink", "#ffc0cb"),
+        ("brown", "#a52a2a"),
+        ("gold", "#ffd700"),
+    ];
+    table.iter().find(|(kw, _)| eq(kw)).map(|(_, hex)| *hex)
 }
 
 // ---------------------------------------------------------------------------------
@@ -574,10 +801,10 @@ mod tests {
     #[test]
     fn unknown_property_is_ignored() {
         let sheet = parse(".x { background: #fff; border: 1px; outline: none }");
-        // Only `background` maps; `border` and `outline` are outside this subset and
-        // skipped. (`opacity`, once unknown, is now a mapped prop — see
-        // `opacity_parses_as_a_unitless_float`.)
-        assert_eq!(sheet.declarations("x"), &[(BG, "#fff".to_string())]);
+        // Only `background` maps; the `border` shorthand and `outline` are outside this subset
+        // and skipped (`border-width`/`border-color` ARE mapped, but the `border` shorthand is
+        // not). The `#fff` value is normalized to the 6-digit `#ffffff` form.
+        assert_eq!(sheet.declarations("x"), &[(BG, "#ffffff".to_string())]);
     }
 
     #[test]
@@ -807,13 +1034,152 @@ mod tests {
             sheet.resolve(&["a", "b"], false),
             vec![(BG, "#111111".to_string())]
         );
-        // hovered, walking classes in order:
-        // class `a`: base #111111 then its `:hover` #333333 -> #333333;
-        // class `b`: `:hover` #222222 overrides -> #222222 (later class wins).
+        // hovered: `.a`(spec 10), `.b:hover`(spec 20), `.a:hover`(spec 20) all match. Sorted by
+        // (specificity, source order): the two spec-20 rules tie, so the LATER one in the sheet
+        // (`.a:hover` at index 2) wins -> #333333. (CSS source-order tie-break, not class order.)
         assert_eq!(
             sheet.resolve(&["a", "b"], true),
-            vec![(BG, "#222222".to_string())]
+            vec![(BG, "#333333".to_string())]
         );
+    }
+
+    #[test]
+    fn type_and_id_selectors_match() {
+        let sheet =
+            parse("button { background:#111111 } #go { color:#222222 } .btn { padding:4px }");
+        let hit = MatchTarget {
+            type_name: Some("button"),
+            id: Some("go"),
+            classes: &["btn"],
+        };
+        let r = sheet.resolve_for(&hit, false);
+        assert!(
+            r.contains(&(BG, "#111111".to_string())),
+            "type selector matched"
+        );
+        assert!(
+            r.contains(&(FG, "#222222".to_string())),
+            "id selector matched"
+        );
+        assert!(
+            r.contains(&(PADDING, "4".to_string())),
+            "class selector matched"
+        );
+        let miss = MatchTarget {
+            type_name: Some("div"),
+            id: None,
+            classes: &[],
+        };
+        assert!(
+            sheet.resolve_for(&miss, false).is_empty(),
+            "no selector matches a bare div"
+        );
+    }
+
+    #[test]
+    fn compound_selector_requires_all_parts() {
+        let sheet = parse("button.primary { background:#abcdef }");
+        let both = MatchTarget {
+            type_name: Some("button"),
+            id: None,
+            classes: &["primary"],
+        };
+        assert_eq!(
+            sheet.resolve_for(&both, false),
+            vec![(BG, "#abcdef".to_string())]
+        );
+        let only_type = MatchTarget {
+            type_name: Some("button"),
+            id: None,
+            classes: &[],
+        };
+        assert!(
+            sheet.resolve_for(&only_type, false).is_empty(),
+            "missing the .primary class"
+        );
+        let only_class = MatchTarget {
+            type_name: Some("div"),
+            id: None,
+            classes: &["primary"],
+        };
+        assert!(
+            sheet.resolve_for(&only_class, false).is_empty(),
+            "wrong type"
+        );
+    }
+
+    #[test]
+    fn id_beats_class_beats_type_by_specificity() {
+        // All three set `background`; specificity id(100) > class(10) > type(1) decides, regardless
+        // of the source order (here type is last in the sheet but lowest specificity).
+        let sheet = parse(
+            "#x { background:#111111 } .c { background:#222222 } button { background:#333333 }",
+        );
+        let hit = MatchTarget {
+            type_name: Some("button"),
+            id: Some("x"),
+            classes: &["c"],
+        };
+        assert_eq!(
+            sheet.resolve_for(&hit, false),
+            vec![(BG, "#111111".to_string())]
+        );
+    }
+
+    #[test]
+    fn selector_grouping_shares_declarations() {
+        let sheet = parse(".a, .b, button { color:#445566 }");
+        let targets = [
+            MatchTarget {
+                type_name: None,
+                id: None,
+                classes: &["a"],
+            },
+            MatchTarget {
+                type_name: None,
+                id: None,
+                classes: &["b"],
+            },
+            MatchTarget {
+                type_name: Some("button"),
+                id: None,
+                classes: &[],
+            },
+        ];
+        for target in &targets {
+            assert_eq!(
+                sheet.resolve_for(target, false),
+                vec![(FG, "#445566".to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn colors_named_short_hex_and_rgb_normalize() {
+        let sheet = parse(".a { background: red; color: #0f0; border-color: rgb(0, 0, 255) }");
+        let decls = sheet.declarations("a");
+        assert!(decls.contains(&(BG, "#ff0000".to_string())), "named color");
+        assert!(
+            decls.contains(&(FG, "#00ff00".to_string())),
+            "#rgb expanded"
+        );
+        assert!(
+            decls.contains(&(BORDER_COLOR, "#0000ff".to_string())),
+            "rgb() converted"
+        );
+    }
+
+    #[test]
+    fn new_box_props_map_and_strip_px() {
+        let sheet = parse(
+            ".a { margin:8px; min-width:40px; max-width:200px; flex-grow:1; border-width:2px }",
+        );
+        let decls = sheet.declarations("a");
+        assert!(decls.contains(&(MARGIN, "8".to_string())));
+        assert!(decls.contains(&(MIN_WIDTH, "40".to_string())));
+        assert!(decls.contains(&(MAX_WIDTH, "200".to_string())));
+        assert!(decls.contains(&(FLEX_GROW, "1".to_string())));
+        assert!(decls.contains(&(BORDER_WIDTH, "2".to_string())));
     }
 
     #[test]

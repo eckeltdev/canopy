@@ -44,7 +44,8 @@ use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
 use canopy_paint::{
-    ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
+    ALIGN, BG, BORDER_COLOR, BORDER_WIDTH, DIRECTION, FG, FLEX_GROW, GAP, HEIGHT, JUSTIFY, MARGIN,
+    MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
     TRANSLATE_X, TRANSLATE_Y, WIDTH,
 };
 use canopy_protocol::{ElementTag, NodeId, PropId};
@@ -53,7 +54,7 @@ use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, 
 use taffy::prelude::length;
 use taffy::{
     AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    Rect as TaffyRect, Size as TaffySize, Style, TaffyTree,
+    LengthPercentageAuto, Rect as TaffyRect, Size as TaffySize, Style, TaffyTree,
 };
 
 /// Default text size (px) when no [`HEIGHT`] is set.
@@ -335,10 +336,26 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
     };
     let gap = style_px(dom, id, GAP).unwrap_or(0) as f32;
     let pad = style_px(dom, id, PADDING).unwrap_or(0) as f32;
+    // Uniform outer `margin` (px) on all four sides — the spacing analog of `padding`,
+    // but a `LengthPercentageAuto` (margin admits `auto`; padding does not). Default 0.
+    let margin = style_px(dom, id, MARGIN).unwrap_or(0) as f32;
     // Width/height accept a percentage ("100%"/"50%"), a length ("Npx"/"N"), or are
     // auto (content-sized) when absent — see `style_dimension`.
     let width = style_dimension(dom, id, WIDTH);
     let height = style_dimension(dom, id, HEIGHT);
+    // min/max constraints reuse `style_dimension`, which returns `Dimension::auto()` when
+    // absent — exactly Taffy's "no constraint" value for an unset min/max bound.
+    let min_width = style_dimension(dom, id, MIN_WIDTH);
+    let min_height = style_dimension(dom, id, MIN_HEIGHT);
+    let max_width = style_dimension(dom, id, MAX_WIDTH);
+    let max_height = style_dimension(dom, id, MAX_HEIGHT);
+    // `flex-grow` is unitless and may be fractional ("1", "0.5"), so it is read raw and
+    // parsed as f32 (the integer-only `style_px` would reject a fraction). Default 0.0 =
+    // does not grow, matching CSS `flex-grow`'s initial value.
+    let flex_grow = dom
+        .style(id, FLEX_GROW)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0);
     // UA-stylesheet default: a button/input centers its label on BOTH axes (the cross axis via
     // align-items, the main axis via justify-content) unless the author sets align/justify,
     // mirroring how browsers center `<button>` content. Plain containers keep Taffy's defaults
@@ -356,6 +373,7 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
         flex_direction: dir,
         align_items,
         justify_content,
+        flex_grow,
         gap: TaffySize {
             width: length(gap),
             height: length(gap),
@@ -366,7 +384,23 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
             top: LengthPercentage::length(pad),
             bottom: LengthPercentage::length(pad),
         },
+        // Margin uses `LengthPercentageAuto` (it admits `auto`, unlike padding), so the
+        // uniform px value is wrapped accordingly on all four sides.
+        margin: TaffyRect {
+            left: LengthPercentageAuto::length(margin),
+            right: LengthPercentageAuto::length(margin),
+            top: LengthPercentageAuto::length(margin),
+            bottom: LengthPercentageAuto::length(margin),
+        },
         size: TaffySize { width, height },
+        min_size: TaffySize {
+            width: min_width,
+            height: min_height,
+        },
+        max_size: TaffySize {
+            width: max_width,
+            height: max_height,
+        },
         ..Default::default()
     }
 }
@@ -631,6 +665,7 @@ fn build_display_list(
                     radius: style_radius(dom, id),
                 });
             }
+            push_border(dom, id, rect, paint.opacity, &mut items);
             items.push(DisplayItem::Text {
                 origin: rect.origin,
                 text: text.to_string(),
@@ -644,15 +679,43 @@ fn build_display_list(
                 box_w: rect.size.w,
                 align: paint.align,
             });
-        } else if let Some(bg) = style_color(dom, id, BG) {
-            items.push(DisplayItem::Rect {
-                rect,
-                color: fade(bg, paint.opacity),
-                radius: style_radius(dom, id),
-            });
+        } else {
+            if let Some(bg) = style_color(dom, id, BG) {
+                items.push(DisplayItem::Rect {
+                    rect,
+                    color: fade(bg, paint.opacity),
+                    radius: style_radius(dom, id),
+                });
+            }
+            push_border(dom, id, rect, paint.opacity, &mut items);
         }
     }
     items
+}
+
+/// Emit a [`DisplayItem::Border`] frame for `id` over `rect` when the node sets a positive
+/// [`BORDER_WIDTH`] *and* a parseable [`BORDER_COLOR`]; otherwise emit nothing.
+///
+/// The border is **paint-only** — it never altered the Taffy geometry, so `rect` is the
+/// node's laid-out box and the frame is stroked inside it (the renderer's `stroke_rect`).
+/// It is pushed *after* the node's background `Rect` so the frame draws on top, and its
+/// color is [`fade`]d by the node's resolved `opacity` exactly like the background fill,
+/// so a translucent subtree fades its borders in lockstep with its fills. The corner
+/// radius is the node's own [`RADIUS`], matching the rounded fill it frames.
+fn push_border(dom: &Dom, id: NodeId, rect: Rect, opacity: f32, items: &mut Vec<DisplayItem>) {
+    let width = style_px(dom, id, BORDER_WIDTH).unwrap_or(0);
+    if width == 0 {
+        return;
+    }
+    let Some(color) = style_color(dom, id, BORDER_COLOR) else {
+        return;
+    };
+    items.push(DisplayItem::Border {
+        rect,
+        color: fade(color, opacity),
+        width: width as f32,
+        radius: style_radius(dom, id),
+    });
 }
 
 /// Return the topmost node whose absolute rect contains `point`, or `None`.
@@ -1353,6 +1416,239 @@ mod tests {
             .expect("child background rect");
         // 255 * 0.25 = 63.75, rounds to 64.
         assert_eq!(color.a, 64, "nested opacity multiplies to ~quarter alpha");
+    }
+
+    #[test]
+    fn margin_offsets_a_node_and_its_sibling() {
+        // A row of two boxes where the first carries a uniform margin of 10. The margin
+        // insets the first box from the row's top-left, and pushes the second box right
+        // by the first box's width PLUS both boxes' touching margins (10 right of A +
+        // 10 left of B = 20), so the sibling visibly shifts because of the margin.
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(row, a);
+        e.set_inline_style(a, WIDTH, "30");
+        e.set_inline_style(a, HEIGHT, "20");
+        e.set_inline_style(a, MARGIN, "10");
+        let b = e.create_element(ElementTag::new(2));
+        e.append(row, b);
+        e.set_inline_style(b, WIDTH, "40");
+        e.set_inline_style(b, HEIGHT, "20");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 300.0, h: 100.0 });
+
+        let a_rect = lay.rects.iter().find(|(id, _)| *id == a).unwrap().1;
+        let b_rect = lay.rects.iter().find(|(id, _)| *id == b).unwrap().1;
+        // A is inset from the row origin by its own margin on both axes.
+        assert_eq!(
+            a_rect.origin,
+            Point { x: 10.0, y: 10.0 },
+            "margin insets the node from the container edge"
+        );
+        // Only A carries a margin, so B starts past A's right margin: 10 (A left margin)
+        // + 30 (A width) + 10 (A right margin) = 50. Without A's margin B would sit at 30,
+        // so the margin visibly shifts the sibling by 20.
+        assert_eq!(
+            b_rect.origin.x, 50.0,
+            "the margin pushes the sibling further along the main axis"
+        );
+    }
+
+    #[test]
+    fn min_and_max_width_clamp_the_box() {
+        // min-width raises a smaller box UP to the floor; max-width lowers a larger box
+        // DOWN to the ceiling. Two children in a column, each given an explicit width that
+        // its min/max then overrides.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        // Small box: width 20, but min-width 50 -> clamps UP to 50.
+        let small = e.create_element(ElementTag::new(2));
+        e.append(col, small);
+        e.set_inline_style(small, WIDTH, "20");
+        e.set_inline_style(small, HEIGHT, "10");
+        e.set_inline_style(small, MIN_WIDTH, "50");
+        // Big box: width 200, but max-width 80 -> clamps DOWN to 80.
+        let big = e.create_element(ElementTag::new(2));
+        e.append(col, big);
+        e.set_inline_style(big, WIDTH, "200");
+        e.set_inline_style(big, HEIGHT, "10");
+        e.set_inline_style(big, MAX_WIDTH, "80");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+
+        let small_rect = lay.rects.iter().find(|(id, _)| *id == small).unwrap().1;
+        let big_rect = lay.rects.iter().find(|(id, _)| *id == big).unwrap().1;
+        assert_eq!(
+            small_rect.size.w, 50.0,
+            "min-width clamps a smaller box up to the floor"
+        );
+        assert_eq!(
+            big_rect.size.w, 80.0,
+            "max-width clamps a larger box down to the ceiling"
+        );
+    }
+
+    #[test]
+    fn flex_grow_splits_free_main_axis_space() {
+        // A 200-wide row with two `flex-grow: 1` children and no explicit widths: they
+        // split the free main-axis space evenly, 100 each.
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        e.set_inline_style(row, WIDTH, "200");
+        e.set_inline_style(row, HEIGHT, "20");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(row, a);
+        e.set_inline_style(a, HEIGHT, "20");
+        e.set_inline_style(a, FLEX_GROW, "1");
+        let b = e.create_element(ElementTag::new(2));
+        e.append(row, b);
+        e.set_inline_style(b, HEIGHT, "20");
+        e.set_inline_style(b, FLEX_GROW, "1");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+
+        let a_rect = lay.rects.iter().find(|(id, _)| *id == a).unwrap().1;
+        let b_rect = lay.rects.iter().find(|(id, _)| *id == b).unwrap().1;
+        assert_eq!(
+            a_rect.size.w, 100.0,
+            "first grow:1 child takes half the row"
+        );
+        assert_eq!(
+            b_rect.size.w, 100.0,
+            "second grow:1 child takes the other half"
+        );
+        // The second child starts exactly where the first ends — they tile the row.
+        assert_eq!(b_rect.origin.x, 100.0);
+    }
+
+    #[test]
+    fn border_width_and_color_emit_a_border_item() {
+        // A node with `border-width` + `border-color` emits a `DisplayItem::Border`
+        // carrying the stroke width, the parsed color, and the node's radius — and it is
+        // emitted AFTER the node's own background fill so the frame draws on top.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, BG, "#202020");
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, RADIUS, "6");
+        e.set_inline_style(card, BORDER_WIDTH, "3");
+        e.set_inline_style(card, BORDER_COLOR, "#89b4fa");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+
+        let border = scene.items.iter().find_map(|i| match i {
+            DisplayItem::Border {
+                width,
+                color,
+                radius,
+                ..
+            } => Some((*width, *color, *radius)),
+            _ => None,
+        });
+        let (width, color, radius) = border.expect("a Border item is in the scene");
+        assert_eq!(width, 3.0, "border width rides onto the Border item");
+        assert_eq!(
+            color,
+            Color {
+                r: 0x89,
+                g: 0xb4,
+                b: 0xfa,
+                a: 255
+            },
+            "border color is the parsed #rrggbb"
+        );
+        assert_eq!(
+            radius, 6.0,
+            "border radius matches the node's corner radius"
+        );
+
+        // The fill is emitted before the frame so the border draws on top.
+        let bg_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { .. }))
+            .unwrap();
+        let border_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Border { .. }))
+            .unwrap();
+        assert!(
+            bg_idx < border_idx,
+            "the border frame paints on top of the fill"
+        );
+    }
+
+    #[test]
+    fn border_with_zero_width_or_no_color_emits_nothing() {
+        // Border is conditional: a zero width (or a missing/unparseable color) emits no
+        // Border item — it must not paint a phantom frame.
+        let mut e = Emitter::new();
+        // width 0 + a color -> no border.
+        let a = e.create_element(ElementTag::new(1));
+        e.append(ROOT, a);
+        e.set_inline_style(a, WIDTH, "20");
+        e.set_inline_style(a, HEIGHT, "20");
+        e.set_inline_style(a, BORDER_WIDTH, "0");
+        e.set_inline_style(a, BORDER_COLOR, "#ffffff");
+        // a positive width but NO color -> no border.
+        let b = e.create_element(ElementTag::new(1));
+        e.append(ROOT, b);
+        e.set_inline_style(b, WIDTH, "20");
+        e.set_inline_style(b, HEIGHT, "20");
+        e.set_inline_style(b, BORDER_WIDTH, "2");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let borders = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Border { .. }))
+            .count();
+        assert_eq!(borders, 0, "no border without both a width and a color");
+    }
+
+    #[test]
+    fn border_color_fades_with_opacity() {
+        // The border color is faded by the node's resolved opacity, exactly like the
+        // background fill — so a 0.5-opacity node strokes a half-alpha frame.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, OPACITY, "0.5");
+        e.set_inline_style(card, BORDER_WIDTH, "2");
+        e.set_inline_style(card, BORDER_COLOR, "#ffffff");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let color = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Border { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("a Border item");
+        // 255 * 0.5 rounded = 128; RGB untouched (straight-alpha fade).
+        assert_eq!(
+            color.a, 128,
+            "the border alpha is scaled by the node opacity"
+        );
+        assert_eq!((color.r, color.g, color.b), (0xff, 0xff, 0xff));
     }
 
     #[test]

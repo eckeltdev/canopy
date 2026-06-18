@@ -87,6 +87,28 @@ pub const JUSTIFY: PropId = PropId::new(13);
 /// on [`canopy_traits::DisplayItem::Text`]'s `align` field; an unrecognized or absent
 /// value is left-aligned (`0.0`).
 pub const TEXT_ALIGN: PropId = PropId::new(14);
+/// Uniform outer **margin** in logical px (CSS `margin`): space *outside* the border box,
+/// between this node and its flex siblings. Like [`PADDING`] but on the outside; the layout
+/// engine maps it to Taffy's margin on all four sides.
+pub const MARGIN: PropId = PropId::new(15);
+/// **Minimum** width / height in logical px (CSS `min-width` / `min-height`): a floor the
+/// layout engine clamps the box up to, even when content or a percentage would be smaller.
+pub const MIN_WIDTH: PropId = PropId::new(16);
+pub const MIN_HEIGHT: PropId = PropId::new(17);
+/// **Maximum** width / height in logical px (CSS `max-width` / `max-height`): a ceiling the
+/// layout engine clamps the box down to.
+pub const MAX_WIDTH: PropId = PropId::new(18);
+pub const MAX_HEIGHT: PropId = PropId::new(19);
+/// Flex **grow** factor (CSS `flex-grow`), a unitless non-negative number: how much free space
+/// on the container's main axis this child absorbs relative to its siblings. `0` (default) = do
+/// not grow; `1` = take an equal share of the leftover space.
+pub const FLEX_GROW: PropId = PropId::new(20);
+/// **Border width** in logical px (CSS `border-width`): a uniform frame drawn inside the box edge
+/// in [`BORDER_COLOR`]. `0` (default) = no frame. Paint-only — it does not change layout geometry.
+pub const BORDER_WIDTH: PropId = PropId::new(21);
+/// **Border color** (CSS `border-color`), a `#rrggbb` value the renderer strokes the frame in when
+/// [`BORDER_WIDTH`] is positive.
+pub const BORDER_COLOR: PropId = PropId::new(22);
 
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;
