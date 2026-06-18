@@ -1,14 +1,30 @@
 #include "canopy_cpp/build_context.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include "canopy_cpp/protocol.hpp"
+#include "canopy_cpp/reactive.hpp" // complete reactive_runtime for the owned unique_ptr
 
 namespace canopy {
+
+    build_context::build_context() : runtime_(std::make_unique<reactive_runtime>()) {}
+
+    // Out-of-line so the unique_ptr sees a complete reactive_runtime here (it is incomplete at the
+    // header). `= default` after the include gives the engine its proper destructor.
+    build_context::~build_context() = default;
+
+    auto build_context::runtime() noexcept -> reactive_runtime& {
+        return *runtime_;
+    }
+
+    void build_context::flush() {
+        runtime_->flush(*this);
+    }
 
     namespace {
 

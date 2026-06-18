@@ -34,7 +34,7 @@ project(canopy_cpp LANGUAGES CXX VERSION 0.1.0)
 
 # Target: canopy_cpp
 add_library(canopy_cpp STATIC)
-target_sources(canopy_cpp PRIVATE "src/build_context.cpp")
+target_sources(canopy_cpp PRIVATE "src/build_context.cpp" "src/reactive.cpp")
 target_include_directories(canopy_cpp PUBLIC "../../crates/canopy-abi/include" include)
 target_compile_features(canopy_cpp PUBLIC cxx_std_23)
 
@@ -45,6 +45,7 @@ target_sources(
 	PRIVATE
 	"examples/counter_card/main.cpp"
 	"src/build_context.cpp"
+	"src/reactive.cpp"
 )
 target_include_directories(
 	canopy_cpp_counter_example
@@ -69,6 +70,7 @@ target_sources(
 	PRIVATE
 	"src/build_context.cpp"
 	"src/host.cpp"
+	"src/reactive.cpp"
 	"tests/event_loop_test.cpp"
 )
 target_include_directories(canopy_cpp_event_test PRIVATE "../../crates/canopy-abi/include" include)
@@ -81,6 +83,7 @@ target_sources(
 	canopy_cpp_freestanding_smoke
 	PRIVATE
 	"src/build_context.cpp"
+	"src/reactive.cpp"
 	"tests/freestanding_smoke.cpp"
 )
 target_include_directories(
@@ -103,9 +106,34 @@ target_include_directories(
 )
 target_compile_features(canopy_cpp_inplace_test PRIVATE cxx_std_23)
 
+# Target: canopy_cpp_reactive_test
+add_executable(canopy_cpp_reactive_test)
+target_sources(
+	canopy_cpp_reactive_test
+	PRIVATE
+	"src/build_context.cpp"
+	"src/host.cpp"
+	"src/reactive.cpp"
+	"tests/reactive_test.cpp"
+)
+target_include_directories(
+	canopy_cpp_reactive_test
+	PRIVATE
+	"../../crates/canopy-abi/include"
+	include
+)
+target_compile_features(canopy_cpp_reactive_test PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_reactive_test PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_roundtrip_test
 add_executable(canopy_cpp_roundtrip_test)
-target_sources(canopy_cpp_roundtrip_test PRIVATE "src/build_context.cpp" "tests/roundtrip_test.cpp")
+target_sources(
+	canopy_cpp_roundtrip_test
+	PRIVATE
+	"src/build_context.cpp"
+	"src/reactive.cpp"
+	"tests/roundtrip_test.cpp"
+)
 target_include_directories(
 	canopy_cpp_roundtrip_test
 	PRIVATE

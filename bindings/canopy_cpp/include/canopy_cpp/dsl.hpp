@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -9,6 +10,8 @@
 #include <utility>
 
 #include "canopy_cpp/build_context.hpp"
+#include "canopy_cpp/reactive.hpp"
+#include "canopy_cpp/signal.hpp"
 
 // A Leptos-builder-like authoring DSL that compiles to the Canopy op-stream. The factories
 // (div/row/button/text/cls/on_click/...) build lightweight VALUE descriptions — no context,
@@ -107,13 +110,65 @@ namespace canopy {
             ctx.append(parent, ctx.create_text(leaf.text));
         }
 
+        // The heap-owned state a reactive text binding carries across runs: the resolver closure,
+        // the build_context to emit into, and the text node it owns (filled after creation). It
+        // outlives mount because the runtime keeps re-running the effect on later flushes.
+        template <class Fn> struct text_binding {
+            Fn func;
+            build_context* ctx;
+            node_id node{};
+            bool node_created = false;
+        };
+
+        // The effect body for a reactive text binding. First run (node_created == false) only
+        // resolves the closure — under the runtime's `running` it subscribes the signals it reads —
+        // and stashes nothing extra; the caller reads the value via `func()` again to seed the
+        // CreateText, so this run emits NO op (preserving byte-parity with the static path).
+        // Subsequent runs (after the node exists) re-resolve and emit exactly ONE targeted SetText.
+        template <class Fn> void run_text_binding(void* ctx_data, effect_id /*self*/) {
+            auto* binding = static_cast<text_binding<Fn>*>(ctx_data);
+            const std::string value{binding->func()};
+            if (binding->node_created) {
+                binding->ctx->set_text(binding->node, value); // surgical update: one SetText op
+            }
+        }
+
         template <class Fn>
         void apply(build_context& ctx, node_id parent, const dynamic_text<Fn>& leaf) {
             // Force an OWNED string: `auto` would deduce the closure's exact return type, and a
             // closure returning a string_view into a temporary would dangle before create_text
             // reads it. std::string copies the bytes regardless of what func returns.
-            const std::string value{leaf.func()}; // P4: re-run on change; P1 resolves once
-            ctx.append(parent, ctx.create_text(value));
+            reactive_runtime* runtime = active_runtime();
+            if (runtime == nullptr) {
+                // STATIC PATH: no runtime installed → resolve once, byte-identical to static text.
+                const std::string value{leaf.func()};
+                ctx.append(parent, ctx.create_text(value));
+                return;
+            }
+
+            // REACTIVE PATH: register a binding effect (runs once now, subscribing the signals the
+            // closure reads), then create the text node from the SAME resolved value. The effect
+            // re-runs on flush, each run emitting one SetText for `node`. The structural ops here
+            // (CreateText + InsertBefore) are byte-identical to the static path; only the dirty-set
+            // bookkeeping differs, which emits nothing until a signal changes.
+            auto binding = std::make_unique<text_binding<Fn>>(
+                text_binding<Fn>{.func = leaf.func, .ctx = &ctx});
+            auto* raw = binding.get();
+            const auto free_ctx = [](void* ctx_data) noexcept {
+                // Reclaim ownership into a unique_ptr so teardown is RAII — no raw delete.
+                std::unique_ptr<text_binding<Fn>>{static_cast<text_binding<Fn>*>(ctx_data)};
+            };
+            // The runtime takes ownership of the binding box; release the unique_ptr to it.
+            runtime->register_effect(&run_text_binding<Fn>, binding.release(), free_ctx);
+
+            // The first effect run above subscribed the signals; resolve once more for the initial
+            // CreateText content (the same value), then hand the node to the binding so later runs
+            // target it with SetText.
+            const std::string value{raw->func()};
+            const node_id node = ctx.create_text(value);
+            ctx.append(parent, node);
+            raw->node = node;
+            raw->node_created = true;
         }
 
         inline void apply(build_context& ctx, node_id parent, const click_listener& listener) {
@@ -153,8 +208,14 @@ namespace canopy {
     } // namespace detail
 
     // Mount `tree` under `parent` (defaults to the host root); returns the new element node.
+    //
+    // AUTO-DISCOVERY: the build pass installs this context's reactive runtime as active for the
+    // walk, so a reactive `text(λ)` resolves a runtime through the seam and registers a binding —
+    // no component wires a runtime in by hand. A tree with no reactive slot installs the runtime
+    // but never touches it, so its bytes are byte-identical to the non-reactive path.
     template <class... Children>
     auto mount(build_context& ctx, node_id parent, const element<Children...>& tree) -> node_id {
+        const active_runtime_scope scope(&ctx.runtime());
         return detail::apply(ctx, parent, tree);
     }
     template <class... Children>

@@ -13,7 +13,7 @@ cxx = 23
 # (crates/canopy-abi/include/canopy_protocol.h) as its single source of op tags / ids.
 [target.canopy_cpp]
 type = "static"
-sources = ["src/build_context.cpp"]
+sources = ["src/build_context.cpp", "src/reactive.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 
@@ -50,7 +50,7 @@ compile-features = ["cxx_std_23"]
 # flags isolated from the other targets.
 [target.canopy_cpp_freestanding_smoke]
 type = "executable"
-sources = ["tests/freestanding_smoke.cpp", "src/build_context.cpp"]
+sources = ["tests/freestanding_smoke.cpp", "src/build_context.cpp", "src/reactive.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 compile-options = ["-fno-exceptions", "-fno-rtti"]
@@ -60,7 +60,7 @@ compile-options = ["-fno-exceptions", "-fno-rtti"]
 # expected Dom dump. The link dir is relative to the BUILD dir (build/ -> repo target/debug).
 [target.canopy_cpp_roundtrip_test]
 type = "executable"
-sources = ["tests/roundtrip_test.cpp", "src/build_context.cpp"]
+sources = ["tests/roundtrip_test.cpp", "src/build_context.cpp", "src/reactive.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
@@ -70,7 +70,7 @@ link-options = ["-L../../../target/debug", "-lcanopy_abi"]
 # avoid an ODR double-definition) and links libcanopy_abi.a (needs `cargo build -p canopy-abi`).
 [target.canopy_cpp_event_test]
 type = "executable"
-sources = ["tests/event_loop_test.cpp", "src/host.cpp", "src/build_context.cpp"]
+sources = ["tests/event_loop_test.cpp", "src/host.cpp", "src/build_context.cpp", "src/reactive.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
@@ -80,7 +80,19 @@ link-options = ["-L../../../target/debug", "-lcanopy_abi"]
 # test, so it needs `cargo build -p canopy-abi` first.
 [target.canopy_cpp_counter_example]
 type = "executable"
-sources = ["examples/counter_card/main.cpp", "src/build_context.cpp"]
+sources = ["examples/counter_card/main.cpp", "src/build_context.cpp", "src/reactive.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
+# P4 fine-grained reactivity proof: mount a reactive text node, apply through the real engine,
+# snapshot; set the signal, FLUSH, take_batch; assert exactly ONE SetText op (tag 0x14) and ZERO
+# structural ops; apply that surgical batch to the SAME host; snapshot shows the new value. Links
+# libcanopy_abi.a like the round-trip test (needs `cargo build -p canopy-abi`), plus host.cpp for
+# the pump/event path.
+[target.canopy_cpp_reactive_test]
+type = "executable"
+sources = ["tests/reactive_test.cpp", "src/host.cpp", "src/build_context.cpp", "src/reactive.cpp"]
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]

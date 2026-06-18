@@ -8,6 +8,7 @@
 
 #include "canopy_cpp/build_context.hpp"
 #include "canopy_cpp/event.hpp"
+#include "canopy_cpp/reactive.hpp"
 
 namespace canopy {
 
@@ -34,6 +35,11 @@ namespace canopy {
         if (code != CANOPY_OK || len == 0) {
             return 0;
         }
+        // Install the context's runtime as active while handlers run, so a handler's `signal.set`
+        // discovers the runtime through the seam and marks its bound effects dirty. The caller then
+        // `flush`es to emit the surgical update ops. Without this scope a `set` outside a build
+        // pass would no-op and the reactive update would be lost.
+        const active_runtime_scope scope(&ctx.runtime());
         int fired = 0;
         decode_event_batch(buf.data(), len, [&](const dispatch_event& event) {
             if (ctx.invoke_handler(event.handler)) {
