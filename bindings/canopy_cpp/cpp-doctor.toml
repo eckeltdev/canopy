@@ -65,6 +65,18 @@ include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
 
+# Cross-producer parity sweep: ~15 representative DSL trees, each applied through the real Rust
+# engine (libcanopy_abi.a) and asserted byte-for-byte against the snapshot the Rust Emitter would
+# produce for the same tree (deep nesting, multi-class, every inline-style PropId, id+attr, tag
+# name, multiple listeners, plain + reactive text, row/column/button/input, empty, sibling order).
+# Same link/include shape as the round-trip test (needs `cargo build -p canopy-abi` first).
+[target.canopy_cpp_parity_test]
+type = "executable"
+sources = ["tests/parity_test.cpp", "src/build_context.cpp", "src/reactive.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
 # P3 event loop: drives pointer input through the real engine and fires the stored C++ handler
 # closures. Compiles host.cpp + build_context.cpp directly (NOT linking the canopy_cpp lib, to
 # avoid an ODR double-definition) and links libcanopy_abi.a (needs `cargo build -p canopy-abi`).

@@ -143,6 +143,19 @@ target_include_directories(
 target_compile_features(canopy_cpp_on_frt_test PRIVATE cxx_std_23)
 target_compile_options(canopy_cpp_on_frt_test PRIVATE -DFRT_OWN_NEW_DELETE)
 
+# Target: canopy_cpp_parity_test
+add_executable(canopy_cpp_parity_test)
+target_sources(
+	canopy_cpp_parity_test
+	PRIVATE
+	"src/build_context.cpp"
+	"src/reactive.cpp"
+	"tests/parity_test.cpp"
+)
+target_include_directories(canopy_cpp_parity_test PRIVATE "../../crates/canopy-abi/include" include)
+target_compile_features(canopy_cpp_parity_test PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_parity_test PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_reactive_test
 add_executable(canopy_cpp_reactive_test)
 target_sources(

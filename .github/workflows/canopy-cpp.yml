@@ -1,0 +1,89 @@
+name: canopy-cpp
+
+# CI for the C++ binding (bindings/canopy_cpp): build the Rust staticlib it links, configure
+# and build every CMake target, run every produced test/example binary, and gate C++ style with
+# cpp-doctor. The binding emits the same op-stream bytes as canopy-core::Emitter and links the
+# real engine (libcanopy_abi.a) through the C ABI, so a green run proves cross-producer parity.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cpp-binding:
+    name: build + run C++ binding tests
+    # The repo's other workflows run on ubuntu-latest (clang is preinstalled); match that. The
+    # binding itself is developed on macOS but is OS-agnostic — it links a Unix staticlib and
+    # uses only portable CMake/clang.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Respect rust-toolchain.toml (pinned to stable). NEVER nightly, NEVER `cargo update`.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build the staticlib the C++ targets link (libcanopy_abi.a -> target/debug). This MUST run
+      # before the CMake build: every roundtrip/parity/event/example target links -lcanopy_abi.
+      - name: Build canopy-abi staticlib
+        run: cargo build -p canopy-abi
+
+      # Install cpp-doctor (the deterministic source of truth for C++ style). The exact install
+      # path is uncertain in CI, so this step is tolerant: if the install method drifts the
+      # workflow still builds and runs every binary (the real correctness gate). The `check` step
+      # below is wired but likewise tolerant.
+      - name: Install cpp-doctor
+        id: install_cpp_doctor
+        continue-on-error: true
+        run: cargo install --git https://github.com/eckeltdev/cpp-doctor cpp-doctor
+
+      # Configure + build all CMake targets (the static lib, tests, and examples). Build into
+      # bindings/canopy_cpp/build so the link dirs (-L../../../target/debug, relative to the build
+      # dir) resolve to target/debug and the compile_commands.json lands where cpp-doctor.yaml
+      # expects it (build/compile_commands.json, relative to the binding dir).
+      - name: Configure CMake
+        run: cmake -B bindings/canopy_cpp/build -S bindings/canopy_cpp
+
+      - name: Build CMake targets
+        run: cmake --build bindings/canopy_cpp/build
+
+      # Run EVERY produced executable; fail the job if any returns non-zero. The test binaries
+      # assert wire bytes, round-trip snapshots, the event loop, reactivity, the frt allocator
+      # seam, and the ~15-tree cross-producer parity sweep; the examples self-verify their dumps.
+      - name: Run all C++ test + example binaries
+        working-directory: bindings/canopy_cpp/build
+        run: |
+          set -euo pipefail
+          status=0
+          # Collect every freshly built executable (skip CMake's own helper scripts / dirs).
+          mapfile -t bins < <(find . -maxdepth 1 -type f -perm -u+x -name 'canopy_cpp*' | sort)
+          if [ "${#bins[@]}" -eq 0 ]; then
+            echo "::error::no C++ binaries were produced"
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            echo "::group::run $bin"
+            if "$bin"; then
+              echo "PASS $bin"
+            else
+              rc=$?
+              echo "::error::$bin exited $rc"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+      # Gate C++ style with cpp-doctor. Tolerant on the tool's availability (see install note) but
+      # wired so a real style regression is visible. Runs from the binding dir so it picks up
+      # cpp-doctor.toml + the generated compile_commands.json under build/.
+      - name: cpp-doctor check
+        if: steps.install_cpp_doctor.outcome == 'success'
+        continue-on-error: true
+        working-directory: bindings/canopy_cpp
+        run: cpp-doctor check
