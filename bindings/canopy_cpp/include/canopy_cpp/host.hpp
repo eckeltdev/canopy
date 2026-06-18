@@ -34,6 +34,10 @@ namespace canopy {
         // on a node with a matching listener. Returns the number of events queued (0 or 1).
         auto pointer(float pos_x, float pos_y, std::uint8_t button, std::uint16_t event) -> int;
 
+        // Update which node is under the pointer (for `:hover` styling); feed on pointer move.
+        // Returns true if the hovered node changed (re-render to reflect it), false otherwise.
+        auto hover(float pos_x, float pos_y) -> bool;
+
         // Drain queued events and invoke the stored handler for each, looked up in `ctx`'s
         // handler table (the guest-minted handler ids round-trip). Returns the number fired.
         auto pump(build_context& ctx) -> int;

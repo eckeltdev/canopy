@@ -28,7 +28,9 @@ namespace {
         ".bar     { width: 376; height: 56; direction: row; gap: 16 }"
         ".btn     { width: 180; height: 56; radius: 10; color: #11111b }"
         ".primary { background: #89b4fa }"
+        ".primary:hover { background: #b4caff }" // lighter on hover (pointer over the button)
         ".danger  { background: #f38ba8 }"
+        ".danger:hover  { background: #f8b0c4 }"
         ".status  { width: 368; height: 44; background: #45475a; radius: 8; padding: 14;"
         "           color: #a6e3a1 }";
 
@@ -57,8 +59,6 @@ namespace {
 } // namespace
 
 int main() {
-    const std::string path = "canopy_cpp_css.ppm";
-
     // 1. Author the structure (classes only) with the C++ DSL on frt.
     canopy::build_context ctx;
     build_app(ctx);
@@ -67,17 +67,22 @@ int main() {
     canopy::host engine;
     engine.set_stylesheet(stylesheet);
     engine.apply(ctx.take_batch(0));
+    engine.resize(static_cast<float>(view_w), static_cast<float>(view_h)); // viewport for hover hit-test
 
     // 3. Render: the host cascades classes -> styles, lays out, and rasterizes to RGBA8.
-    const std::vector<std::uint8_t> rgba = engine.render_rgba(view_w, view_h);
-    if (rgba.empty()) {
+    const std::vector<std::uint8_t> base = engine.render_rgba(view_w, view_h);
+    if (base.empty()) {
         std::cerr << "render failed (empty framebuffer)\n";
         return 1;
     }
+    write_ppm("canopy_cpp_css.ppm", base);
 
-    // 4. Save the image.
-    write_ppm(path, rgba);
-    std::cout << "canopy C++ (classes only) + CSS stylesheet -> real engine -> " << view_w << 'x'
-              << view_h << " RGBA -> " << path << " (" << engine.node_count() << " nodes)\n";
+    // 4. Move the pointer over the "Run" button (its center) and re-render: the `.primary:hover`
+    //    rule lightens it. Proves `:hover` end to end — same path a live window drives per move.
+    engine.hover(146.0F, 116.0F);
+    write_ppm("canopy_cpp_css_hover.ppm", engine.render_rgba(view_w, view_h));
+
+    std::cout << "canopy C++ (classes only) + CSS stylesheet -> canopy_cpp_css.ppm"
+              << " + canopy_cpp_css_hover.ppm (Run hovered) (" << engine.node_count() << " nodes)\n";
     return 0;
 }

@@ -32,6 +32,10 @@ namespace canopy {
         return canopy_host_pointer(handle_.get(), pos_x, pos_y, button, event);
     }
 
+    auto host::hover(float pos_x, float pos_y) -> bool {
+        return canopy_host_hover(handle_.get(), pos_x, pos_y) > 0;
+    }
+
     auto host::pump(build_context& ctx) -> int {
         std::vector<std::uint8_t> buf(256);
         std::size_t len = 0;

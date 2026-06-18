@@ -194,6 +194,14 @@ int32_t canopy_host_pointer(CanopyHost *host, float x, float y, uint8_t button,
                             uint16_t event);
 
 /*
+ * Update which node is under the pointer at (x, y) for `:hover` styling (feed on pointer move),
+ * so a later canopy_host_render_rgba applies that node's — and its ancestors' — `:hover` rules
+ * from the installed stylesheet. Returns 1 if the hovered node CHANGED (re-render to reflect it),
+ * 0 if it did not (the caller may skip the render), or CANOPY_ERR_NULL_HOST if `host` is null.
+ */
+int32_t canopy_host_hover(CanopyHost *host, float x, float y);
+
+/*
  * Drain queued host -> guest events into `out` (capacity `cap` bytes), writing the byte
  * length to *out_len. The drained bytes are one canopy-protocol batch
  * (BeginBatch ... DispatchEvent* ... EndBatch) the guest decodes with its normal reader.

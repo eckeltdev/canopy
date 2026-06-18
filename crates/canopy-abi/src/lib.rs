@@ -129,6 +129,9 @@ pub struct CanopyHost {
     /// classes resolve to inline styles, author inline winning) — so `class`-styled trees paint
     /// without the guest expanding any CSS. `None` = inline-only styling.
     stylesheet: Option<Stylesheet>,
+    /// The node currently under the pointer (set via [`canopy_host_hover`]); its `:hover` rules
+    /// (and its ancestors') apply during the cascade. `None` when the pointer is outside the tree.
+    hovered: Option<NodeId>,
 }
 
 impl CanopyHost {
@@ -142,6 +145,7 @@ impl CanopyHost {
             pending_events: Vec::new(),
             event_seq: 0,
             stylesheet: None,
+            hovered: None,
         }
     }
 
@@ -162,6 +166,9 @@ impl CanopyHost {
     /// count, and the debug snapshot stay exactly what the guest authored.
     fn styled_dom(&self) -> Option<Dom> {
         let sheet = self.stylesheet.as_ref()?;
+        // The `:hover` chain: a node matches `:hover` when the pointer is over it OR a descendant,
+        // so the hovered leaf and every ancestor up to the root are "hovered" (CSS semantics).
+        let hover_path = self.hover_path();
         let mut dom = self.dom.clone();
         // Collect (node, prop, value) first so the immutable walk doesn't overlap the mutation.
         let mut overlay: Vec<(NodeId, PropId, String)> = Vec::new();
@@ -170,7 +177,7 @@ impl CanopyHost {
             let Some(n) = dom.node(node) else { continue };
             if !n.classes.is_empty() {
                 let classes: Vec<&str> = n.classes.iter().map(String::as_str).collect();
-                for (prop, value) in sheet.resolve(&classes, false) {
+                for (prop, value) in sheet.resolve(&classes, hover_path.contains(&node)) {
                     // Author inline styles win over class rules (CSS specificity: inline beats
                     // a class selector), so only fold in a property the node didn't set itself.
                     if !n.styles.contains_key(&prop) {
@@ -184,6 +191,37 @@ impl CanopyHost {
             dom.set_inline_style(node, prop, value);
         }
         Some(dom)
+    }
+
+    /// The chain of node ids from the hovered leaf ([`Self::hovered`]) up to the root, i.e. every
+    /// node a `:hover` rule should match (the leaf under the pointer and all its ancestors). Empty
+    /// when nothing is hovered. A short, shallow path, so a `Vec` + linear `contains` is plenty.
+    fn hover_path(&self) -> Vec<NodeId> {
+        let mut path = Vec::new();
+        let mut cur = self.hovered;
+        while let Some(node) = cur {
+            path.push(node);
+            cur = self.dom.node(node).and_then(|n| n.parent);
+        }
+        path
+    }
+
+    /// Update which node is under the pointer at `(x, y)` for `:hover` styling. Hit-tests the
+    /// styled geometry (so hover tracks what is painted) and records the topmost node, or `None`
+    /// outside the tree. Returns `true` if the hovered node changed — the caller should re-render
+    /// (and may skip the render when it returns `false`).
+    pub fn set_hover(&mut self, x: f32, y: f32) -> bool {
+        let hit = {
+            let styled = self.styled_dom();
+            let dom = styled.as_ref().unwrap_or(&self.dom);
+            let (_scene, layout) = canopy_layout_taffy::layout(dom, self.viewport);
+            canopy_layout_taffy::hit_test(&layout, Point { x, y })
+        };
+        if hit == self.hovered {
+            return false;
+        }
+        self.hovered = hit;
+        true
     }
 
     /// Set the viewport the tree is laid out within for hit-testing.
@@ -735,6 +773,25 @@ pub unsafe extern "C" fn canopy_host_pointer(
     host.pointer_event(x, y, button, event)
 }
 
+/// Update which node is under the pointer at `(x, y)` for `:hover` styling, so a later
+/// [`canopy_host_render_rgba`] applies the node's (and its ancestors') `:hover` rules. Feed this
+/// on pointer move. Returns `1` if the hovered node changed (re-render to reflect it), `0` if it
+/// did not (the caller can skip the render), or [`CANOPY_ERR_NULL_HOST`] if `host` is null.
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`] that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_hover(host: *mut CanopyHost, x: f32, y: f32) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; unique ref for this
+    // call only.
+    let host = unsafe { &mut *host };
+    i32::from(host.set_hover(x, y))
+}
+
 /// Drain queued host→guest events into `out` (capacity `cap` bytes), writing the byte
 /// length to `*out_len`. The drained bytes are one `canopy-protocol` batch
 /// (`BeginBatch … DispatchEvent* … EndBatch`) the guest decodes with its normal reader.
@@ -1053,6 +1110,59 @@ mod tests {
                 .chunks_exact(4)
                 .any(|p| p[0] > 200 && p[1] < 80 && p[2] < 80),
             "clearing the stylesheet drops the class styling"
+        );
+    }
+
+    #[test]
+    fn hover_restyles_the_node_under_the_pointer() {
+        // A button styled by class: `.btn` is blue, `.btn:hover` is red. Moving the pointer over
+        // it must apply `:hover` (red); moving away reverts (blue).
+        let mut e = Emitter::new();
+        let btn = e.create_element(ElementTag::new(3)); // button
+        e.append(ROOT, btn);
+        e.set_class(btn, "btn");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_viewport(100.0, 60.0);
+        host.set_stylesheet(
+            ".btn { width: 100; height: 60; background: #0000ff } .btn:hover { background: #ff0000 }",
+        );
+
+        let center = (50usize, 30usize);
+        let rgb = |buf: &[u8], at: (usize, usize)| {
+            let i = (at.1 * 100 + at.0) * 4;
+            (buf[i], buf[i + 1], buf[i + 2])
+        };
+        let is_blue = |c: (u8, u8, u8)| c.0 < 80 && c.1 < 80 && c.2 > 200;
+        let is_red = |c: (u8, u8, u8)| c.0 > 200 && c.1 < 80 && c.2 < 80;
+
+        // Pointer outside: base `.btn` is blue.
+        assert!(
+            is_blue(rgb(&host.render_rgba(100, 60), center)),
+            "base .btn is blue"
+        );
+
+        // Move over the button: hover changed -> re-render shows `.btn:hover` red.
+        assert!(
+            host.set_hover(50.0, 30.0),
+            "set_hover reports the hovered node changed"
+        );
+        assert!(
+            is_red(rgb(&host.render_rgba(100, 60), center)),
+            ".btn:hover paints red"
+        );
+
+        // Move off the button: hover changed back -> blue again.
+        assert!(host.set_hover(500.0, 500.0), "hover left the button");
+        assert!(
+            is_blue(rgb(&host.render_rgba(100, 60), center)),
+            "reverts to base blue"
+        );
+
+        // Staying off the button: no change, so the caller can skip the render.
+        assert!(
+            !host.set_hover(500.0, 500.0),
+            "no change reported when hover stays out"
         );
     }
 

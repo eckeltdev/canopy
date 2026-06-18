@@ -71,19 +71,19 @@ namespace {
                         row( // counter row: [-] [count] [+]
                             style(wire::prop_width, "376"), style(wire::prop_height, "72"),
                             style(wire::prop_direction, "row"), style(wire::prop_gap, "16"),
-                            button(style(wire::prop_width, "80"), style(wire::prop_height, "72"),
-                                   style(wire::prop_bg, "#f38ba8"), style(wire::prop_radius, "12"),
-                                   style(wire::prop_fg, "#11111b"),
-                                   on_click([this] { count.set(count.get() - 1); }), "-"), // buttons auto-center
+                            button(cls("minus"), style(wire::prop_width, "80"),
+                                   style(wire::prop_height, "72"), style(wire::prop_radius, "12"),
+                                   style(wire::prop_fg, "#11111b"), // bg + :hover come from the stylesheet
+                                   on_click([this] { count.set(count.get() - 1); }), "-"),
                             div( // count readout (reactive text), centered both axes
                                 style(wire::prop_width, "184"), style(wire::prop_height, "72"),
                                 style(wire::prop_bg, "#45475a"), style(wire::prop_radius, "12"),
                                 style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
                                 style(wire::prop_fg, "#f9e2af"),
                                 text([this] { return std::to_string(count.get()); })),
-                            button(style(wire::prop_width, "80"), style(wire::prop_height, "72"),
-                                   style(wire::prop_bg, "#a6e3a1"), style(wire::prop_radius, "12"),
-                                   style(wire::prop_fg, "#11111b"),
+                            button(cls("plus"), style(wire::prop_width, "80"),
+                                   style(wire::prop_height, "72"), style(wire::prop_radius, "12"),
+                                   style(wire::prop_fg, "#11111b"), // bg + :hover come from the stylesheet
                                    on_click([this] { count.set(count.get() + 1); }), "+")),
                         text("click + / - to count"),
                         text("auto-ticks (no input):"),
@@ -100,6 +100,15 @@ namespace {
 
             engine.apply(ctx.take_batch(seq++));
             engine.resize(static_cast<float>(kViewW), static_cast<float>(kViewH));
+            // The buttons' background + :hover come from CSS classes, so hovering a button lightens
+            // it (the host cascades `.minus`/`.plus` and their `:hover` rules per pointer move).
+            engine.set_stylesheet(".minus { background: #f38ba8 } .minus:hover { background: #f7a9bd }"
+                                  ".plus  { background: #a6e3a1 } .plus:hover  { background: #c2edbb }");
+        }
+
+        // Update the hovered node from a pointer position; true if it changed (redraw needed).
+        bool hover(double pos_x, double pos_y) {
+            return engine.hover(static_cast<float>(pos_x), static_cast<float>(pos_y));
         }
 
         // Deliver a click in canopy pixel space. Returns true if it changed the UI (redraw needed).
@@ -159,11 +168,18 @@ namespace {
             app.tick();
         }
 
+        // Hover: moving onto the "+" button (center 380,112) changes the hovered node; moving off
+        // (outside the window) changes it back. Both report a change -> a live window would redraw.
+        const bool hover_on = app.hover(380.0, 112.0);
+        const bool hover_off = app.hover(2000.0, 2000.0);
+
         const bool click_ok = hit && app.count.get() == 1;
         const bool anim_ok = app.ticks.get() == kTicks;
-        std::printf("selftest: click hit a handler = %s; count now = %d; ticks now = %d (want %d)\n",
-                    hit ? "yes" : "no", app.count.get(), app.ticks.get(), kTicks);
-        return (click_ok && anim_ok) ? 0 : 1;
+        const bool hover_ok = hover_on && hover_off;
+        std::printf("selftest: click=%s count=%d ticks=%d/%d hover on/off=%s/%s\n", hit ? "yes" : "no",
+                    app.count.get(), app.ticks.get(), kTicks, hover_on ? "y" : "n",
+                    hover_off ? "y" : "n");
+        return (click_ok && anim_ok && hover_ok) ? 0 : 1;
     }
 
 } // namespace
@@ -222,6 +238,28 @@ namespace {
     const NSPoint local = [self convertPoint:event.locationInWindow fromView:nil];
     // The content view is a fixed kViewW x kViewH, so local coords ARE canopy pixels (flipped Y).
     if (app_->click(local.x, local.y)) {
+        [self setNeedsDisplay:YES];
+    }
+}
+
+// A tracking area over the visible rect so the view receives mouseMoved for `:hover`.
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea* area in self.trackingAreas) {
+        [self removeTrackingArea:area];
+    }
+    NSTrackingArea* area = [[NSTrackingArea alloc]
+        initWithRect:self.bounds
+             options:(NSTrackingMouseMoved | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect)
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:area];
+}
+
+- (void)mouseMoved:(NSEvent*)event {
+    const NSPoint local = [self convertPoint:event.locationInWindow fromView:nil];
+    // Feed the pointer to the engine's hover tracking; redraw only when the hovered node changed.
+    if (app_->hover(local.x, local.y)) {
         [self setNeedsDisplay:YES];
     }
 }
