@@ -5,6 +5,7 @@
 
 #include "xstd/bitwise.hpp"
 #include "xstd/fnv.hpp"
+#include "xstd/narrow_cast.hpp" // pulls the assert -> logger -> formatting chain (vendor-patched)
 
 // Proof that the vendored xstd extended STL compiles AND runs on frt under the freestanding
 // configuration (-fno-exceptions -fno-rtti): exercise a couple of pure, allocation-free xstd
@@ -31,6 +32,14 @@ namespace {
             std::cerr << "FAIL: xstd::fnv1a produced a zero digest\n";
             return false;
         }
+
+        // narrow_cast: a value within range narrows cleanly (no failure path). This pulls the
+        // assert -> logger -> formatting chain, so it proves that whole chain works on frt.
+        const auto narrowed = xstd::narrow_cast<std::uint8_t>(200);
+        if (narrowed != 200) {
+            std::cerr << "FAIL: xstd::narrow_cast\n";
+            return false;
+        }
         return true;
     }
 
@@ -38,7 +47,8 @@ namespace {
 
 int main() {
     if (xstd_bitwise_and_fnv_work()) {
-        std::cerr << "ok: xstd (bitwise + fnv) compiles and runs on frt, freestanding\n";
+        std::cerr << "ok: xstd (bitwise + fnv + narrow_cast) compiles and runs on frt, "
+                     "freestanding\n";
         return 0;
     }
     return 1;

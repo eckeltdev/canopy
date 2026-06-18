@@ -6,17 +6,17 @@
 // After including this, include the specific xstd headers you want.
 //
 // CURATED FREESTANDING-SAFE SUBSET — compiles under -fno-exceptions -fno-rtti today:
-//   xstd/type_helpers.hpp, xstd/bitwise.hpp, xstd/fnv.hpp  (+ their transitive base
-//   xstd/intrinsics.hpp, whose x86 paths are arch-guarded so they are skipped on AArch64).
+//   type_helpers, bitwise, fnv, math, narrow_cast, result, assert, formatting, logger (+ their
+//   transitive base xstd/intrinsics.hpp, whose x86 paths are arch-guarded, skipped on AArch64).
+//   The assert/logger/formatting chain was unblocked by one frt vendor patch to
+//   xstd/formatting.hpp (a deduced-return `as_string` used before its definition, which Apple
+//   clang 17 rejects — see the "frt vendor patch" comment there). Genuinely hosted xstd
+//   (http / coro / sockets / gzip / file / thread_pool / time) stays out by not being included.
 //
-// GATED (not yet supported freestanding): anything that pulls xstd/assert.hpp, which drags
-// xstd/logger.hpp -> xstd/formatting.hpp. formatting.hpp has a deduced-return-type ordering
-// issue (its single-argument `as_string` is called by the STL string_formatter<> specialisations
-// before its own definition) that Apple clang 17 rejects. Unlocking that chain — a vendor patch
-// to xstd/formatting.hpp — is what enables narrow_cast / result / assert and the
-// XSTD_ASSERT -> frt_platform_panic and XSTD_DEFAULT_CLOCK_READ -> frt_platform_ticks bindings
-// (deliberately NOT defined here yet, since the headers that consume them do not build, so
-// frt/frt_platform.h is intentionally not yet included here — it returns with those bindings).
+// STILL DEFERRED: the platform-hook BINDINGS (XSTD_ASSERT failure -> frt_platform_panic via
+// xstd's logger/error config; XSTD_DEFAULT_CLOCK_READ -> frt_platform_ticks). Those headers
+// COMPILE now but aren't yet ROUTED to the frt seam — that wiring + its test is the next step,
+// which is why frt/frt_platform.h is not yet included here.
 
 // xstd resolves a would-be `throw` into an error value instead of a C++ exception — required
 // under -fno-exceptions and the correct policy for the runtime core.

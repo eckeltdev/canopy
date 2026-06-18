@@ -286,7 +286,11 @@ namespace xstd::fmt
 		FORCE_INLINE inline std::string operator()( const std::optional<T>& value ) const
 		{
 			if ( value ) return as_string( value.value() );
-			else         return as_string( std::nullopt );
+			// frt vendor patch: was `as_string( std::nullopt )` — that calls the single-arg
+			// as_string (deduced return, defined later in this file) before its definition,
+			// which Apple clang 17 rejects. string_formatter<std::nullopt_t> just yields
+			// "nullopt", so emit it directly and avoid the before-definition use.
+			else         return std::string{ "nullopt" };
 		}
 	};
 	template<StringConvertible T>
