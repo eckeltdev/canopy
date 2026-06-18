@@ -1,0 +1,57 @@
+[cmake]
+version = "3.15...3.31"
+mode = "managed"
+
+[project]
+name = "frt"
+version = "0.1.0"
+languages = ["CXX"]
+cxx = 23
+
+# frt: the freestanding C++ runtime Canopy owns. The C ABI floor (frt_platform.h)
+# is the only thing both the C++ core and (on device) the Rust #[global_allocator] route
+# through. Built inside Canopy now; extracted to its own repo later (Canopy still includes it).
+
+# The runtime library: the platform seam + the host-POSIX backend. Deliberately does NOT
+# contain the operator new/delete definitions (those are replaceable, one-per-image, so they
+# are added by-source only to the target that opts in — see frt_new_delete_test).
+[target.frt]
+type = "static"
+sources = ["src/platform.cpp", "src/backend_host_posix.cpp"]
+include-directories = ["include"]
+compile-features = ["cxx_std_23"]
+
+# Platform-seam test: alloc/free round-trip, monotonic ticks, and runtime backend override.
+# Links the lib only (system allocator — no operator-new override here).
+[target.frt_platform_test]
+type = "executable"
+sources = ["tests/platform_host_test.cpp"]
+include-directories = ["include"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["frt"]
+
+# new/delete routing test: compiles new_delete.cpp + the debug-tracking backend BY SOURCE
+# (FRT_OWN_NEW_DELETE makes new_delete.cpp define the global operators ONLY here),
+# proving std::vector/std::map/std::string allocate through frt_platform_alloc/free.
+[target.frt_new_delete_test]
+type = "executable"
+sources = ["tests/new_delete_route_test.cpp", "src/new_delete.cpp", "src/backend_debug_tracking.cpp"]
+include-directories = ["include"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-DFRT_OWN_NEW_DELETE"]
+link-libraries = ["frt"]
+
+# M2 STL-surface smoke: the developer-facing header surface (containers.hpp / stl.hpp /
+# config.hpp), compiled in the FREESTANDING configuration. -fno-exceptions / -fno-rtti +
+# -DFRT_FREESTANDING=1 fire config.hpp's static_asserts (exceptions and RTTI must be off),
+# so the TU compiling proves the policy; the test body proves fixed_vector overflow returns false
+# (no throw) and the arena bumps/resets. The surface is header-only; it links frt purely so
+# the platform seam (frt_platform_panic, behind FRT_PANIC) resolves — exactly how a
+# backend supplies that C ABI floor symbol on the device.
+[target.frt_surface_test]
+type = "executable"
+sources = ["tests/rt_surface_smoke.cpp"]
+include-directories = ["include"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-fno-exceptions", "-fno-rtti", "-DFRT_FREESTANDING=1"]
+link-libraries = ["frt"]
