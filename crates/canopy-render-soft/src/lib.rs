@@ -338,11 +338,64 @@ impl Buffer {
     /// background shows through. `size` is the target cell height in pixels; the
     /// font is 8px tall, so the integer scale is `max(1, (size / 8).floor())`. Each
     /// source pixel is drawn as a `scale`×`scale` block.
+    ///
+    /// The run is **vertically centered within the line height**: see
+    /// [`blit_text_in_box`](Buffer::blit_text_in_box) for the centering math. This
+    /// convenience wrapper applies no horizontal box clip (the run is bounded only by
+    /// the buffer edges) — the renderer's `DisplayItem::Text` path calls
+    /// [`blit_text_in_box`](Buffer::blit_text_in_box) directly to clip to the box.
     pub fn blit_text(&mut self, origin: Point, text: &str, color: Color, size: f32) {
+        // No box clip: bound only by the buffer (an effectively infinite right edge).
+        self.blit_text_in_box(origin, text, color, size, f32::INFINITY);
+    }
+
+    /// Blit `text` like [`blit_text`](Buffer::blit_text), but **clipped to a box's
+    /// right edge** and **vertically centered within the line height**.
+    ///
+    /// ## Vertical centering
+    /// The baked glyph occupies only `CELL_H * scale` pixels, while the layout asked
+    /// for a `size`-px-tall line. When `size` exceeds that baked pixel height (the
+    /// usual case for any `size` that is not an exact multiple of 8 — e.g. `size = 20`
+    /// is scale 2 -> 16 baked px, leaving 4px of slack) the run is offset down by
+    /// `(size - CELL_H * scale) / 2` so the glyphs sit in the vertical middle of the
+    /// line box instead of pinned to its top.
+    ///
+    /// Limitation: `DisplayItem::Text` carries no `box_h`, only the line `size`, so
+    /// the renderer can only center the glyphs *within the baked line height* (`size`),
+    /// not within a taller layout box. Centering a short line inside a tall box would
+    /// need the box height on the seam; here we center within the geometry we have.
+    ///
+    /// ## Horizontal box clipping
+    /// `box_right` is the run box's absolute right edge in pixels (origin x + box
+    /// width). Any glyph pixel at or past `box_right` is dropped, so a run longer than
+    /// its container stops at the box edge rather than spilling past it. This is a box
+    /// clip, distinct from the buffer-bounds clip in [`put_pixel`](Buffer::put_pixel):
+    /// it bounds the run to its container even when the buffer is wider. Pass
+    /// `f32::INFINITY` for no box clip.
+    pub fn blit_text_in_box(
+        &mut self,
+        origin: Point,
+        text: &str,
+        color: Color,
+        size: f32,
+        box_right: f32,
+    ) {
         let scale = ((size / CELL_H as f32) as usize).max(1);
         let advance = CELL_W as usize * scale;
         let ox = origin.x as usize;
-        let oy = origin.y as usize;
+        // Vertical center within the line height: push the baked glyph (CELL_H * scale
+        // px tall) down by half the leftover slack so it sits mid-line, not top-pinned.
+        let glyph_h = CELL_H as usize * scale;
+        let slack = (size as usize).saturating_sub(glyph_h);
+        let oy = origin.y as usize + slack / 2;
+        // Box-width clip: never paint a pixel at/after the box's right edge. Saturating
+        // `f32 as usize` keeps a negative/empty box from wrapping to a huge bound; an
+        // infinite (no-clip) edge saturates to `usize::MAX`, so nothing is clipped.
+        let clip_x = if box_right >= usize::MAX as f32 {
+            usize::MAX
+        } else {
+            box_right.max(0.0) as usize
+        };
         for (col, ch) in text.chars().enumerate() {
             let bitmap = glyph(ch);
             let cell_x = ox + col * advance;
@@ -354,7 +407,12 @@ impl Buffer {
                         let py0 = oy + row * scale;
                         for dy in 0..scale {
                             for dx in 0..scale {
-                                self.put_pixel(px0 + dx, py0 + dy, color);
+                                let px = px0 + dx;
+                                // Stop the run at the box's right edge.
+                                if px >= clip_x {
+                                    continue;
+                                }
+                                self.put_pixel(px, py0 + dy, color);
                             }
                         }
                     }
@@ -441,11 +499,18 @@ impl Renderer for SoftwareRenderer {
                     let scale = ((size / CELL_H as f32) as usize).max(1);
                     let advance = (CELL_W as usize * scale) as f32;
                     let run_w = text.chars().count() as f32 * advance;
+                    // The run box's right edge is the *unshifted* origin x plus the box
+                    // width; capture it before shadowing `origin` with the align shift.
+                    // Glyph pixels at/past this are clipped so the run cannot spill out
+                    // of its container — composes with the align shift and the vertical
+                    // centering done inside `blit_text`.
+                    let box_right = origin.x + box_w;
                     let origin = Point {
                         x: origin.x + ((box_w - run_w) * align).max(0.0),
                         y: origin.y,
                     };
-                    self.buffer.blit_text(origin, text, *color, *size)
+                    self.buffer
+                        .blit_text_in_box(origin, text, *color, *size, box_right)
                 }
                 DisplayItem::Border {
                     rect,
@@ -765,6 +830,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE vertical-centering proof: a baked run on a line *taller* than the baked
+    /// glyph height must have its ink land in the vertical middle band of the line,
+    /// not pinned to the top row. `size = 20` is scale 2 (glyph is 16 baked px), so
+    /// there is `20 - 16 = 4` px of slack and the glyph is pushed down `4 / 2 = 2` px;
+    /// the top two buffer rows stay background and the 'A' crossbar lands mid-buffer.
+    #[test]
+    fn text_is_vertically_centered_in_a_tall_line() {
+        let bg = Color {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+            a: 255,
+        };
+        let ink = Color {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+            a: 255,
+        };
+        // A 20px-tall line (scale 2 -> 16 baked px, 4px slack). Buffer is the line
+        // height so "middle band" is unambiguous; box is one glyph cell wide.
+        let mut r = SoftwareRenderer::new(16, 20, bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Text {
+                origin: Point { x: 0.0, y: 0.0 },
+                text: "A".into(),
+                color: ink,
+                size: 20.0,
+                box_w: 16.0,
+                align: 0.0,
+            }],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let is_ink = |x: usize, y: usize| buf.pixel(x, y) == [ink.r, ink.g, ink.b, ink.a];
+        let row_has_ink = |y: usize| (0..buf.width()).any(|x| is_ink(x, y));
+
+        // The top two rows are the centering slack: glyph row 0 is offset down to
+        // buffer row 2, so rows 0 and 1 stay background (not top-pinned).
+        assert!(!row_has_ink(0), "top row must be background, not ink");
+        assert!(!row_has_ink(1), "second row must be background, not ink");
+
+        // The vertical middle band of the line carries ink (the 'A' crossbar, row 4 of
+        // the glyph -> buffer rows 10/11 at scale 2): proof the run sits mid-line.
+        let mid = buf.height() / 2; // 10
+        assert!(
+            (mid.saturating_sub(1)..=mid + 1).any(row_has_ink),
+            "expected ink in the vertical middle band around row {mid}"
+        );
+
+        // The topmost inked row is the slack offset (2), not 0.
+        let topmost_ink = (0..buf.height())
+            .find(|&y| row_has_ink(y))
+            .expect("the run must have inked some row");
+        assert_eq!(
+            topmost_ink, 2,
+            "ink starts at the centering offset, not the top"
+        );
+    }
+
+    /// THE box-clip proof: a run wider than its box stops at the box's right edge —
+    /// no glyph pixel is painted at or past it — even though the buffer is wider, so
+    /// this is a true box clip, not the buffer-bounds clip. "AAAA" at scale 1 is a
+    /// 32px run; a `box_w` of 16 admits only the first two cells, and columns 16.. of
+    /// the wider buffer stay background.
+    #[test]
+    fn text_wider_than_its_box_is_clipped_at_the_box_edge() {
+        let bg = Color {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+            a: 255,
+        };
+        let ink = Color {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+            a: 255,
+        };
+        let box_w = 16.0_f32; // two 8px cells
+                              // Buffer (40px) is wider than the box, so any ink past col 16 would be a
+                              // genuine box-clip failure, not a buffer overflow.
+        let mut r = SoftwareRenderer::new(40, 8, bg);
+        let scene = DisplayList {
+            items: vec![DisplayItem::Text {
+                origin: Point { x: 0.0, y: 0.0 },
+                text: "AAAA".into(), // 4 cells = 32px, twice the box width
+                color: ink,
+                size: 8.0, // scale 1
+                box_w,
+                align: 0.0,
+            }],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let is_ink = |x: usize, y: usize| buf.pixel(x, y) == [ink.r, ink.g, ink.b, ink.a];
+
+        // No ink at or past the box's right edge (column 16): the run is clipped.
+        let right = box_w as usize; // 16
+        for x in right..buf.width() {
+            for y in 0..buf.height() {
+                assert_eq!(
+                    buf.pixel(x, y),
+                    [bg.r, bg.g, bg.b, bg.a],
+                    "no ink may spill past the box edge, found at ({x},{y})"
+                );
+            }
+        }
+
+        // The run did draw *inside* the box — proof we clipped the overflow, not the
+        // whole run (the first 'A' apex inks columns 2..5 of cell 0).
+        let any_ink_in_box = (0..right).any(|x| (0..buf.height()).any(|y| is_ink(x, y)));
+        assert!(
+            any_ink_in_box,
+            "the part of the run inside the box must be drawn"
+        );
     }
 
     /// THE rounded-rect proof: a filled rounded rect over a contrasting background
