@@ -47,7 +47,7 @@ use canopy_paint::{
     ALIGN, BG, DIRECTION, FG, GAP, HEIGHT, JUSTIFY, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
     TRANSLATE_X, TRANSLATE_Y, WIDTH,
 };
-use canopy_protocol::{NodeId, PropId};
+use canopy_protocol::{ElementTag, NodeId, PropId};
 use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, Size};
 
 use taffy::prelude::length;
@@ -61,6 +61,10 @@ const TEXT_HEIGHT: u32 = 16;
 /// The baked font's square cell size in px (`canopy_text_baked::CELL_W == CELL_H == 8`). A
 /// text run's width estimate steps by this so the layout box matches the renderer's advance.
 const BAKED_CELL_PX: f32 = 8.0;
+/// Well-known element tags (mirrors the protocol's `ElementTag` registry) whose lite layout
+/// gets a UA-stylesheet default: a button/input centers its content unless the author overrides.
+const EL_BUTTON: u16 = 3;
+const EL_INPUT: u16 = 4;
 /// Default foreground ink (light gray) when no [`FG`] is set.
 const DEFAULT_FG: Color = Color {
     r: 0xe6,
@@ -335,10 +339,23 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
     // auto (content-sized) when absent — see `style_dimension`.
     let width = style_dimension(dom, id, WIDTH);
     let height = style_dimension(dom, id, HEIGHT);
+    // UA-stylesheet default: a button/input centers its label on BOTH axes (the cross axis via
+    // align-items, the main axis via justify-content) unless the author sets align/justify,
+    // mirroring how browsers center `<button>` content. Plain containers keep Taffy's defaults
+    // (stretch / flex-start). This is what seats a label in the middle of a taller button without
+    // any per-node align/justify — the glyph is then vertically centered within that box by
+    // canopy_render_soft, so font scale (driven by the run height) is unaffected.
+    let centers_content = matches!(
+        dom.node(id).and_then(|n| n.tag),
+        Some(tag) if tag == ElementTag::new(EL_BUTTON) || tag == ElementTag::new(EL_INPUT)
+    );
+    let align_items = style_align(dom, id).or(centers_content.then_some(AlignItems::CENTER));
+    let justify_content =
+        style_justify(dom, id).or(centers_content.then_some(JustifyContent::CENTER));
     Style {
         flex_direction: dir,
-        align_items: style_align(dom, id),
-        justify_content: style_justify(dom, id),
+        align_items,
+        justify_content,
         gap: TaffySize {
             width: length(gap),
             height: length(gap),
@@ -693,6 +710,58 @@ mod tests {
         assert!(
             lay.rects.len() < depth,
             "the deep tail was truncated, not laid out"
+        );
+    }
+
+    #[test]
+    fn a_button_centers_its_label_by_default() {
+        // UA-stylesheet default: a button (tag 3) centers its label on both axes with NO explicit
+        // align/justify — the common case the lite tier should "just work".
+        let mut e = Emitter::new();
+        let btn = e.create_element(ElementTag::new(3)); // button
+        e.append(ROOT, btn);
+        e.set_inline_style(btn, WIDTH, "100");
+        e.set_inline_style(btn, HEIGHT, "60");
+        let label = e.create_text("ok"); // 2 chars -> 32x16 box (advance 16)
+        e.append(btn, label);
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let btn_r = lay.rects.iter().find(|(id, _)| *id == btn).unwrap().1;
+        let lbl_r = lay.rects.iter().find(|(id, _)| *id == label).unwrap().1;
+        let lbl_cx = lbl_r.origin.x + lbl_r.size.w / 2.0;
+        let lbl_cy = lbl_r.origin.y + lbl_r.size.h / 2.0;
+        let btn_cx = btn_r.origin.x + btn_r.size.w / 2.0;
+        let btn_cy = btn_r.origin.y + btn_r.size.h / 2.0;
+        assert!(
+            (lbl_cx - btn_cx).abs() < 0.5,
+            "label centered horizontally ({lbl_cx} vs {btn_cx})"
+        );
+        assert!(
+            (lbl_cy - btn_cy).abs() < 0.5,
+            "label centered vertically ({lbl_cy} vs {btn_cy})"
+        );
+    }
+
+    #[test]
+    fn a_plain_column_leaves_its_child_at_the_start() {
+        // The default is scoped to buttons/inputs: a plain column keeps Taffy's flex-start, so the
+        // child stays at the top-left (no surprise centering of arbitrary containers).
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1)); // column
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "100");
+        e.set_inline_style(col, HEIGHT, "60");
+        let label = e.create_text("ok");
+        e.append(col, label);
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let lbl_r = lay.rects.iter().find(|(id, _)| *id == label).unwrap().1;
+        assert_eq!(
+            lbl_r.origin,
+            Point { x: 0.0, y: 0.0 },
+            "plain column: child at the start"
         );
     }
 

@@ -44,11 +44,11 @@ namespace {
                         style(wire::prop_gap, "16"),
                         button(style(wire::prop_width, "180"), style(wire::prop_height, "56"),
                                style(wire::prop_bg, "#89b4fa"), style(wire::prop_radius, "10"),
-                               style(wire::prop_padding, "20"), style(wire::prop_fg, "#11111b"),
+                               style(wire::prop_fg, "#11111b"),
                                on_click([] {}), "Run"),
                         button(style(wire::prop_width, "180"), style(wire::prop_height, "56"),
                                style(wire::prop_bg, "#f38ba8"), style(wire::prop_radius, "10"),
-                               style(wire::prop_padding, "20"), style(wire::prop_fg, "#11111b"),
+                               style(wire::prop_fg, "#11111b"),
                                on_click([] {}), "Stop")),
                     div( // the status bar
                         style(wire::prop_width, "368"), style(wire::prop_height, "48"),

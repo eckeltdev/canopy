@@ -74,8 +74,7 @@ namespace {
                             button(style(wire::prop_width, "80"), style(wire::prop_height, "72"),
                                    style(wire::prop_bg, "#f38ba8"), style(wire::prop_radius, "12"),
                                    style(wire::prop_fg, "#11111b"),
-                                   style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
-                                   on_click([this] { count.set(count.get() - 1); }), "-"),
+                                   on_click([this] { count.set(count.get() - 1); }), "-"), // buttons auto-center
                             div( // count readout (reactive text), centered both axes
                                 style(wire::prop_width, "184"), style(wire::prop_height, "72"),
                                 style(wire::prop_bg, "#45475a"), style(wire::prop_radius, "12"),
@@ -85,7 +84,6 @@ namespace {
                             button(style(wire::prop_width, "80"), style(wire::prop_height, "72"),
                                    style(wire::prop_bg, "#a6e3a1"), style(wire::prop_radius, "12"),
                                    style(wire::prop_fg, "#11111b"),
-                                   style(wire::prop_align, "center"), style(wire::prop_justify, "center"),
                                    on_click([this] { count.set(count.get() + 1); }), "+")),
                         text("click + / - to count"),
                         text("auto-ticks (no input):"),
