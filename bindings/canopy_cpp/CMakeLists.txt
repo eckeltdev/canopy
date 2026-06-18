@@ -106,6 +106,29 @@ target_include_directories(
 )
 target_compile_features(canopy_cpp_inplace_test PRIVATE cxx_std_23)
 
+# Target: canopy_cpp_on_frt_test
+add_executable(canopy_cpp_on_frt_test)
+target_sources(
+	canopy_cpp_on_frt_test
+	PRIVATE
+	"../../runtime/frt/src/backend_debug_tracking.cpp"
+	"../../runtime/frt/src/backend_host_posix.cpp"
+	"../../runtime/frt/src/new_delete.cpp"
+	"../../runtime/frt/src/platform.cpp"
+	"src/build_context.cpp"
+	"src/reactive.cpp"
+	"tests/on_frt_test.cpp"
+)
+target_include_directories(
+	canopy_cpp_on_frt_test
+	PRIVATE
+	"../../crates/canopy-abi/include"
+	"../../runtime/frt/include"
+	include
+)
+target_compile_features(canopy_cpp_on_frt_test PRIVATE cxx_std_23)
+target_compile_options(canopy_cpp_on_frt_test PRIVATE -DFRT_OWN_NEW_DELETE)
+
 # Target: canopy_cpp_reactive_test
 add_executable(canopy_cpp_reactive_test)
 target_sources(

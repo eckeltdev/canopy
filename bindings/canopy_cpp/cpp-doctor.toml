@@ -96,3 +96,26 @@ sources = ["tests/reactive_test.cpp", "src/host.cpp", "src/build_context.cpp", "
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
+# P5 "binding runs ON frt" proof: compiles the binding (build_context.cpp + reactive.cpp) together
+# with frt's platform seam and its global operator new/delete BY SOURCE — the new/delete operators
+# are emitted ONLY here, gated by FRT_OWN_NEW_DELETE (mirroring frt's own frt_new_delete_test;
+# they are never in the frt static lib). The frt sources come from the sibling runtime/frt tree
+# via relative paths; its headers via ../../runtime/frt/include. NO libcanopy_abi link — this is
+# allocator routing, not the engine. The test installs frt's debug-tracking backend, builds a DSL
+# tree, asserts the wire bytes are unchanged, and proves the binding's std containers allocated
+# through frt_platform_alloc (alloc_count rose, the live set balanced after teardown).
+[target.canopy_cpp_on_frt_test]
+type = "executable"
+sources = [
+    "tests/on_frt_test.cpp",
+    "src/build_context.cpp",
+    "src/reactive.cpp",
+    "../../runtime/frt/src/new_delete.cpp",
+    "../../runtime/frt/src/platform.cpp",
+    "../../runtime/frt/src/backend_host_posix.cpp",
+    "../../runtime/frt/src/backend_debug_tracking.cpp",
+]
+include-directories = ["include", "../../crates/canopy-abi/include", "../../runtime/frt/include"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-DFRT_OWN_NEW_DELETE"]
