@@ -68,7 +68,8 @@
 
 use canopy_dom::Dom;
 use canopy_protocol::{EventKind, EventPayload, NodeId, Op, OpEncoder};
-use canopy_traits::{HostError, OpSink, Point, Size};
+use canopy_render_soft::SoftwareRenderer;
+use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
 ///
@@ -183,6 +184,31 @@ impl CanopyHost {
                 None => return 0,
             }
         }
+    }
+
+    /// Lite-tier render of the current tree to an RGBA8 framebuffer (row-major, straight
+    /// alpha, `width * height * 4` bytes). Lays the retained tree out with the SAME
+    /// inline-style engine the hit-test uses (so what you see is what you can click), then
+    /// software-rasterizes the resulting display list — the device-representative no_std
+    /// path. The clear color is the desktop dark base; any node without a painted
+    /// background shows it through.
+    pub fn render_rgba(&self, width: u32, height: u32) -> Vec<u8> {
+        let viewport = Size {
+            w: width as f32,
+            h: height as f32,
+        };
+        let (scene, _layout) = canopy_layout_taffy::layout(&self.dom, viewport);
+        let clear = Color {
+            r: 0x1e,
+            g: 0x1e,
+            b: 0x2e,
+            a: 0xff,
+        };
+        let mut renderer = SoftwareRenderer::new(width as usize, height as usize, clear);
+        // `render` only errors on a malformed scene, which our own layout never produces;
+        // on the impossible error path keep the clear-filled frame rather than panic.
+        let _ = renderer.render(&scene);
+        renderer.buffer().data().to_vec()
     }
 
     /// Drain the queued events into `out` as one `BeginBatch … DispatchEvent* … EndBatch`
@@ -496,6 +522,63 @@ pub unsafe extern "C" fn canopy_host_debug_snapshot(
     CANOPY_OK
 }
 
+/// Hard cap on a render dimension (pixels): an untrusted `width`/`height` can't request a
+/// multi-gigabyte framebuffer. `MAX_RENDER_DIM²·4 = 256 MiB` bounds the internal buffer.
+pub const MAX_RENDER_DIM: u32 = 8192;
+
+/// Render the current tree to an RGBA8 framebuffer (lite layout + software raster).
+///
+/// `out` receives `width * height * 4` bytes of row-major, straight-alpha RGBA8 pixels.
+/// `*out_len` always receives the needed byte count; the **needed-size contract** mirrors
+/// [`canopy_host_poll_events`] / [`canopy_host_debug_snapshot`]: pass a `cap` too small (or
+/// `out` null) to size the buffer first, then call again. Returns [`CANOPY_OK`], or
+/// [`CANOPY_ERR_NULL_HOST`] (null `host`) / [`CANOPY_ERR_TOO_LARGE`] (`cap` short, or a
+/// dimension is zero or exceeds [`MAX_RENDER_DIM`]) / [`CANOPY_ERR_NULL_DATA`] (null `out_len`,
+/// or null `out` when the frame fits) — matching [`canopy_host_poll_events`] /
+/// [`canopy_host_debug_snapshot`].
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`]; `out_len` must be a valid
+/// writable `usize`; and when the frame fits, `out` must point to `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_render_rgba(
+    host: *const CanopyHost,
+    width: u32,
+    height: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    if out_len.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    }
+    if width == 0 || height == 0 || width > MAX_RENDER_DIM || height > MAX_RENDER_DIM {
+        return CANOPY_ERR_TOO_LARGE; // zero or out-of-range dimension; nothing written
+    }
+    // Bounded by MAX_RENDER_DIM² · 4, so the multiply cannot overflow usize on any target.
+    let needed = (width as usize) * (height as usize) * 4;
+    // SAFETY: `out_len` checked non-null above; per contract it is a valid writable usize.
+    unsafe { *out_len = needed };
+    if needed > cap {
+        return CANOPY_ERR_TOO_LARGE; // needed size reported in *out_len; nothing written
+    }
+    if out.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    }
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; shared ref only.
+    let host = unsafe { &*host };
+    let rgba = host.render_rgba(width, height);
+    debug_assert_eq!(rgba.len(), needed);
+    // SAFETY: `out` is non-null and points to `cap >= needed` writable bytes per contract;
+    // `rgba` is a fresh owned buffer of exactly `needed` bytes, so the regions don't overlap.
+    unsafe { core::ptr::copy_nonoverlapping(rgba.as_ptr(), out, needed) };
+    CANOPY_OK
+}
+
 /// Set the viewport (logical pixels) the tree is laid out within for hit-testing.
 ///
 /// Call on window create/resize. Until set, the viewport is `0×0` and no node has area
@@ -618,6 +701,97 @@ mod tests {
     use canopy_core::Emitter;
     use canopy_dom::ROOT;
     use canopy_protocol::{ElementTag, HandlerId, NodeId};
+
+    #[test]
+    fn render_rgba_rasterizes_a_styled_tree() {
+        use canopy_paint::{BG, HEIGHT, WIDTH};
+        // A 80×40 red card at the top-left, inline-styled — the geometry the lite layout reads.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "80");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, BG, "#ff0000");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+
+        let (w, h) = (100u32, 60u32);
+        let rgba = host.render_rgba(w, h);
+        assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4, "RGBA8, w*h*4");
+
+        // The dark clear shows where nothing painted; the card paints red somewhere.
+        let px = |x: usize, y: usize| {
+            let i = (y * w as usize + x) * 4;
+            (rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
+        };
+        let (cr, cg, cb, ca) = px(10, 10); // inside the card
+        assert!(cr > 200 && cg < 80 && cb < 80 && ca == 255, "card pixel is red, got {:?}", (cr, cg, cb, ca));
+        let (br, bg, bb, _) = px(95, 55); // bottom-right, outside the card -> clear
+        assert!(br < 0x40 && bg < 0x40 && bb < 0x60, "corner shows the clear color, got {:?}", (br, bg, bb));
+    }
+
+    #[test]
+    fn render_rgba_extern_honors_the_needed_size_contract() {
+        let batch = mounted_batch();
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&batch), CANOPY_OK);
+        let (w, h) = (32u32, 16u32);
+        // Probe with a too-small buffer: TOO_LARGE + needed size, nothing written.
+        let mut len = 0usize;
+        let code = unsafe {
+            canopy_host_render_rgba(&host as *const CanopyHost, w, h, core::ptr::null_mut(), 0, &mut len)
+        };
+        assert_eq!(code, CANOPY_ERR_TOO_LARGE);
+        assert_eq!(len, (w as usize) * (h as usize) * 4);
+        // Now provide exactly the needed buffer.
+        let mut buf = vec![0u8; len];
+        let code = unsafe {
+            canopy_host_render_rgba(&host as *const CanopyHost, w, h, buf.as_mut_ptr(), buf.len(), &mut len)
+        };
+        assert_eq!(code, CANOPY_OK);
+        assert_eq!(len, buf.len());
+        // A zero dimension and an over-large dimension are both rejected.
+        assert_eq!(
+            unsafe { canopy_host_render_rgba(&host as *const CanopyHost, 0, h, buf.as_mut_ptr(), buf.len(), &mut len) },
+            CANOPY_ERR_TOO_LARGE
+        );
+        assert_eq!(
+            unsafe { canopy_host_render_rgba(&host as *const CanopyHost, MAX_RENDER_DIM + 1, h, buf.as_mut_ptr(), buf.len(), &mut len) },
+            CANOPY_ERR_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn render_rgba_null_out_len_matches_the_sibling_needed_size_fns() {
+        // The render fn's doc says its needed-size contract "mirrors
+        // canopy_host_poll_events / canopy_host_debug_snapshot", and canopy.h lists
+        // CANOPY_ERR_NULL_DATA for the null out-pointer family. Both sibling fns return
+        // CANOPY_ERR_NULL_DATA when the `out_len` out-param is null; the render fn must
+        // agree so a C caller can branch on one code for a null output pointer.
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&mounted_batch()), CANOPY_OK);
+        let host_ptr: *mut CanopyHost = &mut host;
+
+        // Sibling 1: debug_snapshot with a null out_len.
+        let snap_code = unsafe {
+            canopy_host_debug_snapshot(host_ptr, core::ptr::null_mut(), 0, core::ptr::null_mut())
+        };
+        // Sibling 2: poll_events with a null out_len.
+        let poll_code = unsafe {
+            canopy_host_poll_events(host_ptr, core::ptr::null_mut(), 0, core::ptr::null_mut())
+        };
+        // The render fn with a null out_len.
+        let render_code = unsafe {
+            canopy_host_render_rgba(host_ptr, 32, 16, core::ptr::null_mut(), 0, core::ptr::null_mut())
+        };
+
+        assert_eq!(snap_code, CANOPY_ERR_NULL_DATA, "debug_snapshot: null out_len");
+        assert_eq!(poll_code, CANOPY_ERR_NULL_DATA, "poll_events: null out_len");
+        assert_eq!(
+            render_code, snap_code,
+            "render_rgba must report the same null-out-param code as its sibling needed-size fns"
+        );
+    }
 
     /// Build a real op batch: a column element with a text child, both appended under
     /// the host root. Returns the encoded bytes — exactly what a guest would hand the

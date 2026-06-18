@@ -95,6 +95,20 @@ target_include_directories(
 target_compile_features(canopy_cpp_freestanding_smoke PRIVATE cxx_std_23)
 target_compile_options(canopy_cpp_freestanding_smoke PRIVATE -fno-exceptions -fno-rtti)
 
+# Target: canopy_cpp_gui_example
+add_executable(canopy_cpp_gui_example)
+target_sources(
+	canopy_cpp_gui_example
+	PRIVATE
+	"examples/gui_render/main.cpp"
+	"src/build_context.cpp"
+	"src/host.cpp"
+	"src/reactive.cpp"
+)
+target_include_directories(canopy_cpp_gui_example PRIVATE "../../crates/canopy-abi/include" include)
+target_compile_features(canopy_cpp_gui_example PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_gui_example PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_inplace_test
 add_executable(canopy_cpp_inplace_test)
 target_sources(canopy_cpp_inplace_test PRIVATE "tests/inplace_function_test.cpp")

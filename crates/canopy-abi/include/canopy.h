@@ -130,6 +130,23 @@ int32_t canopy_host_debug_snapshot(const CanopyHost *host, uint8_t *out, size_t 
                                    size_t *out_len);
 
 /*
+ * Render `host`'s retained tree to an RGBA8 framebuffer: `width * height * 4` bytes of
+ * row-major, straight-alpha pixels written into `out` (capacity `cap`), with *out_len set
+ * to the needed byte count. Lays the tree out with the same lite (inline-style) engine the
+ * hit-test uses, then software-rasterizes it — the device-representative no_std path.
+ *
+ * Same needed-size contract as canopy_host_debug_snapshot: pass a too-small `cap` (or NULL
+ * `out`) to size the buffer first (CANOPY_ERR_TOO_LARGE with *out_len = width*height*4,
+ * nothing written), then call again. Returns CANOPY_OK; or CANOPY_ERR_TOO_LARGE if `cap` is
+ * short OR a dimension is zero or exceeds 8192; or CANOPY_ERR_NULL_HOST / CANOPY_ERR_NULL_DATA.
+ *
+ * Precondition: `out_len` is a writable size_t, and when the frame fits, `out` points to
+ * `cap` writable bytes valid for the call.
+ */
+int32_t canopy_host_render_rgba(const CanopyHost *host, uint32_t width, uint32_t height,
+                                uint8_t *out, size_t cap, size_t *out_len);
+
+/*
  * Events (host -> guest)
  * ----------------------
  * Set the viewport, deliver pointer input, and drain the resulting DispatchEvent

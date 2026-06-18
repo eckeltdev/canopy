@@ -119,3 +119,14 @@ sources = [
 include-directories = ["include", "../../crates/canopy-abi/include", "../../runtime/frt/include"]
 compile-features = ["cxx_std_23"]
 compile-options = ["-DFRT_OWN_NEW_DELETE"]
+
+# The end-to-end "C++ DSL on frt -> real engine -> PIXELS" demo: authors an inline-styled GUI with
+# the DSL, applies it through the engine (host.cpp), renders to an RGBA8 framebuffer via the new
+# canopy_host_render_rgba, and writes a PPM. Links libcanopy_abi.a (needs `cargo build -p
+# canopy-abi`); compiles host.cpp + build_context.cpp + reactive.cpp directly like the event test.
+[target.canopy_cpp_gui_example]
+type = "executable"
+sources = ["examples/gui_render/main.cpp", "src/host.cpp", "src/build_context.cpp", "src/reactive.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]

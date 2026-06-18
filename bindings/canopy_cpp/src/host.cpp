@@ -53,4 +53,20 @@ namespace canopy {
         return canopy_host_node_count(handle_.get());
     }
 
+    auto host::render_rgba(std::uint32_t width, std::uint32_t height) const
+        -> std::vector<std::uint8_t> {
+        // The frame is exactly width*height*4 bytes, so size the buffer up front and the single
+        // call fills it (the needed-size contract only forces a second call when cap is short).
+        const std::size_t wide = width;
+        const std::size_t tall = height;
+        std::vector<std::uint8_t> pixels(wide * tall * 4U);
+        std::size_t len = 0;
+        const int code = canopy_host_render_rgba(handle_.get(), width, height, pixels.data(),
+                                                 pixels.size(), &len);
+        if (code != CANOPY_OK) {
+            pixels.clear(); // zero/oversize dimension or a null path — hand back an empty frame
+        }
+        return pixels;
+    }
+
 } // namespace canopy

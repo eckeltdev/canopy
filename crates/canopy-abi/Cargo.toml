@@ -27,6 +27,9 @@ canopy-traits = { path = "../canopy-traits" }
 # lite (inline-style) layout; the host-side-cascade geometry path is a follow-up.
 canopy-protocol = { path = "../canopy-protocol" }
 canopy-layout-taffy = { path = "../canopy-layout-taffy" }
+# Lite CPU rasterizer: turns the laid-out DisplayList into an RGBA8 framebuffer for the
+# headless render seam (canopy_host_render_rgba). The same no_std path the device uses.
+canopy-render-soft = { path = "../canopy-render-soft" }
 
 [dev-dependencies]
 # The guest-side op-builder, used by the tests to produce real op batches (create an

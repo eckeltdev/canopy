@@ -35,6 +35,13 @@ namespace canopy {
         // Live node count in the engine's retained tree (excluding the implicit root).
         [[nodiscard]] auto node_count() const -> std::size_t;
 
+        // Render the engine's current tree to an RGBA8 framebuffer: `width * height * 4` bytes,
+        // row-major, straight alpha — what a desktop viewer or a device framebuffer blits. Uses
+        // the lite layout + software rasterizer (the same geometry the hit-test reads). Returns an
+        // empty vector if a dimension is zero or exceeds the engine's render cap.
+        [[nodiscard]] auto render_rgba(std::uint32_t width, std::uint32_t height) const
+            -> std::vector<std::uint8_t>;
+
     private:
         // A custom deleter that frees via the C ABI (never `delete`), so the opaque CanopyHost
         // never needs to be a complete type here.
