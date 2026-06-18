@@ -142,3 +142,13 @@ sources = ["examples/gui_render/main.cpp", "src/host.cpp", "src/build_context.cp
 include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
+# "A basic app styled with CSS, freestanding": the DSL authors a tree carrying ONLY class names
+# (no inline styles); host::set_stylesheet hands the engine a CSS-lite stylesheet; the host
+# cascades classes -> styles and renders to a PPM. Proves the host-side class cascade end to end.
+[target.canopy_cpp_css_example]
+type = "executable"
+sources = ["examples/gui_css/main.cpp", "src/host.cpp", "src/build_context.cpp", "src/reactive.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]

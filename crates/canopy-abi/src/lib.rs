@@ -66,9 +66,10 @@
 //! (`[lints] workspace = true`), so only the FFI seam itself is unsafe.
 #![allow(unsafe_code)]
 
-use canopy_dom::Dom;
-use canopy_protocol::{EventKind, EventPayload, NodeId, Op, OpEncoder};
+use canopy_dom::{Dom, ROOT};
+use canopy_protocol::{EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
+use canopy_style_css::Stylesheet;
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
@@ -123,6 +124,11 @@ pub struct CanopyHost {
     pending_events: Vec<Op>,
     /// Monotonic seq stamped into each drained event batch's `BeginBatch`.
     event_seq: u32,
+    /// An optional CSS-lite class stylesheet (set via [`canopy_host_set_stylesheet`]). When
+    /// present, layout/render/hit-test run against a cascaded *clone* of the tree (a node's
+    /// classes resolve to inline styles, author inline winning) — so `class`-styled trees paint
+    /// without the guest expanding any CSS. `None` = inline-only styling.
+    stylesheet: Option<Stylesheet>,
 }
 
 impl CanopyHost {
@@ -135,7 +141,49 @@ impl CanopyHost {
             viewport: Size::default(),
             pending_events: Vec::new(),
             event_seq: 0,
+            stylesheet: None,
         }
+    }
+
+    /// Install a CSS-lite class stylesheet (`.class { prop: value }` rules). Parsed once and
+    /// stored; subsequent render/hit-test runs cascade each node's classes through it. Passing
+    /// an empty string clears any current stylesheet (back to inline-only styling).
+    pub fn set_stylesheet(&mut self, css: &str) {
+        self.stylesheet = if css.trim().is_empty() {
+            None
+        } else {
+            Some(canopy_style_css::parse(css))
+        };
+    }
+
+    /// The tree to lay out / paint / hit-test: the host's own `Dom` when there is no stylesheet,
+    /// or a *clone* with each node's resolved CSS-class declarations folded in as inline styles
+    /// (author inline wins, per CSS specificity). Non-destructive — the host's `Dom`, its node
+    /// count, and the debug snapshot stay exactly what the guest authored.
+    fn styled_dom(&self) -> Option<Dom> {
+        let sheet = self.stylesheet.as_ref()?;
+        let mut dom = self.dom.clone();
+        // Collect (node, prop, value) first so the immutable walk doesn't overlap the mutation.
+        let mut overlay: Vec<(NodeId, PropId, String)> = Vec::new();
+        let mut stack: Vec<NodeId> = dom.children(ROOT).to_vec();
+        while let Some(node) = stack.pop() {
+            let Some(n) = dom.node(node) else { continue };
+            if !n.classes.is_empty() {
+                let classes: Vec<&str> = n.classes.iter().map(String::as_str).collect();
+                for (prop, value) in sheet.resolve(&classes, false) {
+                    // Author inline styles win over class rules (CSS specificity: inline beats
+                    // a class selector), so only fold in a property the node didn't set itself.
+                    if !n.styles.contains_key(&prop) {
+                        overlay.push((node, prop, value));
+                    }
+                }
+            }
+            stack.extend(n.children.iter().copied());
+        }
+        for (node, prop, value) in overlay {
+            dom.set_inline_style(node, prop, value);
+        }
+        Some(dom)
     }
 
     /// Set the viewport the tree is laid out within for hit-testing.
@@ -160,7 +208,12 @@ impl CanopyHost {
         if self.pending_events.len() >= MAX_PENDING_EVENTS {
             return 0; // back-pressure: drop until the queue is drained
         }
-        let (_scene, layout) = canopy_layout_taffy::layout(&self.dom, self.viewport);
+        // Hit-test the cascaded tree's geometry (class styles can supply width/height), so what
+        // is clicked matches what was painted. Listener lookup below uses the original tree —
+        // same node ids, same structure — so the cascade only affects geometry, not handlers.
+        let styled = self.styled_dom();
+        let dom = styled.as_ref().unwrap_or(&self.dom);
+        let (_scene, layout) = canopy_layout_taffy::layout(dom, self.viewport);
         let Some(mut node) = canopy_layout_taffy::hit_test(&layout, Point { x, y }) else {
             return 0;
         };
@@ -197,7 +250,11 @@ impl CanopyHost {
             w: width as f32,
             h: height as f32,
         };
-        let (scene, _layout) = canopy_layout_taffy::layout(&self.dom, viewport);
+        // Lay out the cascaded tree (class styles folded in) when a stylesheet is set, else the
+        // host's own inline-styled tree.
+        let styled = self.styled_dom();
+        let dom = styled.as_ref().unwrap_or(&self.dom);
+        let (scene, _layout) = canopy_layout_taffy::layout(dom, viewport);
         let clear = Color {
             r: 0x1e,
             g: 0x1e,
@@ -579,6 +636,56 @@ pub unsafe extern "C" fn canopy_host_render_rgba(
     CANOPY_OK
 }
 
+/// Install a CSS-lite class stylesheet on `host`: `len` UTF-8 bytes of `.class { prop: value }`
+/// rules. Subsequent `canopy_host_render_rgba` / `canopy_host_pointer` cascade each node's
+/// classes through it (the guest just emits `SetClass`; the host expands the CSS), with author
+/// inline styles winning over class rules. A `len` of 0 clears any installed stylesheet.
+///
+/// Supported properties (the lite subset): background, color, width, height, gap, padding,
+/// border-radius, direction, opacity, translate-x/y, align-items, justify-content, text-align.
+/// The cascade is non-destructive — the retained tree and `canopy_host_debug_snapshot` are
+/// unchanged; only layout/paint/hit-test see the resolved styles.
+///
+/// Returns [`CANOPY_OK`]; [`CANOPY_ERR_NULL_HOST`] (null `host`); [`CANOPY_ERR_NULL_DATA`]
+/// (null `css` with `len > 0`); [`CANOPY_ERR_TOO_LARGE`] (`len` exceeds [`MAX_BATCH_BYTES`]);
+/// or [`CANOPY_ERR_DECODE`] (the bytes are not valid UTF-8).
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`]; if `len > 0`, `css` must
+/// point to `len` readable bytes valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_set_stylesheet(
+    host: *mut CanopyHost,
+    css: *const u8,
+    len: usize,
+) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    if len > MAX_BATCH_BYTES {
+        return CANOPY_ERR_TOO_LARGE; // the host never sizes a parse from an untrusted length
+    }
+    let text = if len == 0 {
+        ""
+    } else if css.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    } else {
+        // SAFETY: `css` is non-null and points to `len` (<= MAX_BATCH_BYTES) readable bytes
+        // per the documented contract; the slice is only read for this call.
+        let bytes = unsafe { core::slice::from_raw_parts(css, len) };
+        match core::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return CANOPY_ERR_DECODE,
+        }
+    };
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; unique ref for this
+    // call. `set_stylesheet` parses `text` into an owned Stylesheet, so it need not outlive it.
+    let host = unsafe { &mut *host };
+    host.set_stylesheet(text);
+    CANOPY_OK
+}
+
 /// Set the viewport (logical pixels) the tree is laid out within for hit-testing.
 ///
 /// Call on window create/resize. Until set, the viewport is `0×0` and no node has area
@@ -892,6 +999,61 @@ mod tests {
         host.set_viewport(64.0, 48.0);
         let _ = host.pointer_event(1.0, 1.0, 0, 1); // hit-test must return, not diverge
         assert_eq!(host.node_count(), 2, "the acyclic prefix (A, B) is intact");
+    }
+
+    #[test]
+    fn a_class_stylesheet_styles_the_render_without_mutating_the_tree() {
+        // The node carries ONLY a class; the stylesheet supplies its geometry + color. The
+        // host-side cascade folds the class rules in for layout/paint — but does NOT touch the
+        // retained tree (the snapshot stays structural), so authoring + parity stay byte-exact.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_class(card, "card");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+
+        let red = |buf: &[u8], at: (usize, usize)| {
+            let i = (at.1 * 100 + at.0) * 4;
+            buf[i] > 200 && buf[i + 1] < 80 && buf[i + 2] < 80
+        };
+
+        // No stylesheet yet: the class has no effect, nothing paints the card -> no red anywhere.
+        let bare = host.render_rgba(100, 60);
+        assert!(
+            !bare
+                .chunks_exact(4)
+                .any(|p| p[0] > 200 && p[1] < 80 && p[2] < 80),
+            "no red before"
+        );
+
+        host.set_stylesheet(".card { width: 80; height: 40; background: #ff0000 }");
+        let styled = host.render_rgba(100, 60);
+        assert!(
+            red(&styled, (10, 10)),
+            "the class-styled card paints red where it lays out"
+        );
+        assert!(
+            !red(&styled, (95, 55)),
+            "the clear shows outside the 80x40 card"
+        );
+
+        // The cascade is non-destructive: the tree is still `class=card` with NO inline style.
+        assert_eq!(
+            host.debug_snapshot(),
+            "el tag=1 class=card\n",
+            "tree unchanged by the cascade"
+        );
+
+        // Clearing the stylesheet goes back to inline-only (no red).
+        host.set_stylesheet("");
+        assert!(
+            !host
+                .render_rgba(100, 60)
+                .chunks_exact(4)
+                .any(|p| p[0] > 200 && p[1] < 80 && p[2] < 80),
+            "clearing the stylesheet drops the class styling"
+        );
     }
 
     #[test]

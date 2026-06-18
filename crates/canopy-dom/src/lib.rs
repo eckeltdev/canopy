@@ -55,7 +55,7 @@ pub struct Node {
 }
 
 /// A retained node tree built by applying op-stream batches.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Dom {
     nodes: BTreeMap<NodeId, Node>,
     strings: BTreeMap<StrId, String>,
@@ -86,6 +86,16 @@ impl Dom {
     /// The resolved inline style value for `node`'s `prop`, if set.
     pub fn style(&self, node: NodeId, prop: PropId) -> Option<&str> {
         self.nodes.get(&node)?.styles.get(&prop).map(String::as_str)
+    }
+
+    /// Directly set an inline style on a node, bypassing the op/intern round-trip. A host-side
+    /// cascade uses this to fold a node's resolved CSS-class declarations onto a Dom *clone*
+    /// before layout (so the host's own tree — and [`Self::style`] / the debug snapshot — stay
+    /// structural). No-op if `node` is absent. Overwrites any existing value for `prop`.
+    pub fn set_inline_style(&mut self, node: NodeId, prop: PropId, value: String) {
+        if let Some(node) = self.nodes.get_mut(&node) {
+            node.styles.insert(prop, value);
+        }
     }
 
     /// All inline styles set on `node`, as `(prop, value)` pairs in [`PropId`]

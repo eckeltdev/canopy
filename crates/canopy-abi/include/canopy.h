@@ -147,6 +147,24 @@ int32_t canopy_host_render_rgba(const CanopyHost *host, uint32_t width, uint32_t
                                 uint8_t *out, size_t cap, size_t *out_len);
 
 /*
+ * Install a CSS-lite class stylesheet on `host`: `len` UTF-8 bytes of `.class { prop: value }`
+ * rules. Subsequent canopy_host_render_rgba / canopy_host_pointer cascade each node's classes
+ * through it (the guest just emits SetClass via the op-stream; the host expands the CSS), with
+ * author inline styles winning over class rules. A `len` of 0 clears any installed stylesheet.
+ *
+ * The cascade is NON-DESTRUCTIVE: the retained tree and canopy_host_debug_snapshot are unchanged
+ * (still class-only); only layout, paint, and hit-test see the resolved styles. Supported
+ * properties (the lite subset): background, color, width, height, gap, padding, border-radius,
+ * direction, opacity, translate-x, translate-y, align-items, justify-content, text-align.
+ *
+ * Returns CANOPY_OK; CANOPY_ERR_NULL_HOST; CANOPY_ERR_NULL_DATA (null `css` with len > 0);
+ * CANOPY_ERR_TOO_LARGE (len exceeds the 1 MiB batch cap); or CANOPY_ERR_DECODE (not valid UTF-8).
+ *
+ * Precondition: if len > 0, `css` points to `len` readable bytes valid for the call.
+ */
+int32_t canopy_host_set_stylesheet(CanopyHost *host, const uint8_t *css, size_t len);
+
+/*
  * Events (host -> guest)
  * ----------------------
  * Set the viewport, deliver pointer input, and drain the resulting DispatchEvent

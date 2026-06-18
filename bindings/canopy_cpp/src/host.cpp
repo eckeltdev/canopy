@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include "canopy.h"
@@ -18,6 +19,13 @@ namespace canopy {
 
     void host::resize(float width, float height) {
         canopy_host_resize(handle_.get(), width, height);
+    }
+
+    void host::set_stylesheet(std::string_view css) {
+        // The C ABI takes UTF-8 bytes (const uint8_t*); copy the char view into a byte buffer
+        // rather than reinterpret-cast char* -> uint8_t* (a tiny, infrequently-set stylesheet).
+        const std::vector<std::uint8_t> bytes(css.begin(), css.end());
+        canopy_host_set_stylesheet(handle_.get(), bytes.data(), bytes.size());
     }
 
     auto host::pointer(float pos_x, float pos_y, std::uint8_t button, std::uint16_t event) -> int {

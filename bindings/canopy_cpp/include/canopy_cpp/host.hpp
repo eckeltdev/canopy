@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "canopy.h" // CanopyHost (opaque) + canopy_host_* C ABI
@@ -23,6 +24,11 @@ namespace canopy {
 
         // Set the viewport used for hit-testing (logical pixels).
         void resize(float width, float height);
+
+        // Install a CSS-lite class stylesheet (`.class { prop: value }` rules). Subsequent
+        // render/pointer cascade each node's classes through it (author inline styles win); the
+        // retained tree is unchanged. Pass an empty view to clear the stylesheet.
+        void set_stylesheet(std::string_view css);
 
         // Deliver a pointer event; the engine hit-tests and queues a DispatchEvent if it lands
         // on a node with a matching listener. Returns the number of events queued (0 or 1).

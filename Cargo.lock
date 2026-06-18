@@ -155,6 +155,7 @@ dependencies = [
  "canopy-paint",
  "canopy-protocol",
  "canopy-render-soft",
+ "canopy-style-css",
  "canopy-traits",
  "canopy-view",
 ]

@@ -30,11 +30,12 @@ canopy-layout-taffy = { path = "../canopy-layout-taffy" }
 # Lite CPU rasterizer: turns the laid-out DisplayList into an RGBA8 framebuffer for the
 # headless render seam (canopy_host_render_rgba). The same no_std path the device uses.
 canopy-render-soft = { path = "../canopy-render-soft" }
+# The CSS-lite class engine: parse a stylesheet of `.class { prop: value }` rules and resolve a
+# node's classes to (PropId, value) decls — the host-side cascade behind canopy_host_set_stylesheet.
+canopy-style-css = { path = "../canopy-style-css" }
 
 [dev-dependencies]
-# The guest-side op-builder, used by the tests to produce real op batches (create an
-# element + a text child, append under ROOT, take_batch) and drive them through the
-# C entry points.
+# The guest-side op-builder, used by the tests to produce real op batches.
 canopy-core = { path = "../canopy-core" }
 # The reference host's well-known id registries, so the protocol_header parity test can
 # machine-check include/canopy_protocol.h against the live constants (ElementTag/EventKind
