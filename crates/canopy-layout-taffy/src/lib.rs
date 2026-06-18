@@ -345,9 +345,21 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
     }
 }
 
+/// Hard cap on tree depth the layout builder will descend. `canopy_dom` rejects cycles at
+/// the mutation boundary (the primary defense — see its `InsertBefore` cycle check), so a
+/// real tree never approaches this; this is a defense-in-depth backstop that keeps a
+/// pathological (or future-buggy, e.g. a cycle that ever slipped the Dom) tree from
+/// overflowing the stack. Past the cap a node becomes a childless leaf rather than being
+/// recursed into. The cap is applied in `build_node`, but because the *built* Taffy tree is
+/// then walked to its full depth by `compute_layout` and [`collect_rects`], the value also
+/// bounds those recursions — so it is kept well under the depth at which the whole pipeline
+/// overflows a normal stack (empirically ~512), with generous headroom over any real UI.
+pub const MAX_TREE_DEPTH: usize = 256;
+
 /// Recursively build a Taffy node mirroring `id`, returning its Taffy key. Text
-/// leaves become fixed-size leaves; elements recurse over their children.
-fn build_node(dom: &Dom, id: NodeId, tree: &mut TaffyTree<NodeId>) -> taffy::NodeId {
+/// leaves become fixed-size leaves; elements recurse over their children. `depth` is the
+/// distance from the root; descent stops at [`MAX_TREE_DEPTH`] (see its docs).
+fn build_node(dom: &Dom, id: NodeId, tree: &mut TaffyTree<NodeId>, depth: usize) -> taffy::NodeId {
     if let Some(text) = dom.node(id).and_then(|n| n.text.as_deref()) {
         let size = text_size(dom, id, text);
         let style = Style {
@@ -362,11 +374,14 @@ fn build_node(dom: &Dom, id: NodeId, tree: &mut TaffyTree<NodeId>) -> taffy::Nod
         return tree.new_leaf_with_context(style, id).unwrap();
     }
 
-    let children: Vec<taffy::NodeId> = dom
-        .children(id)
-        .iter()
-        .map(|&c| build_node(dom, c, tree))
-        .collect();
+    let children: Vec<taffy::NodeId> = if depth >= MAX_TREE_DEPTH {
+        Vec::new() // backstop: cannot descend past the cap (see MAX_TREE_DEPTH)
+    } else {
+        dom.children(id)
+            .iter()
+            .map(|&c| build_node(dom, c, tree, depth + 1))
+            .collect()
+    };
     let key = tree
         .new_leaf_with_context(element_style(dom, id), id)
         .unwrap();
@@ -485,7 +500,7 @@ pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
     let mut y = 0.0_f32;
     for &root in dom.children(ROOT) {
         let mut tree: TaffyTree<NodeId> = TaffyTree::new();
-        let key = build_node(dom, root, &mut tree);
+        let key = build_node(dom, root, &mut tree, 0);
 
         // Taffy does not resolve a *root* node's percentage against the available
         // space, so a `width: 100%` / `height: 100%` root would collapse to its
@@ -640,6 +655,36 @@ mod tests {
         let mut dom = Dom::new();
         dom.apply(&e.take_batch(0)).unwrap();
         dom
+    }
+
+    #[test]
+    fn deep_tree_is_depth_capped_not_stack_overflowed() {
+        // Defense-in-depth: `canopy_dom` rejects cycles, but even a pathologically DEEP acyclic
+        // tree (or a cycle that ever slipped the Dom's guard) must not recurse without bound.
+        // Build a chain deeper than MAX_TREE_DEPTH and assert layout TERMINATES and truncates at
+        // the cap (far fewer rects than the input depth) rather than overflowing the stack.
+        let depth = MAX_TREE_DEPTH * 2;
+        let mut e = Emitter::new();
+        let mut prev = e.create_element(ElementTag::new(1));
+        e.append(ROOT, prev);
+        for _ in 1..depth {
+            let next = e.create_element(ElementTag::new(1));
+            e.append(prev, next);
+            prev = next;
+        }
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        assert!(
+            lay.rects.len() <= MAX_TREE_DEPTH + 1,
+            "descent stops at the cap: {} rects for a {}-deep chain",
+            lay.rects.len(),
+            depth
+        );
+        assert!(
+            lay.rects.len() < depth,
+            "the deep tail was truncated, not laid out"
+        );
     }
 
     #[test]

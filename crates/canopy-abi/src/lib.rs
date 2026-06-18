@@ -725,9 +725,17 @@ mod tests {
             (rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
         };
         let (cr, cg, cb, ca) = px(10, 10); // inside the card
-        assert!(cr > 200 && cg < 80 && cb < 80 && ca == 255, "card pixel is red, got {:?}", (cr, cg, cb, ca));
+        assert!(
+            cr > 200 && cg < 80 && cb < 80 && ca == 255,
+            "card pixel is red, got {:?}",
+            (cr, cg, cb, ca)
+        );
         let (br, bg, bb, _) = px(95, 55); // bottom-right, outside the card -> clear
-        assert!(br < 0x40 && bg < 0x40 && bb < 0x60, "corner shows the clear color, got {:?}", (br, bg, bb));
+        assert!(
+            br < 0x40 && bg < 0x40 && bb < 0x60,
+            "corner shows the clear color, got {:?}",
+            (br, bg, bb)
+        );
     }
 
     #[test]
@@ -739,24 +747,56 @@ mod tests {
         // Probe with a too-small buffer: TOO_LARGE + needed size, nothing written.
         let mut len = 0usize;
         let code = unsafe {
-            canopy_host_render_rgba(&host as *const CanopyHost, w, h, core::ptr::null_mut(), 0, &mut len)
+            canopy_host_render_rgba(
+                &host as *const CanopyHost,
+                w,
+                h,
+                core::ptr::null_mut(),
+                0,
+                &mut len,
+            )
         };
         assert_eq!(code, CANOPY_ERR_TOO_LARGE);
         assert_eq!(len, (w as usize) * (h as usize) * 4);
         // Now provide exactly the needed buffer.
         let mut buf = vec![0u8; len];
         let code = unsafe {
-            canopy_host_render_rgba(&host as *const CanopyHost, w, h, buf.as_mut_ptr(), buf.len(), &mut len)
+            canopy_host_render_rgba(
+                &host as *const CanopyHost,
+                w,
+                h,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len,
+            )
         };
         assert_eq!(code, CANOPY_OK);
         assert_eq!(len, buf.len());
         // A zero dimension and an over-large dimension are both rejected.
         assert_eq!(
-            unsafe { canopy_host_render_rgba(&host as *const CanopyHost, 0, h, buf.as_mut_ptr(), buf.len(), &mut len) },
+            unsafe {
+                canopy_host_render_rgba(
+                    &host as *const CanopyHost,
+                    0,
+                    h,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut len,
+                )
+            },
             CANOPY_ERR_TOO_LARGE
         );
         assert_eq!(
-            unsafe { canopy_host_render_rgba(&host as *const CanopyHost, MAX_RENDER_DIM + 1, h, buf.as_mut_ptr(), buf.len(), &mut len) },
+            unsafe {
+                canopy_host_render_rgba(
+                    &host as *const CanopyHost,
+                    MAX_RENDER_DIM + 1,
+                    h,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut len,
+                )
+            },
             CANOPY_ERR_TOO_LARGE
         );
     }
@@ -782,10 +822,20 @@ mod tests {
         };
         // The render fn with a null out_len.
         let render_code = unsafe {
-            canopy_host_render_rgba(host_ptr, 32, 16, core::ptr::null_mut(), 0, core::ptr::null_mut())
+            canopy_host_render_rgba(
+                host_ptr,
+                32,
+                16,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+            )
         };
 
-        assert_eq!(snap_code, CANOPY_ERR_NULL_DATA, "debug_snapshot: null out_len");
+        assert_eq!(
+            snap_code, CANOPY_ERR_NULL_DATA,
+            "debug_snapshot: null out_len"
+        );
         assert_eq!(poll_code, CANOPY_ERR_NULL_DATA, "poll_events: null out_len");
         assert_eq!(
             render_code, snap_code,
@@ -811,6 +861,37 @@ mod tests {
         // SAFETY: `host` comes from `canopy_host_new` below, and `batch` is a live
         // Rust slice valid for the call.
         unsafe { canopy_host_apply(host, batch.as_ptr(), batch.len()) }
+    }
+
+    #[test]
+    fn cyclic_batch_is_rejected_and_the_host_stays_renderable() {
+        // A crafted op batch that tries to form a parent/child cycle (A->B, then B->A) must be
+        // rejected by the Dom as BadHandle through the real C entry point — NOT crash the host
+        // by sending layout/hit-test into infinite recursion. The host must stay usable after.
+        let mut e = Emitter::new();
+        let a = e.create_element(ElementTag::new(1));
+        let b = e.create_element(ElementTag::new(1));
+        e.append(ROOT, a);
+        e.append(a, b);
+        e.append(b, a); // the cycle op
+        let batch = e.take_batch(0);
+
+        let mut host = CanopyHost::new();
+        assert_eq!(
+            apply_via_c(&mut host as *mut CanopyHost, &batch),
+            CANOPY_ERR_BAD_HANDLE,
+            "the cycle-forming op is rejected, not applied"
+        );
+        // The host survived and is acyclic: both walkers terminate rather than overflow.
+        let rgba = host.render_rgba(64, 48);
+        assert_eq!(
+            rgba.len(),
+            64 * 48 * 4,
+            "render terminates and returns a full frame"
+        );
+        host.set_viewport(64.0, 48.0);
+        let _ = host.pointer_event(1.0, 1.0, 0, 1); // hit-test must return, not diverge
+        assert_eq!(host.node_count(), 2, "the acyclic prefix (A, B) is intact");
     }
 
     #[test]

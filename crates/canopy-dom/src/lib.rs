@@ -165,6 +165,27 @@ impl Dom {
         }
     }
 
+    /// True if `maybe_ancestor` is `node` itself or lies on `node`'s parent chain up to
+    /// the root. Used to reject a re-parent that would introduce a cycle: making `child`
+    /// a child of `parent` loops the tree iff `child` is `parent` or an ancestor of it.
+    /// The walk is bounded by the live node count, so it terminates even if the tree
+    /// somehow already held a loop — though this very check is what keeps it acyclic.
+    fn is_ancestor_or_self(&self, maybe_ancestor: NodeId, node: NodeId) -> bool {
+        let mut cur = Some(node);
+        let mut steps = 0usize;
+        while let Some(n) = cur {
+            if n == maybe_ancestor {
+                return true;
+            }
+            steps += 1;
+            if steps > self.nodes.len() {
+                return true; // a pre-existing loop (shouldn't happen) — treat as a cycle
+            }
+            cur = self.nodes.get(&n).and_then(|x| x.parent);
+        }
+        false
+    }
+
     fn resolve_str(&self, id: StrId) -> Result<String, HostError> {
         self.strings.get(&id).cloned().ok_or(HostError::Decode)
     }
@@ -235,6 +256,15 @@ impl Dom {
                 self.require(child)?;
                 if parent != ROOT {
                     self.require(parent)?;
+                    // Reject a re-parent that would build a cycle: `child` must not be
+                    // `parent` itself nor an ancestor of `parent`. Otherwise `parent` would
+                    // sit both above `child` (its new parent) and below it (already in
+                    // `child`'s subtree), and every tree walk — layout, remove_subtree, the
+                    // debug snapshot — would recurse forever. Rejected as a forged structure,
+                    // like a bad handle, before any mutation so the tree stays acyclic.
+                    if self.is_ancestor_or_self(child, parent) {
+                        return Err(HostError::BadHandle);
+                    }
                 }
                 // Re-parenting: detach from any current position first.
                 self.detach(child);
@@ -366,6 +396,55 @@ mod tests {
         assert_eq!(dom.children(ROOT), &[col]);
         assert_eq!(dom.children(col), &[label]);
         assert_eq!(dom.text_of(label), Some("hello"));
+    }
+
+    #[test]
+    fn rejects_a_reparent_that_would_form_a_cycle() {
+        // A -> B, then try B -> A. The second re-parent would loop the tree (A both above
+        // and below B); it must be rejected so no later walk (layout/remove/snapshot) diverges.
+        let mut e = Emitter::new();
+        let a = e.create_element(ElementTag::new(1));
+        let b = e.create_element(ElementTag::new(1));
+        e.append(ROOT, a);
+        e.append(a, b);
+        e.append(b, a); // cycle: a is an ancestor of b
+
+        let mut dom = Dom::new();
+        assert_eq!(dom.apply(&e.take_batch(0)), Err(HostError::BadHandle));
+        // The rejected op mutated nothing: the tree is the acyclic prefix and stays usable.
+        assert_eq!(dom.children(ROOT), &[a]);
+        assert_eq!(dom.children(a), &[b]);
+        assert!(dom.children(b).is_empty());
+    }
+
+    #[test]
+    fn rejects_self_parenting() {
+        let mut e = Emitter::new();
+        let a = e.create_element(ElementTag::new(1));
+        e.append(ROOT, a);
+        e.append(a, a); // a as its own child
+
+        let mut dom = Dom::new();
+        assert_eq!(dom.apply(&e.take_batch(0)), Err(HostError::BadHandle));
+        assert_eq!(dom.children(ROOT), &[a]);
+        assert!(dom.children(a).is_empty());
+    }
+
+    #[test]
+    fn allows_a_legitimate_reparent() {
+        // Moving a node to a NON-descendant must still work — the cycle check rejects only
+        // ancestor-or-self, not any re-parent. Build A,B siblings under ROOT, move B under A.
+        let mut e = Emitter::new();
+        let a = e.create_element(ElementTag::new(1));
+        let b = e.create_element(ElementTag::new(1));
+        e.append(ROOT, a);
+        e.append(ROOT, b);
+        e.append(a, b); // legitimate: a is not a descendant of b
+
+        let mut dom = Dom::new();
+        dom.apply(&e.take_batch(0)).unwrap();
+        assert_eq!(dom.children(ROOT), &[a]);
+        assert_eq!(dom.children(a), &[b]);
     }
 
     #[test]
