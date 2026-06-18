@@ -55,3 +55,13 @@ include-directories = ["include"]
 compile-features = ["cxx_std_23"]
 compile-options = ["-fno-exceptions", "-fno-rtti", "-DFRT_FREESTANDING=1"]
 link-libraries = ["frt"]
+
+# xstd integration proof: the vendored xstd extended STL, configured via frt/xstd.hpp and
+# compiled under the freestanding flags, proving the curated-safe subset (bitwise/fnv) works on
+# frt. include vendor/xstd for the headers; header-only, no link.
+[target.frt_xstd_test]
+type = "executable"
+sources = ["tests/xstd_surface_smoke.cpp"]
+include-directories = ["include", "vendor/xstd"]
+compile-features = ["cxx_std_23"]
+compile-options = ["-fno-exceptions", "-fno-rtti"]
