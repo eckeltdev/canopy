@@ -363,6 +363,31 @@ fn header_matches_the_rust_constants() {
             "CANOPY_PROP_BACKGROUND_IMAGE",
             u64::from(canopy_paint::BACKGROUND_IMAGE.raw()),
         ),
+        // Grid (CSS Grid for the lite tier).
+        (
+            "CANOPY_PROP_GRID_TEMPLATE_COLUMNS",
+            u64::from(canopy_paint::GRID_TEMPLATE_COLUMNS.raw()),
+        ),
+        (
+            "CANOPY_PROP_GRID_TEMPLATE_ROWS",
+            u64::from(canopy_paint::GRID_TEMPLATE_ROWS.raw()),
+        ),
+        (
+            "CANOPY_PROP_GRID_COLUMN",
+            u64::from(canopy_paint::GRID_COLUMN.raw()),
+        ),
+        (
+            "CANOPY_PROP_GRID_ROW",
+            u64::from(canopy_paint::GRID_ROW.raw()),
+        ),
+        (
+            "CANOPY_PROP_GRID_AUTO_FLOW",
+            u64::from(canopy_paint::GRID_AUTO_FLOW.raw()),
+        ),
+        (
+            "CANOPY_PROP_JUSTIFY_ITEMS",
+            u64::from(canopy_paint::JUSTIFY_ITEMS.raw()),
+        ),
     ]);
 
     let header = header_defines();

@@ -47,11 +47,12 @@ use canopy_paint::{
     ALIGN, ALIGN_SELF, ASPECT_RATIO, BACKGROUND_IMAGE, BG, BORDER_BOTTOM_WIDTH, BORDER_COLOR,
     BORDER_LEFT_WIDTH, BORDER_RIGHT_WIDTH, BORDER_TOP_WIDTH, BORDER_WIDTH, BOX_SHADOW, BOX_SIZING,
     COLUMN_GAP, DIRECTION, DISPLAY, FG, FLEX_BASIS, FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE,
-    GAP, HEIGHT, INSET_BOTTOM, INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, MARGIN, MARGIN_BOTTOM,
-    MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY,
-    OUTLINE_COLOR, OUTLINE_OFFSET, OUTLINE_WIDTH, OVERFLOW, PADDING, PADDING_BOTTOM, PADDING_LEFT,
-    PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TEXT_DECORATION,
-    TRANSLATE_X, TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
+    GAP, GRID_AUTO_FLOW, GRID_COLUMN, GRID_ROW, GRID_TEMPLATE_COLUMNS, GRID_TEMPLATE_ROWS, HEIGHT,
+    INSET_BOTTOM, INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, JUSTIFY_ITEMS, MARGIN,
+    MARGIN_BOTTOM, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT,
+    MIN_WIDTH, OPACITY, OUTLINE_COLOR, OUTLINE_OFFSET, OUTLINE_WIDTH, OVERFLOW, PADDING,
+    PADDING_BOTTOM, PADDING_LEFT, PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP,
+    TEXT_ALIGN, TEXT_DECORATION, TRANSLATE_X, TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
 };
 use canopy_protocol::{ElementTag, NodeId, PropId};
 use canopy_traits::{
@@ -59,11 +60,12 @@ use canopy_traits::{
     Point, Rect, Size,
 };
 
-use taffy::prelude::length;
+use taffy::prelude::{auto, fr, length, line, minmax, percent, span};
 use taffy::{
     AlignItems, AvailableSpace, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
-    JustifyContent, LengthPercentage, LengthPercentageAuto, Position, Rect as TaffyRect,
-    Size as TaffySize, Style, TaffyTree,
+    GridAutoFlow, GridPlacement, GridTemplateComponent, JustifyContent, LengthPercentage,
+    LengthPercentageAuto, Line, MaxTrackSizingFunction, MinTrackSizingFunction, Position,
+    Rect as TaffyRect, Size as TaffySize, Style, TaffyTree, TrackSizingFunction,
 };
 
 /// Default text size (px) when no [`HEIGHT`] is set.
@@ -465,12 +467,14 @@ fn style_justify(dom: &Dom, id: NodeId) -> Option<JustifyContent> {
 }
 
 /// The node's [`DISPLAY`] mapped to a Taffy [`Display`]: `"none"` -> [`Display::None`]
-/// (Taffy zero-sizes the node and skips its subtree), `"flex"` (or any other value) ->
-/// [`Display::Flex`]. Default is `Flex` — this crate is flex-only, so an unset or
-/// unrecognized `display` keeps the existing flex behavior.
+/// (Taffy zero-sizes the node and skips its subtree), `"grid"` -> [`Display::Grid`] (the box lays
+/// its children on the CSS grid built from its `grid-template-*` tracks), `"flex"` (or any other
+/// value) -> [`Display::Flex`]. Default is `Flex` — an unset or unrecognized `display` keeps the
+/// existing flex behavior.
 fn style_display(dom: &Dom, id: NodeId) -> Display {
     match dom.style(id, DISPLAY) {
         Some("none") => Display::None,
+        Some("grid") => Display::Grid,
         _ => Display::Flex,
     }
 }
@@ -552,6 +556,166 @@ fn style_z_index(dom: &Dom, id: NodeId) -> i32 {
         .and_then(signed_px)
         .map(|n| n as i32)
         .unwrap_or(0)
+}
+
+// ---- CSS Grid mapping -----------------------------------------------------------------------
+//
+// The grid props arrive in the canonical form the `canopy-style-css` normalizer freezes: the
+// track-list props ([`GRID_TEMPLATE_COLUMNS`]/[`GRID_TEMPLATE_ROWS`]) are a space-separated list of
+// tracks (`<px>`/`<n>fr`/`<pct>%`/`auto`/`minmax(<a>,<b>)`), every `repeat(...)` already expanded;
+// the placement props ([`GRID_COLUMN`]/[`GRID_ROW`]) are `<start>/<end>`, `span <n>`, or a bare
+// `<int>` line. So this side never re-parses CSS — it only maps the frozen tokens to Taffy types.
+// (Named grid lines, `grid-template-areas`, subgrid, dense, and `grid-auto-*` are out of scope.)
+
+/// The custom-identifier string type Taffy's grid types are generic over. Taffy's [`Style`] defaults
+/// it to its `DefaultCheapStr` (which is `alloc::string::String` on this crate's `alloc` config), so
+/// naming `String` here keeps the grid helpers' return types in lockstep with the `Style` fields they
+/// feed — this crate never authors a named line, so the ident type is otherwise unused.
+type GridStr = alloc::string::String;
+
+/// Parse one canonical grid **track size** (`100`, `1fr`, `50%`, `auto`) into a Taffy
+/// [`TrackSizingFunction`], or `None` if the token isn't one of those forms. Used directly for a
+/// plain track and for each side of a `minmax()`.
+fn parse_track_size(tok: &str) -> Option<TrackSizingFunction> {
+    if tok == "auto" {
+        return Some(auto());
+    }
+    if let Some(n) = tok.strip_suffix("fr") {
+        return n.parse::<f32>().ok().map(fr);
+    }
+    if let Some(n) = tok.strip_suffix('%') {
+        // The normalizer emits a whole/decimal percent; "50%" -> percent(0.5).
+        return n.parse::<f32>().ok().map(|p| percent(p / 100.0));
+    }
+    tok.parse::<f32>().ok().map(length)
+}
+
+/// Parse the **min** side of a `minmax()` into a Taffy [`MinTrackSizingFunction`]. The min side has
+/// no `fr` form in CSS (a flexible minimum is invalid), so `auto`/length/percent only; an `fr` (or
+/// anything else) falls back to `auto`.
+fn parse_minmax_min(tok: &str) -> MinTrackSizingFunction {
+    if tok == "auto" {
+        return MinTrackSizingFunction::auto();
+    }
+    if let Some(n) = tok.strip_suffix('%') {
+        if let Ok(p) = n.parse::<f32>() {
+            return percent(p / 100.0);
+        }
+    }
+    if let Ok(px) = tok.parse::<f32>() {
+        return length(px);
+    }
+    MinTrackSizingFunction::auto()
+}
+
+/// Parse the **max** side of a `minmax()` into a Taffy [`MaxTrackSizingFunction`]. The max side
+/// admits the `fr` flexible form in addition to `auto`/length/percent; an unrecognized token falls
+/// back to `auto`.
+fn parse_minmax_max(tok: &str) -> MaxTrackSizingFunction {
+    if tok == "auto" {
+        return MaxTrackSizingFunction::auto();
+    }
+    if let Some(n) = tok.strip_suffix("fr") {
+        if let Ok(f) = n.parse::<f32>() {
+            return fr(f);
+        }
+    }
+    if let Some(n) = tok.strip_suffix('%') {
+        if let Ok(p) = n.parse::<f32>() {
+            return percent(p / 100.0);
+        }
+    }
+    if let Ok(px) = tok.parse::<f32>() {
+        return length(px);
+    }
+    MaxTrackSizingFunction::auto()
+}
+
+/// Parse one canonical grid track token — a plain size or a `minmax(<a>,<b>)` — into a Taffy
+/// [`GridTemplateComponent`] (always the `Single` variant: `repeat()` is already expanded upstream,
+/// so no `Repeat` component is ever produced here). A token the mapper can't read is dropped by the
+/// caller.
+fn parse_track_component(tok: &str) -> Option<GridTemplateComponent<GridStr>> {
+    if let Some(inner) = tok
+        .strip_prefix("minmax(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        // Canonical form has exactly one comma and no inner spaces: `minmax(<min>,<max>)`.
+        let (min, max) = inner.split_once(',')?;
+        let func = minmax(parse_minmax_min(min), parse_minmax_max(max));
+        return Some(GridTemplateComponent::Single(func));
+    }
+    parse_track_size(tok).map(GridTemplateComponent::Single)
+}
+
+/// Map a canonical grid **track list** (`prop` is [`GRID_TEMPLATE_COLUMNS`] or
+/// [`GRID_TEMPLATE_ROWS`]) to Taffy's `Vec<GridTemplateComponent>`. The value is the
+/// space-separated, `repeat()`-expanded list the CSS normalizer froze; each token maps to one
+/// `Single` component. An empty/unset value (or one whose every token is unreadable) yields an empty
+/// vec — the explicit grid then has no tracks on that axis (auto tracks only).
+fn style_grid_template(dom: &Dom, id: NodeId, prop: PropId) -> Vec<GridTemplateComponent<GridStr>> {
+    let Some(value) = dom.style(id, prop) else {
+        return Vec::new();
+    };
+    value
+        .split_whitespace()
+        .filter_map(parse_track_component)
+        .collect()
+}
+
+/// Parse one canonical grid line term — a signed integer line index or `span <n>` — into a Taffy
+/// [`GridPlacement`], or `None` for `auto`/unreadable (the caller leaves that edge `Auto`).
+fn parse_grid_line(tok: &str) -> Option<GridPlacement> {
+    let tok = tok.trim();
+    if let Some(n) = tok.strip_prefix("span ") {
+        return n.trim().parse::<u16>().ok().map(span);
+    }
+    // A bare line index. CSS line 0 is invalid; taffy's `line(0)` maps it to Auto, which matches.
+    tok.parse::<i16>().ok().map(line)
+}
+
+/// Map a canonical grid **placement** (`prop` is [`GRID_COLUMN`] or [`GRID_ROW`]) to a Taffy
+/// `Line<GridPlacement>`. The value is the frozen `<start>/<end>`, `span <n>`, or bare `<int>` form:
+/// - `<start>/<end>` -> both edges set (a span until / from a line);
+/// - `span <n>`      -> `start = Span(n)`, `end = Auto`;
+/// - bare `<int>`    -> `start = Line(int)`, `end = Auto`.
+///
+/// An empty/unset/unreadable value -> `Line { Auto, Auto }` (Taffy's default: auto-place the item).
+fn style_grid_placement(dom: &Dom, id: NodeId, prop: PropId) -> Line<GridPlacement> {
+    let auto_line = Line {
+        start: GridPlacement::Auto,
+        end: GridPlacement::Auto,
+    };
+    let Some(value) = dom.style(id, prop) else {
+        return auto_line;
+    };
+    if let Some((start, end)) = value.split_once('/') {
+        return Line {
+            start: parse_grid_line(start).unwrap_or(GridPlacement::Auto),
+            end: parse_grid_line(end).unwrap_or(GridPlacement::Auto),
+        };
+    }
+    Line {
+        start: parse_grid_line(value).unwrap_or(GridPlacement::Auto),
+        end: GridPlacement::Auto,
+    }
+}
+
+/// The node's [`GRID_AUTO_FLOW`] mapped to a Taffy [`GridAutoFlow`]: `"column"` ->
+/// [`GridAutoFlow::Column`], `"row"`/anything else (incl. unset) -> [`GridAutoFlow::Row`] (the
+/// default). `dense` is deferred (out of scope), so only the two principal axes are honored.
+fn style_grid_auto_flow(dom: &Dom, id: NodeId) -> GridAutoFlow {
+    match dom.style(id, GRID_AUTO_FLOW) {
+        Some("column") => GridAutoFlow::Column,
+        _ => GridAutoFlow::Row,
+    }
+}
+
+/// The node's [`JUSTIFY_ITEMS`] (the grid items' default inline-axis alignment) mapped to a Taffy
+/// `Option<AlignItems>`, reusing [`parse_align`]; `None` (Taffy's default = stretch) when unset or
+/// unrecognized.
+fn style_justify_items(dom: &Dom, id: NodeId) -> Option<AlignItems> {
+    dom.style(id, JUSTIFY_ITEMS).and_then(parse_align)
 }
 
 /// Layout size of a text leaf: its **height is the requested font size in px**
@@ -769,6 +933,17 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
             width: max_width,
             height: max_height,
         },
+        // CSS Grid. These are inert unless `display: grid` (Taffy reads them only on a grid box),
+        // so a flex/block box pays nothing for an empty track vec / Auto placement. Tracks are the
+        // `repeat()`-expanded canonical list; placement is the `<int>`/`<start>/<end>`/`span <n>`
+        // form; `justify-items` is the grid items' default inline alignment. The existing
+        // ROW_GAP/COLUMN_GAP already feed `gap`, which Taffy shares between flex and grid.
+        grid_template_columns: style_grid_template(dom, id, GRID_TEMPLATE_COLUMNS),
+        grid_template_rows: style_grid_template(dom, id, GRID_TEMPLATE_ROWS),
+        grid_auto_flow: style_grid_auto_flow(dom, id),
+        grid_column: style_grid_placement(dom, id, GRID_COLUMN),
+        grid_row: style_grid_placement(dom, id, GRID_ROW),
+        justify_items: style_justify_items(dom, id),
         ..Default::default()
     }
 }
@@ -3678,5 +3853,173 @@ mod tests {
             .filter(|i| matches!(i, DisplayItem::PushClip { .. }))
             .count();
         assert_eq!(pushes_before, 2, "both clips are open when the leaf paints");
+    }
+
+    // ---- CSS Grid -------------------------------------------------------------------------------
+
+    /// Build a `display: grid` container of `width`x`height` with the given canonical track lists
+    /// (as the CSS normalizer would freeze them) and `n` plain element children, returning the Dom
+    /// plus the child NodeIds in order. The container fills the viewport so `fr`/`%` tracks resolve.
+    fn grid_dom(
+        width: &str,
+        height: &str,
+        cols: &str,
+        rows: &str,
+        n: usize,
+    ) -> (Dom, NodeId, alloc::vec::Vec<NodeId>) {
+        let mut e = Emitter::new();
+        let grid = e.create_element(ElementTag::new(1));
+        e.append(ROOT, grid);
+        e.set_inline_style(grid, DISPLAY, "grid");
+        e.set_inline_style(grid, WIDTH, width);
+        e.set_inline_style(grid, HEIGHT, height);
+        if !cols.is_empty() {
+            e.set_inline_style(grid, GRID_TEMPLATE_COLUMNS, cols);
+        }
+        if !rows.is_empty() {
+            e.set_inline_style(grid, GRID_TEMPLATE_ROWS, rows);
+        }
+        let mut kids = alloc::vec::Vec::new();
+        for _ in 0..n {
+            let c = e.create_element(ElementTag::new(2));
+            e.append(grid, c);
+            kids.push(c);
+        }
+        (dom_from(e), grid, kids)
+    }
+
+    fn rect_of(lay: &LayoutResult, id: NodeId) -> Rect {
+        lay.rects.iter().find(|(n, _)| *n == id).unwrap().1
+    }
+
+    #[test]
+    fn grid_three_equal_columns_lay_children_across() {
+        // `display: grid; grid-template-columns: repeat(3, 1fr)` over a 300px-wide box: three
+        // children land in three 100px columns across one row.
+        let (dom, _g, kids) = grid_dom("300", "100", "1fr 1fr 1fr", "100", 3);
+        let (_scene, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let r0 = rect_of(&lay, kids[0]);
+        let r1 = rect_of(&lay, kids[1]);
+        let r2 = rect_of(&lay, kids[2]);
+        // Equal 100px columns, left to right, all on the same row.
+        assert_eq!(r0.origin.x, 0.0);
+        assert_eq!(r1.origin.x, 100.0);
+        assert_eq!(r2.origin.x, 200.0);
+        assert_eq!(r0.size.w, 100.0);
+        assert_eq!(r1.size.w, 100.0);
+        assert_eq!(r2.size.w, 100.0);
+        assert_eq!(r0.origin.y, 0.0);
+        assert_eq!(r1.origin.y, 0.0);
+        assert_eq!(r2.origin.y, 0.0);
+    }
+
+    #[test]
+    fn grid_explicit_px_fr_auto_tracks_size_correctly() {
+        // `grid-template-columns: 100 1fr auto` over a 300px box with three children. The fixed
+        // 100px and the auto track (sizing to its empty content = 0) leave the `1fr` track the rest.
+        let (dom, _g, kids) = grid_dom("300", "50", "100 1fr auto", "50", 3);
+        let (_scene, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let r0 = rect_of(&lay, kids[0]);
+        let r1 = rect_of(&lay, kids[1]);
+        let r2 = rect_of(&lay, kids[2]);
+        // First column is exactly the fixed 100px.
+        assert_eq!(r0.origin.x, 0.0);
+        assert_eq!(r0.size.w, 100.0);
+        // The auto track has no content, so it collapses to 0 and the 1fr track absorbs the
+        // remaining 200px. The second child therefore starts at 100 and spans 200px.
+        assert_eq!(r1.origin.x, 100.0);
+        assert_eq!(r1.size.w, 200.0);
+        // The (zero-width) auto column sits at the right edge.
+        assert_eq!(r2.origin.x, 300.0);
+        assert_eq!(r2.size.w, 0.0);
+    }
+
+    #[test]
+    fn grid_column_span_two_columns() {
+        // A child placed `grid-column: 1 / 3` spans the first two of three 100px columns (200px wide,
+        // starting at the left), while a later child auto-flows onto the next cell.
+        let mut e = Emitter::new();
+        let grid = e.create_element(ElementTag::new(1));
+        e.append(ROOT, grid);
+        e.set_inline_style(grid, DISPLAY, "grid");
+        e.set_inline_style(grid, WIDTH, "300");
+        e.set_inline_style(grid, HEIGHT, "100");
+        e.set_inline_style(grid, GRID_TEMPLATE_COLUMNS, "1fr 1fr 1fr");
+        let wide = e.create_element(ElementTag::new(2));
+        e.append(grid, wide);
+        e.set_inline_style(wide, GRID_COLUMN, "1/3");
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let r = rect_of(&lay, wide);
+        // Lines 1..3 cover the first two 100px tracks: x in [0, 200).
+        assert_eq!(r.origin.x, 0.0);
+        assert_eq!(r.size.w, 200.0);
+    }
+
+    #[test]
+    fn grid_auto_flow_column_stacks_down_then_across() {
+        // `grid-auto-flow: column` with two explicit rows packs children DOWN the first column
+        // before moving to the next, so two children land in the same column, different rows.
+        let mut e = Emitter::new();
+        let grid = e.create_element(ElementTag::new(1));
+        e.append(ROOT, grid);
+        e.set_inline_style(grid, DISPLAY, "grid");
+        e.set_inline_style(grid, WIDTH, "200");
+        e.set_inline_style(grid, HEIGHT, "100");
+        e.set_inline_style(grid, GRID_TEMPLATE_ROWS, "1fr 1fr");
+        e.set_inline_style(grid, GRID_AUTO_FLOW, "column");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(grid, a);
+        let b = e.create_element(ElementTag::new(2));
+        e.append(grid, b);
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let ra = rect_of(&lay, a);
+        let rb = rect_of(&lay, b);
+        // Same column (x), stacked down two 50px rows.
+        assert_eq!(ra.origin.x, rb.origin.x);
+        assert_eq!(ra.origin.y, 0.0);
+        assert_eq!(rb.origin.y, 50.0);
+    }
+
+    #[test]
+    fn grid_minmax_track_clamps_between_bounds() {
+        // `grid-template-columns: minmax(100,1fr) minmax(100,1fr)` over a 300px box: each track wants
+        // an equal `1fr` share (150px) but is floored at 100px, so both resolve to 150px (above the
+        // floor) — proving minmax parses and feeds Taffy a real min/max function.
+        let (dom, _g, kids) = grid_dom("300", "50", "minmax(100,1fr) minmax(100,1fr)", "50", 2);
+        let (_scene, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let r0 = rect_of(&lay, kids[0]);
+        let r1 = rect_of(&lay, kids[1]);
+        assert_eq!(r0.size.w, 150.0);
+        assert_eq!(r1.size.w, 150.0);
+        assert_eq!(r1.origin.x, 150.0);
+    }
+
+    #[test]
+    fn non_grid_box_ignores_grid_props() {
+        // Grid fields are inert on a flex box: a default column with grid track styles still lays
+        // its child out as flex (stacked at the start), proving the grid mapping is gated by
+        // `display: grid` (Taffy reads the track vecs only on a grid box).
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "300");
+        e.set_inline_style(col, HEIGHT, "100");
+        // No `display: grid`; these should be ignored by the flex algorithm.
+        e.set_inline_style(col, GRID_TEMPLATE_COLUMNS, "1fr 1fr 1fr");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(col, child);
+        e.set_inline_style(child, WIDTH, "40");
+        e.set_inline_style(child, HEIGHT, "20");
+        let dom = dom_from(e);
+
+        let (_scene, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let r = rect_of(&lay, child);
+        // Flex column: child stays at the top-left at its own explicit size.
+        assert_eq!(r.origin, Point { x: 0.0, y: 0.0 });
+        assert_eq!(r.size, Size { w: 40.0, h: 20.0 });
     }
 }

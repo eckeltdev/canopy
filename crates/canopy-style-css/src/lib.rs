@@ -153,12 +153,13 @@ use canopy_paint::{
     BORDER_LEFT_COLOR, BORDER_LEFT_WIDTH, BORDER_RIGHT_COLOR, BORDER_RIGHT_WIDTH, BORDER_STYLE,
     BORDER_TOP_COLOR, BORDER_TOP_LEFT_RADIUS, BORDER_TOP_RIGHT_RADIUS, BORDER_TOP_WIDTH,
     BORDER_WIDTH, BOX_SHADOW, BOX_SIZING, COLUMN_GAP, DIRECTION, DISPLAY, FG, FLEX_BASIS,
-    FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE, FONT_WEIGHT, GAP, HEIGHT, INSET_BOTTOM,
-    INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, LINE_HEIGHT, MARGIN, MARGIN_BOTTOM, MARGIN_LEFT,
-    MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, OUTLINE_COLOR,
-    OUTLINE_OFFSET, OUTLINE_WIDTH, OVERFLOW, PADDING, PADDING_BOTTOM, PADDING_LEFT, PADDING_RIGHT,
-    PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TEXT_DECORATION, TRANSLATE_X, TRANSLATE_Y,
-    VISIBILITY, WIDTH, Z_INDEX,
+    FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE, FONT_WEIGHT, GAP, GRID_AUTO_FLOW, GRID_COLUMN,
+    GRID_ROW, GRID_TEMPLATE_COLUMNS, GRID_TEMPLATE_ROWS, HEIGHT, INSET_BOTTOM, INSET_LEFT,
+    INSET_RIGHT, INSET_TOP, JUSTIFY, JUSTIFY_ITEMS, LINE_HEIGHT, MARGIN, MARGIN_BOTTOM,
+    MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY,
+    OUTLINE_COLOR, OUTLINE_OFFSET, OUTLINE_WIDTH, OVERFLOW, PADDING, PADDING_BOTTOM, PADDING_LEFT,
+    PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TEXT_DECORATION,
+    TRANSLATE_X, TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
 };
 use canopy_protocol::{NodeId, PropId};
 use canopy_view::App;
@@ -2158,6 +2159,17 @@ fn map_property(name: &str) -> Option<PropId> {
         // Per-axis gaps (the `gap` shorthand expands to these for a two-value form).
         "row-gap" => Some(ROW_GAP),
         "column-gap" => Some(COLUMN_GAP),
+        // CSS Grid (lite tier). Track lists / placements are normalized to a canonical, easy-to-parse
+        // form in `normalize_value` (`repeat()` expanded, tracks space-separated; placement as
+        // `<start>/<end>` / `span <n>` / bare `<int>`). `grid-auto-flow`/`justify-items` pass their
+        // keyword through. Named lines, `grid-template-areas`, subgrid, dense, and `grid-auto-*` are
+        // deferred (out of this wave's scope).
+        "grid-template-columns" => Some(GRID_TEMPLATE_COLUMNS),
+        "grid-template-rows" => Some(GRID_TEMPLATE_ROWS),
+        "grid-column" => Some(GRID_COLUMN),
+        "grid-row" => Some(GRID_ROW),
+        "grid-auto-flow" => Some(GRID_AUTO_FLOW),
+        "justify-items" => Some(JUSTIFY_ITEMS),
         // Flex item / container longhands.
         "flex-grow" => Some(FLEX_GROW),
         "flex-shrink" => Some(FLEX_SHRINK),
@@ -2228,9 +2240,21 @@ fn normalize_value(prop: PropId, value: &str) -> String {
         return value.to_string();
     }
     // `display`: `block` is the lite alias for `flex` (the only block-ish layout we model); other
-    // values (`flex`, `none`, …) pass through verbatim.
+    // values (`flex`, `grid`, `none`, …) pass through verbatim. `grid` reaches the Taffy mapping,
+    // which switches the box to `Display::Grid`.
     if prop == DISPLAY && value.eq_ignore_ascii_case("block") {
         return "flex".to_string();
+    }
+    // Grid track lists (`grid-template-columns`/`-rows`): canonicalize to a space-separated list of
+    // tracks with every `repeat(n, tracks)` EXPANDED, so the layout consumer reads it without
+    // re-parsing CSS. A list the grammar can't make sense of is dropped (empty string).
+    if prop == GRID_TEMPLATE_COLUMNS || prop == GRID_TEMPLATE_ROWS {
+        return normalize_track_list(value);
+    }
+    // Grid placement (`grid-column`/`grid-row`): canonicalize to `<start>/<end>`, `span <n>`, or a
+    // bare `<int>` line index. Unparseable placement drops to an empty string.
+    if prop == GRID_COLUMN || prop == GRID_ROW {
+        return normalize_grid_placement(value);
     }
     // Lengths: strip a trailing `px`, keep a bare number, PRESERVE a leading `-` and a trailing `%`.
     // The `auto` keyword passes through verbatim (margins / inset / flex-basis). Anything that is
@@ -2244,9 +2268,208 @@ fn normalize_value(prop: PropId, value: &str) -> String {
         }
     }
     // Keywords and the verbatim-passthrough props (z-index, flex-shrink, aspect-ratio,
-    // display:flex|none, position, overflow, …): unchanged. (`box-shadow` / `background-image`
-    // never reach here — their complex values are normalized in `expand_shorthand`.)
+    // display:flex|none, position, overflow, grid-auto-flow, justify-items, …): unchanged.
+    // (`box-shadow` / `background-image` never reach here — their complex values are normalized in
+    // `expand_shorthand`.)
     value.to_string()
+}
+
+/// Normalize a grid **track list** (`grid-template-columns` / `grid-template-rows`) into a canonical,
+/// space-separated string the layout consumer reads without re-parsing CSS. Every `repeat(n, tracks)`
+/// is EXPANDED to `n` copies of its (canonicalized) inner tracks, and each remaining track is reduced
+/// to one of: `<px-number>` (a length with the `px` stripped), `<n>fr`, `<pct>%`, `auto`, or
+/// `minmax(<a>,<b>)` (no spaces inside). Examples:
+/// - `repeat(3, 1fr)`     -> `1fr 1fr 1fr`
+/// - `100px 1fr auto`     -> `100 1fr auto`
+/// - `repeat(2, 10px 1fr)`-> `10 1fr 10 1fr`
+///
+/// A token the grammar can't make sense of drops the **whole** list (returns `""`), so the layout
+/// consumer never sees a half-parsed track list. Named lines, `grid-template-areas`, subgrid, and
+/// `auto-fill`/`auto-fit` repeat counts are out of scope (deferred): an `auto-fill`/`auto-fit` repeat
+/// count fails to parse and drops the list.
+fn normalize_track_list(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        // `none` is the CSS default (no explicit tracks); emit nothing so the consumer leaves the
+        // axis empty (auto tracks only).
+        return String::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for tok in split_top_level_ws(value) {
+        // A `repeat(<count>, <tracks>)` token: expand to `count` copies of its inner tracks.
+        if let Some(inner) = strip_fn(tok, "repeat") {
+            // The count is the part before the FIRST top-level comma; the rest is the track list.
+            let parts = split_top_level_commas(inner);
+            if parts.len() < 2 {
+                return String::new(); // malformed repeat -> drop the whole list
+            }
+            let Ok(count) = parts[0].trim().parse::<u32>() else {
+                // A non-integer count (`auto-fill`/`auto-fit`) is deferred -> drop the list.
+                return String::new();
+            };
+            // Reassemble the inner track list (everything after the first comma) and canonicalize it.
+            let rest = &inner[inner.find(',').map(|p| p + 1).unwrap_or(inner.len())..];
+            let mut inner_tracks: Vec<String> = Vec::new();
+            for t in split_top_level_ws(rest.trim()) {
+                match normalize_track(t) {
+                    Some(c) => inner_tracks.push(c),
+                    None => return String::new(),
+                }
+            }
+            if inner_tracks.is_empty() {
+                return String::new();
+            }
+            for _ in 0..count {
+                for t in &inner_tracks {
+                    out.push(t.clone());
+                }
+            }
+            continue;
+        }
+        match normalize_track(tok) {
+            Some(c) => out.push(c),
+            None => return String::new(),
+        }
+    }
+    out.join(" ")
+}
+
+/// Canonicalize ONE grid track (not a `repeat()`) into `<px-number>` / `<n>fr` / `<pct>%` / `auto` /
+/// `minmax(<a>,<b>)`, or `None` if it is not a recognized single-track form. `minmax(min, max)` keeps
+/// each side canonicalized (a length/`fr`/`%`/`auto`) and emits `minmax(<a>,<b>)` with no inner
+/// spaces, the form the layout consumer parses.
+fn normalize_track(tok: &str) -> Option<String> {
+    let tok = tok.trim();
+    if let Some(inner) = strip_fn(tok, "minmax") {
+        let parts = split_top_level_commas(inner);
+        if parts.len() != 2 {
+            return None;
+        }
+        let min = normalize_track_size(parts[0].trim())?;
+        let max = normalize_track_size(parts[1].trim())?;
+        let mut out = String::with_capacity(min.len() + max.len() + 9);
+        out.push_str("minmax(");
+        out.push_str(&min);
+        out.push(',');
+        out.push_str(&max);
+        out.push(')');
+        return Some(out);
+    }
+    normalize_track_size(tok)
+}
+
+/// Canonicalize a single grid track *size* — the leaf of a track or a `minmax()` side — into
+/// `<px-number>` (a length with `px` stripped), `<n>fr`, `<pct>%`, or `auto`. Returns `None` for any
+/// other token (a keyword like `min-content`/`max-content`/`fit-content` is deferred — out of scope).
+fn normalize_track_size(tok: &str) -> Option<String> {
+    let tok = tok.trim();
+    if tok.eq_ignore_ascii_case("auto") {
+        return Some("auto".to_string());
+    }
+    // `<n>fr`: a flexible track. Keep the `fr` suffix verbatim (the number may be fractional).
+    if let Some(num) = tok.strip_suffix("fr") {
+        let num = num.trim();
+        if is_unsigned_number(num) {
+            let mut out = String::with_capacity(num.len() + 2);
+            out.push_str(num);
+            out.push_str("fr");
+            return Some(out);
+        }
+        return None;
+    }
+    // `<pct>%`: a percentage track. Keep the `%`.
+    if let Some(num) = tok.strip_suffix('%') {
+        let num = num.trim();
+        if is_unsigned_number(num) {
+            let mut out = String::with_capacity(num.len() + 1);
+            out.push_str(num);
+            out.push('%');
+            return Some(out);
+        }
+        return None;
+    }
+    // `<px>` or a bare number: a fixed length. Strip a trailing `px`; emit the bare number.
+    let num = tok.strip_suffix("px").unwrap_or(tok).trim();
+    if is_unsigned_number(num) {
+        return Some(num.to_string());
+    }
+    None
+}
+
+/// Normalize a grid **placement** (`grid-column` / `grid-row`) into a canonical `<start>/<end>`,
+/// `span <n>`, or a bare `<int>` line index, or `""` if it is not a recognized placement. The slash
+/// form trims whitespace around the `/` and re-emits each side canonicalized (a bare line `<int>` or
+/// `span <n>`); a single-value form is a bare line or a span.
+///
+/// Named lines and the `<line> / span <n>` mixed form are deferred (out of scope): a token that is
+/// neither a signed integer nor `span <n>` drops the placement.
+fn normalize_grid_placement(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return String::new();
+    }
+    if let Some((start, end)) = value.split_once('/') {
+        let (Some(start), Some(end)) = (
+            normalize_grid_line(start.trim()),
+            normalize_grid_line(end.trim()),
+        ) else {
+            return String::new();
+        };
+        let mut out = String::with_capacity(start.len() + end.len() + 1);
+        out.push_str(&start);
+        out.push('/');
+        out.push_str(&end);
+        return out;
+    }
+    normalize_grid_line(value).unwrap_or_default()
+}
+
+/// Canonicalize one grid line term: a signed integer line index (`-1`, `3`) emitted verbatim, or a
+/// `span <n>` (one or more spaces collapsed to one). `None` for anything else (a named line, `auto`
+/// inside a slash side, …).
+fn normalize_grid_line(tok: &str) -> Option<String> {
+    let tok = tok.trim();
+    if let Some(rest) = tok.strip_prefix("span") {
+        // `span <n>`: the count must be a positive integer. Re-emit with a single space.
+        let n = rest.trim();
+        if n.parse::<u32>().ok().filter(|&n| n >= 1).is_some() {
+            let mut out = String::with_capacity(n.len() + 5);
+            out.push_str("span ");
+            out.push_str(n);
+            return Some(out);
+        }
+        return None;
+    }
+    // A bare line index: a signed integer (0 is invalid in CSS but Taffy treats it as auto; we still
+    // canonicalize it through so the consumer maps it, matching Taffy's `line(0)` behavior).
+    if tok.parse::<i32>().is_ok() {
+        return Some(tok.to_string());
+    }
+    None
+}
+
+/// If `tok` is a `name( … )` function call (ASCII case-insensitive name), return its inner argument
+/// text (between the parens); otherwise `None`. Used to peel `repeat(...)` / `minmax(...)` apart.
+fn strip_fn<'a>(tok: &'a str, name: &str) -> Option<&'a str> {
+    let tok = tok.trim();
+    let rest = tok.get(..name.len())?;
+    if !rest.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    tok[name.len()..]
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+/// Whether `s` is an unsigned (non-negative) decimal number — digits with at most one `.`, at least
+/// one digit, and no sign. Track sizes (`1fr`, `50%`, `100px`) are non-negative, so this rejects a
+/// stray `-` while accepting `1.5fr`.
+fn is_unsigned_number(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && s.bytes().filter(|&b| b == b'.').count() <= 1
+        && s.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Whether `prop` carries a color value (and so must round-trip through [`normalize_color`]).
@@ -5734,6 +5957,129 @@ mod tests {
         assert!(
             r.contains(&(FG, "#ff0000".to_string())),
             "a min-width rule passes against the ALL sentinel viewport"
+        );
+    }
+
+    // ---- CSS Grid (lite tier) -------------------------------------------------------------------
+
+    #[test]
+    fn display_grid_keyword_passes_through() {
+        // `display: grid` maps to DISPLAY and passes its keyword through (only `block` is folded to
+        // `flex`); the Taffy layer switches the box to Display::Grid on this value.
+        let sheet = parse(".g { display: grid }");
+        assert_eq!(sheet.declarations("g"), &[(DISPLAY, "grid".to_string())]);
+    }
+
+    #[test]
+    fn grid_template_repeat_expands_to_canonical_tracks() {
+        // `repeat(3, 1fr)` expands to three `1fr` tracks, space-separated.
+        let sheet = parse(".g { grid-template-columns: repeat(3, 1fr) }");
+        assert_eq!(
+            sheet.declarations("g"),
+            &[(GRID_TEMPLATE_COLUMNS, "1fr 1fr 1fr".to_string())]
+        );
+    }
+
+    #[test]
+    fn grid_template_repeat_expands_multi_track_groups() {
+        // `repeat(2, 10px 1fr)` expands to two copies of the inner `10 1fr` group, with the px
+        // stripped on the fixed track.
+        let sheet = parse(".g { grid-template-rows: repeat(2, 10px 1fr) }");
+        assert_eq!(
+            sheet.declarations("g"),
+            &[(GRID_TEMPLATE_ROWS, "10 1fr 10 1fr".to_string())]
+        );
+    }
+
+    #[test]
+    fn grid_template_mixed_tracks_strip_px_and_keep_fr_pct_auto() {
+        // A mixed explicit list: px stripped, `fr`/`%`/`auto` kept verbatim, all space-separated.
+        let sheet = parse(".g { grid-template-columns: 100px 1fr auto 50% }");
+        assert_eq!(
+            sheet.declarations("g"),
+            &[(GRID_TEMPLATE_COLUMNS, "100 1fr auto 50%".to_string())]
+        );
+    }
+
+    #[test]
+    fn grid_template_minmax_is_canonicalized_without_inner_spaces() {
+        // `minmax(100px, 1fr)` canonicalizes each side (px stripped) and emits `minmax(100,1fr)`
+        // with no spaces inside, the form the layout consumer parses. A `repeat` over a minmax
+        // expands the minmax too.
+        let sheet =
+            parse(".g { grid-template-columns: minmax(100px, 1fr) repeat(2, minmax(0, 1fr)) }");
+        assert_eq!(
+            sheet.declarations("g"),
+            &[(
+                GRID_TEMPLATE_COLUMNS,
+                "minmax(100,1fr) minmax(0,1fr) minmax(0,1fr)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn grid_template_none_and_bad_tracks_drop_cleanly() {
+        // `none` -> empty (no explicit tracks). An unsupported track keyword (min-content) drops the
+        // whole list. An `auto-fill` repeat count is deferred -> the list drops.
+        assert_eq!(
+            parse(".g { grid-template-columns: none }").declarations("g"),
+            &[(GRID_TEMPLATE_COLUMNS, String::new())]
+        );
+        assert_eq!(
+            parse(".g { grid-template-columns: 1fr min-content }").declarations("g"),
+            &[(GRID_TEMPLATE_COLUMNS, String::new())]
+        );
+        assert_eq!(
+            parse(".g { grid-template-columns: repeat(auto-fill, 1fr) }").declarations("g"),
+            &[(GRID_TEMPLATE_COLUMNS, String::new())]
+        );
+    }
+
+    #[test]
+    fn grid_placement_line_span_and_pair_canonicalize() {
+        // A bare line index, a `<start>/<end>` pair (whitespace trimmed around the `/`), and
+        // `span <n>` (extra spaces collapsed). Negative line indices survive.
+        assert_eq!(
+            parse(".g { grid-column: 2 }").declarations("g"),
+            &[(GRID_COLUMN, "2".to_string())]
+        );
+        assert_eq!(
+            parse(".g { grid-column: 1 / 3 }").declarations("g"),
+            &[(GRID_COLUMN, "1/3".to_string())]
+        );
+        assert_eq!(
+            parse(".g { grid-row: span 2 }").declarations("g"),
+            &[(GRID_ROW, "span 2".to_string())]
+        );
+        assert_eq!(
+            parse(".g { grid-column: -1 / -3 }").declarations("g"),
+            &[(GRID_COLUMN, "-1/-3".to_string())]
+        );
+    }
+
+    #[test]
+    fn grid_placement_bad_value_drops_cleanly() {
+        // A named line / unparseable placement drops to an empty value (the layout consumer then
+        // leaves the item auto-placed).
+        assert_eq!(
+            parse(".g { grid-column: header-start }").declarations("g"),
+            &[(GRID_COLUMN, String::new())]
+        );
+        assert_eq!(
+            parse(".g { grid-row: span 0 }").declarations("g"),
+            &[(GRID_ROW, String::new())]
+        );
+    }
+
+    #[test]
+    fn grid_auto_flow_and_justify_items_pass_keyword_through() {
+        let sheet = parse(".g { grid-auto-flow: column; justify-items: center }");
+        assert_eq!(
+            sheet.declarations("g"),
+            &[
+                (GRID_AUTO_FLOW, "column".to_string()),
+                (JUSTIFY_ITEMS, "center".to_string()),
+            ]
         );
     }
 }

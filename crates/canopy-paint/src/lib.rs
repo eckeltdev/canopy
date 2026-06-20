@@ -273,6 +273,33 @@ pub const BOX_SHADOW: PropId = PropId::new(68);
 /// rasterizes behind the box's content (in front of [`BG`]).
 pub const BACKGROUND_IMAGE: PropId = PropId::new(69);
 
+// Grid (CSS Grid for the lite tier). The track-list props carry a canonical, space-separated
+// list of tracks the layout consumer reads without re-parsing CSS: each track is `<px-number>`
+// (px stripped), `<n>fr`, `<pct>%`, `auto`, or `minmax(<a>,<b>)` (no inner spaces); a
+// `repeat(n, tracks)` is already EXPANDED to n copies upstream. The placement props carry a
+// canonical `<start>/<end>`, `span <n>`, or a bare `<int>` line index.
+/// **Grid template columns** (CSS `grid-template-columns`): the explicit column track list the grid
+/// container lays its children across (`<px>`/`<n>fr`/`<%>`/`auto`/`minmax(a,b)`, `repeat(...)`
+/// expanded). Maps to Taffy's `grid_template_columns`.
+pub const GRID_TEMPLATE_COLUMNS: PropId = PropId::new(70);
+/// **Grid template rows** (CSS `grid-template-rows`): the explicit row track list, same track grammar
+/// as [`GRID_TEMPLATE_COLUMNS`]. Maps to Taffy's `grid_template_rows`.
+pub const GRID_TEMPLATE_ROWS: PropId = PropId::new(71);
+/// **Grid column placement** (CSS `grid-column`): where a grid item sits along the inline (column)
+/// axis — a bare `<int>` line, a `<start>/<end>` line pair, or `span <n>`. Maps to Taffy's
+/// `grid_column` (`Line<GridPlacement>`).
+pub const GRID_COLUMN: PropId = PropId::new(72);
+/// **Grid row placement** (CSS `grid-row`): the block-axis counterpart of [`GRID_COLUMN`]; same
+/// `<int>` / `<start>/<end>` / `span <n>` grammar. Maps to Taffy's `grid_row`.
+pub const GRID_ROW: PropId = PropId::new(73);
+/// **Grid auto flow** (CSS `grid-auto-flow`): `"row"` (default) or `"column"` — the axis the
+/// auto-placement algorithm fills before wrapping. Maps to Taffy's `grid_auto_flow`. (`dense` is
+/// deferred — keyword passthrough only.)
+pub const GRID_AUTO_FLOW: PropId = PropId::new(74);
+/// **Justify items** (CSS `justify-items`): the default inline-axis alignment of grid items within
+/// their cells (`"start"`/`"center"`/`"end"`/`"stretch"`). Maps to Taffy's `justify_items`.
+pub const JUSTIFY_ITEMS: PropId = PropId::new(75);
+
 /// Whether a property is **inherited** down the element tree per CSS: a child with no rule of
 /// its own for an inherited property takes its parent's resolved value. Text/font traits and
 /// `visibility` inherit; box, paint, border, layout, and effect properties do not. The host
@@ -626,6 +653,37 @@ mod tests {
             for b in &all[i + 1..] {
                 assert_ne!(a.raw(), b.raw(), "PropId ids must be unique");
             }
+        }
+    }
+
+    #[test]
+    fn grid_prop_ids_are_the_next_free_distinct_slots() {
+        // The six grid ids are the next free slots after BACKGROUND_IMAGE=69. The CSS map,
+        // the Taffy grid mapping, and the C/C++ protocol mirrors all key off these concrete
+        // values, so pin them and the parity test (protocol_header.rs) keeps the four sites
+        // (this crate, the .h, the .hpp, the test) in agreement.
+        assert_eq!(GRID_TEMPLATE_COLUMNS.raw(), 70);
+        assert_eq!(GRID_TEMPLATE_ROWS.raw(), 71);
+        assert_eq!(GRID_COLUMN.raw(), 72);
+        assert_eq!(GRID_ROW.raw(), 73);
+        assert_eq!(GRID_AUTO_FLOW.raw(), 74);
+        assert_eq!(JUSTIFY_ITEMS.raw(), 75);
+        let grid = [
+            GRID_TEMPLATE_COLUMNS,
+            GRID_TEMPLATE_ROWS,
+            GRID_COLUMN,
+            GRID_ROW,
+            GRID_AUTO_FLOW,
+            JUSTIFY_ITEMS,
+        ];
+        // None of the grid props are inherited (they are box/layout, not text/font traits).
+        for p in grid {
+            assert!(!is_inherited(p), "grid props must not be inherited");
+        }
+        // And the grid ids don't collide with the prior top of the registry.
+        for p in grid {
+            assert_ne!(p.raw(), BACKGROUND_IMAGE.raw());
+            assert!(p.raw() > BACKGROUND_IMAGE.raw());
         }
     }
 

@@ -131,5 +131,12 @@ namespace canopy::wire {
     // Effects.
     inline constexpr std::uint16_t prop_box_shadow = CANOPY_PROP_BOX_SHADOW;
     inline constexpr std::uint16_t prop_background_image = CANOPY_PROP_BACKGROUND_IMAGE;
+    // Grid (CSS Grid for the lite tier).
+    inline constexpr std::uint16_t prop_grid_template_columns = CANOPY_PROP_GRID_TEMPLATE_COLUMNS;
+    inline constexpr std::uint16_t prop_grid_template_rows = CANOPY_PROP_GRID_TEMPLATE_ROWS;
+    inline constexpr std::uint16_t prop_grid_column = CANOPY_PROP_GRID_COLUMN;
+    inline constexpr std::uint16_t prop_grid_row = CANOPY_PROP_GRID_ROW;
+    inline constexpr std::uint16_t prop_grid_auto_flow = CANOPY_PROP_GRID_AUTO_FLOW;
+    inline constexpr std::uint16_t prop_justify_items = CANOPY_PROP_JUSTIFY_ITEMS;
 
 } // namespace canopy::wire

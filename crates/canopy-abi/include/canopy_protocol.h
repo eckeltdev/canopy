@@ -174,5 +174,12 @@
 /* Effects. */
 #define CANOPY_PROP_BOX_SHADOW       68u
 #define CANOPY_PROP_BACKGROUND_IMAGE 69u
+/* Grid (CSS Grid for the lite tier). */
+#define CANOPY_PROP_GRID_TEMPLATE_COLUMNS 70u
+#define CANOPY_PROP_GRID_TEMPLATE_ROWS    71u
+#define CANOPY_PROP_GRID_COLUMN           72u
+#define CANOPY_PROP_GRID_ROW              73u
+#define CANOPY_PROP_GRID_AUTO_FLOW        74u
+#define CANOPY_PROP_JUSTIFY_ITEMS         75u
 
 #endif /* CANOPY_PROTOCOL_H */
