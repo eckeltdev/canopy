@@ -110,6 +110,169 @@ pub const BORDER_WIDTH: PropId = PropId::new(21);
 /// [`BORDER_WIDTH`] is positive.
 pub const BORDER_COLOR: PropId = PropId::new(22);
 
+// Box model — per-side margin/padding (px lengths; `auto` allowed for margins).
+/// Top **margin** in logical px (CSS `margin-top`): space outside the border box on the top edge.
+/// `auto` is allowed (centers the box on that axis); the per-side longhand of [`MARGIN`].
+pub const MARGIN_TOP: PropId = PropId::new(23);
+/// Right **margin** in logical px (CSS `margin-right`): space outside the border box on the right
+/// edge. `auto` is allowed; the per-side longhand of [`MARGIN`].
+pub const MARGIN_RIGHT: PropId = PropId::new(24);
+/// Bottom **margin** in logical px (CSS `margin-bottom`): space outside the border box on the bottom
+/// edge. `auto` is allowed; the per-side longhand of [`MARGIN`].
+pub const MARGIN_BOTTOM: PropId = PropId::new(25);
+/// Left **margin** in logical px (CSS `margin-left`): space outside the border box on the left edge.
+/// `auto` is allowed; the per-side longhand of [`MARGIN`].
+pub const MARGIN_LEFT: PropId = PropId::new(26);
+/// Top **padding** in logical px (CSS `padding-top`): space inside the border box on the top edge;
+/// the per-side longhand of [`PADDING`].
+pub const PADDING_TOP: PropId = PropId::new(27);
+/// Right **padding** in logical px (CSS `padding-right`): space inside the border box on the right
+/// edge; the per-side longhand of [`PADDING`].
+pub const PADDING_RIGHT: PropId = PropId::new(28);
+/// Bottom **padding** in logical px (CSS `padding-bottom`): space inside the border box on the
+/// bottom edge; the per-side longhand of [`PADDING`].
+pub const PADDING_BOTTOM: PropId = PropId::new(29);
+/// Left **padding** in logical px (CSS `padding-left`): space inside the border box on the left
+/// edge; the per-side longhand of [`PADDING`].
+pub const PADDING_LEFT: PropId = PropId::new(30);
+
+// Display / visibility.
+/// **Display** mode (CSS `display`): `"flex"`, `"block"` (mapped to flex), or `"none"` (removed from
+/// layout and paint). The keyword the layout engine uses to decide whether and how a box participates.
+pub const DISPLAY: PropId = PropId::new(31);
+/// **Visibility** (CSS `visibility`): `"visible"` (default) or `"hidden"` (box keeps its layout space
+/// but paints nothing). Paint-only — unlike `display: none` it does not collapse the box.
+pub const VISIBILITY: PropId = PropId::new(32);
+
+// Position.
+/// **Position** scheme (CSS `position`): `"static"` (default), `"relative"` (offset from the in-flow
+/// box by the inset props), or `"absolute"` (taken out of flow, placed against the containing block).
+pub const POSITION: PropId = PropId::new(33);
+/// **Top** inset in logical px or `auto` (CSS `top`): the box's offset from its containing block's top
+/// edge under [`POSITION`] `relative`/`absolute`.
+pub const INSET_TOP: PropId = PropId::new(34);
+/// **Right** inset in logical px or `auto` (CSS `right`): the box's offset from its containing block's
+/// right edge under [`POSITION`] `relative`/`absolute`.
+pub const INSET_RIGHT: PropId = PropId::new(35);
+/// **Bottom** inset in logical px or `auto` (CSS `bottom`): the box's offset from its containing
+/// block's bottom edge under [`POSITION`] `relative`/`absolute`.
+pub const INSET_BOTTOM: PropId = PropId::new(36);
+/// **Left** inset in logical px or `auto` (CSS `left`): the box's offset from its containing block's
+/// left edge under [`POSITION`] `relative`/`absolute`.
+pub const INSET_LEFT: PropId = PropId::new(37);
+/// **Stacking order** (CSS `z-index`), a signed integer: the paint order of a positioned box relative
+/// to its siblings — higher values paint on top.
+pub const Z_INDEX: PropId = PropId::new(38);
+
+// Flex.
+/// Flex **wrapping** (CSS `flex-wrap`): `"nowrap"` (default), `"wrap"`, or `"wrap-reverse"` — whether a
+/// flex container's children overflow onto new lines along the cross axis.
+pub const FLEX_WRAP: PropId = PropId::new(39);
+/// Flex **basis** (CSS `flex-basis`): the child's initial main-axis size before grow/shrink — a px
+/// length, a percentage, or `"auto"` (use the box's own width/height).
+pub const FLEX_BASIS: PropId = PropId::new(40);
+/// Flex **shrink** factor (CSS `flex-shrink`), a unitless non-negative `f32`: how much this child gives
+/// up when the container overflows its main axis, relative to its siblings. `1` is the CSS default.
+pub const FLEX_SHRINK: PropId = PropId::new(41);
+/// Per-child **cross-axis alignment** (CSS `align-self`): a flex alignment keyword
+/// (`"start"`/`"center"`/`"end"`/`"stretch"`) that overrides the container's [`ALIGN`] for this child.
+pub const ALIGN_SELF: PropId = PropId::new(42);
+
+// Sizing.
+/// **Aspect ratio** (CSS `aspect-ratio`): the box's preferred width-to-height ratio as `"w/h"` or a
+/// decimal — the layout engine derives the missing dimension from the one that is set.
+pub const ASPECT_RATIO: PropId = PropId::new(43);
+/// **Box sizing** (CSS `box-sizing`): `"content-box"` (default — width/height set the content box) or
+/// `"border-box"` (width/height include padding and border).
+pub const BOX_SIZING: PropId = PropId::new(44);
+
+// Gaps — per-axis; the existing [`GAP`] fills both.
+/// **Row gap** in logical px (CSS `row-gap`): the gutter between flex lines / grid rows; the per-axis
+/// longhand of [`GAP`] along the block axis.
+pub const ROW_GAP: PropId = PropId::new(45);
+/// **Column gap** in logical px (CSS `column-gap`): the gutter between items along the inline axis; the
+/// per-axis longhand of [`GAP`].
+pub const COLUMN_GAP: PropId = PropId::new(46);
+
+// Overflow — reserved for a later wave; the slot is mapped now.
+/// **Overflow** handling (CSS `overflow`): `"visible"` (default), `"hidden"`, `"clip"`, or `"scroll"` —
+/// what happens to content past the box edge. Reserved: the slot is registered but not yet consumed.
+pub const OVERFLOW: PropId = PropId::new(47);
+
+// Border longhands.
+/// **Border style** (CSS `border-style`): `"none"` (default), `"solid"`, `"dashed"`, `"dotted"`, or
+/// `"double"` — the stroke pattern of the border drawn in [`BORDER_COLOR`].
+pub const BORDER_STYLE: PropId = PropId::new(48);
+/// **Top border width** in logical px (CSS `border-top-width`): the per-side longhand of
+/// [`BORDER_WIDTH`] for the top edge.
+pub const BORDER_TOP_WIDTH: PropId = PropId::new(49);
+/// **Right border width** in logical px (CSS `border-right-width`): the per-side longhand of
+/// [`BORDER_WIDTH`] for the right edge.
+pub const BORDER_RIGHT_WIDTH: PropId = PropId::new(50);
+/// **Bottom border width** in logical px (CSS `border-bottom-width`): the per-side longhand of
+/// [`BORDER_WIDTH`] for the bottom edge.
+pub const BORDER_BOTTOM_WIDTH: PropId = PropId::new(51);
+/// **Left border width** in logical px (CSS `border-left-width`): the per-side longhand of
+/// [`BORDER_WIDTH`] for the left edge.
+pub const BORDER_LEFT_WIDTH: PropId = PropId::new(52);
+/// **Top border color** (CSS `border-top-color`), a `#rrggbb`/`#rrggbbaa` value: the per-side longhand
+/// of [`BORDER_COLOR`] for the top edge.
+pub const BORDER_TOP_COLOR: PropId = PropId::new(53);
+/// **Right border color** (CSS `border-right-color`), a `#rrggbb`/`#rrggbbaa` value: the per-side
+/// longhand of [`BORDER_COLOR`] for the right edge.
+pub const BORDER_RIGHT_COLOR: PropId = PropId::new(54);
+/// **Bottom border color** (CSS `border-bottom-color`), a `#rrggbb`/`#rrggbbaa` value: the per-side
+/// longhand of [`BORDER_COLOR`] for the bottom edge.
+pub const BORDER_BOTTOM_COLOR: PropId = PropId::new(55);
+/// **Left border color** (CSS `border-left-color`), a `#rrggbb`/`#rrggbbaa` value: the per-side
+/// longhand of [`BORDER_COLOR`] for the left edge.
+pub const BORDER_LEFT_COLOR: PropId = PropId::new(56);
+/// **Top-left corner radius** in logical px (CSS `border-top-left-radius`): the per-corner longhand of
+/// [`RADIUS`] for the top-left corner.
+pub const BORDER_TOP_LEFT_RADIUS: PropId = PropId::new(57);
+/// **Top-right corner radius** in logical px (CSS `border-top-right-radius`): the per-corner longhand of
+/// [`RADIUS`] for the top-right corner.
+pub const BORDER_TOP_RIGHT_RADIUS: PropId = PropId::new(58);
+/// **Bottom-right corner radius** in logical px (CSS `border-bottom-right-radius`): the per-corner
+/// longhand of [`RADIUS`] for the bottom-right corner.
+pub const BORDER_BOTTOM_RIGHT_RADIUS: PropId = PropId::new(59);
+/// **Bottom-left corner radius** in logical px (CSS `border-bottom-left-radius`): the per-corner
+/// longhand of [`RADIUS`] for the bottom-left corner.
+pub const BORDER_BOTTOM_LEFT_RADIUS: PropId = PropId::new(60);
+
+// Text.
+/// **Font size** in logical px (CSS `font-size`): the em size the text backend rasterizes/shapes a run
+/// at.
+pub const FONT_SIZE: PropId = PropId::new(61);
+/// **Font weight** (CSS `font-weight`): a `100`..`900` numeric weight or the `"normal"`/`"bold"`
+/// keywords the text backend maps to a face.
+pub const FONT_WEIGHT: PropId = PropId::new(62);
+/// **Line height** (CSS `line-height`): a px length or a unitless multiplier of [`FONT_SIZE`] — the
+/// distance between baselines of wrapped text.
+pub const LINE_HEIGHT: PropId = PropId::new(63);
+/// **Text decoration** (CSS `text-decoration`): `"none"` (default), `"underline"`, or `"line-through"`
+/// — the line the renderer draws across a text run.
+pub const TEXT_DECORATION: PropId = PropId::new(64);
+
+// Outline.
+/// **Outline width** in logical px (CSS `outline-width`): the stroke width of an outline drawn outside
+/// the border box, painted in [`OUTLINE_COLOR`] and offset by [`OUTLINE_OFFSET`].
+pub const OUTLINE_WIDTH: PropId = PropId::new(65);
+/// **Outline color** (CSS `outline-color`), a `#rrggbb`/`#rrggbbaa` value the renderer strokes the
+/// outline in when [`OUTLINE_WIDTH`] is positive.
+pub const OUTLINE_COLOR: PropId = PropId::new(66);
+/// **Outline offset** in logical px (CSS `outline-offset`), may be negative: the gap between the border
+/// box edge and the outline stroke.
+pub const OUTLINE_OFFSET: PropId = PropId::new(67);
+
+// Effects.
+/// **Box shadow** (CSS `box-shadow`), carrying `offx offy blur spread #color [inset]`: a drop (or, with
+/// `inset`, inner) shadow the renderer paints around or inside the box.
+pub const BOX_SHADOW: PropId = PropId::new(68);
+/// **Background image** (CSS `background-image`), carrying a `linear-gradient(...)` value the renderer
+/// rasterizes behind the box's content (in front of [`BG`]).
+pub const BACKGROUND_IMAGE: PropId = PropId::new(69);
+
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;
 /// Baked-font cell height the renderer rasterizes at scale 1.

@@ -71,5 +71,65 @@ namespace canopy::wire {
     inline constexpr std::uint16_t prop_flex_grow = CANOPY_PROP_FLEX_GROW;
     inline constexpr std::uint16_t prop_border_width = CANOPY_PROP_BORDER_WIDTH;
     inline constexpr std::uint16_t prop_border_color = CANOPY_PROP_BORDER_COLOR;
+    // Box model — per-side margin/padding.
+    inline constexpr std::uint16_t prop_margin_top = CANOPY_PROP_MARGIN_TOP;
+    inline constexpr std::uint16_t prop_margin_right = CANOPY_PROP_MARGIN_RIGHT;
+    inline constexpr std::uint16_t prop_margin_bottom = CANOPY_PROP_MARGIN_BOTTOM;
+    inline constexpr std::uint16_t prop_margin_left = CANOPY_PROP_MARGIN_LEFT;
+    inline constexpr std::uint16_t prop_padding_top = CANOPY_PROP_PADDING_TOP;
+    inline constexpr std::uint16_t prop_padding_right = CANOPY_PROP_PADDING_RIGHT;
+    inline constexpr std::uint16_t prop_padding_bottom = CANOPY_PROP_PADDING_BOTTOM;
+    inline constexpr std::uint16_t prop_padding_left = CANOPY_PROP_PADDING_LEFT;
+    // Display / visibility.
+    inline constexpr std::uint16_t prop_display = CANOPY_PROP_DISPLAY;
+    inline constexpr std::uint16_t prop_visibility = CANOPY_PROP_VISIBILITY;
+    // Position.
+    inline constexpr std::uint16_t prop_position = CANOPY_PROP_POSITION;
+    inline constexpr std::uint16_t prop_inset_top = CANOPY_PROP_INSET_TOP;
+    inline constexpr std::uint16_t prop_inset_right = CANOPY_PROP_INSET_RIGHT;
+    inline constexpr std::uint16_t prop_inset_bottom = CANOPY_PROP_INSET_BOTTOM;
+    inline constexpr std::uint16_t prop_inset_left = CANOPY_PROP_INSET_LEFT;
+    inline constexpr std::uint16_t prop_z_index = CANOPY_PROP_Z_INDEX;
+    // Flex.
+    inline constexpr std::uint16_t prop_flex_wrap = CANOPY_PROP_FLEX_WRAP;
+    inline constexpr std::uint16_t prop_flex_basis = CANOPY_PROP_FLEX_BASIS;
+    inline constexpr std::uint16_t prop_flex_shrink = CANOPY_PROP_FLEX_SHRINK;
+    inline constexpr std::uint16_t prop_align_self = CANOPY_PROP_ALIGN_SELF;
+    // Sizing.
+    inline constexpr std::uint16_t prop_aspect_ratio = CANOPY_PROP_ASPECT_RATIO;
+    inline constexpr std::uint16_t prop_box_sizing = CANOPY_PROP_BOX_SIZING;
+    // Gaps — per-axis.
+    inline constexpr std::uint16_t prop_row_gap = CANOPY_PROP_ROW_GAP;
+    inline constexpr std::uint16_t prop_column_gap = CANOPY_PROP_COLUMN_GAP;
+    // Overflow — reserved for a later wave.
+    inline constexpr std::uint16_t prop_overflow = CANOPY_PROP_OVERFLOW;
+    // Border longhands.
+    inline constexpr std::uint16_t prop_border_style = CANOPY_PROP_BORDER_STYLE;
+    inline constexpr std::uint16_t prop_border_top_width = CANOPY_PROP_BORDER_TOP_WIDTH;
+    inline constexpr std::uint16_t prop_border_right_width = CANOPY_PROP_BORDER_RIGHT_WIDTH;
+    inline constexpr std::uint16_t prop_border_bottom_width = CANOPY_PROP_BORDER_BOTTOM_WIDTH;
+    inline constexpr std::uint16_t prop_border_left_width = CANOPY_PROP_BORDER_LEFT_WIDTH;
+    inline constexpr std::uint16_t prop_border_top_color = CANOPY_PROP_BORDER_TOP_COLOR;
+    inline constexpr std::uint16_t prop_border_right_color = CANOPY_PROP_BORDER_RIGHT_COLOR;
+    inline constexpr std::uint16_t prop_border_bottom_color = CANOPY_PROP_BORDER_BOTTOM_COLOR;
+    inline constexpr std::uint16_t prop_border_left_color = CANOPY_PROP_BORDER_LEFT_COLOR;
+    inline constexpr std::uint16_t prop_border_top_left_radius = CANOPY_PROP_BORDER_TOP_LEFT_RADIUS;
+    inline constexpr std::uint16_t prop_border_top_right_radius = CANOPY_PROP_BORDER_TOP_RIGHT_RADIUS;
+    inline constexpr std::uint16_t prop_border_bottom_right_radius =
+        CANOPY_PROP_BORDER_BOTTOM_RIGHT_RADIUS;
+    inline constexpr std::uint16_t prop_border_bottom_left_radius =
+        CANOPY_PROP_BORDER_BOTTOM_LEFT_RADIUS;
+    // Text.
+    inline constexpr std::uint16_t prop_font_size = CANOPY_PROP_FONT_SIZE;
+    inline constexpr std::uint16_t prop_font_weight = CANOPY_PROP_FONT_WEIGHT;
+    inline constexpr std::uint16_t prop_line_height = CANOPY_PROP_LINE_HEIGHT;
+    inline constexpr std::uint16_t prop_text_decoration = CANOPY_PROP_TEXT_DECORATION;
+    // Outline.
+    inline constexpr std::uint16_t prop_outline_width = CANOPY_PROP_OUTLINE_WIDTH;
+    inline constexpr std::uint16_t prop_outline_color = CANOPY_PROP_OUTLINE_COLOR;
+    inline constexpr std::uint16_t prop_outline_offset = CANOPY_PROP_OUTLINE_OFFSET;
+    // Effects.
+    inline constexpr std::uint16_t prop_box_shadow = CANOPY_PROP_BOX_SHADOW;
+    inline constexpr std::uint16_t prop_background_image = CANOPY_PROP_BACKGROUND_IMAGE;
 
 } // namespace canopy::wire
