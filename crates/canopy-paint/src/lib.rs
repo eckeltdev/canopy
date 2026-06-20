@@ -273,6 +273,21 @@ pub const BOX_SHADOW: PropId = PropId::new(68);
 /// rasterizes behind the box's content (in front of [`BG`]).
 pub const BACKGROUND_IMAGE: PropId = PropId::new(69);
 
+/// Whether a property is **inherited** down the element tree per CSS: a child with no rule of
+/// its own for an inherited property takes its parent's resolved value. Text/font traits and
+/// `visibility` inherit; box, paint, border, layout, and effect properties do not. The host
+/// cascade uses this to thread inherited values through the tree (a child label takes its
+/// container's `color`/`font-size` without repeating the rule). Source of truth for the registry.
+#[must_use]
+pub fn is_inherited(prop: PropId) -> bool {
+    prop == FG
+        || prop == FONT_SIZE
+        || prop == FONT_WEIGHT
+        || prop == LINE_HEIGHT
+        || prop == TEXT_ALIGN
+        || prop == VISIBILITY
+}
+
 /// Baked-font cell advance at the reference height, in pixels.
 const TEXT_ADVANCE: f32 = 8.0;
 /// Baked-font cell height the renderer rasterizes at scale 1.
