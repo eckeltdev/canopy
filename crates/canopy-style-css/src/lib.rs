@@ -16,10 +16,12 @@
 //!
 //! # Selectors and specificity
 //!
-//! A selector is a single **compound** of simple selectors — an optional leading
-//! type/tag name followed by any run of `.class` and `#id` parts — plus an optional
-//! `:hover` pseudo-class. `*` is the universal (matches anything). Commas group
-//! several selectors onto one declaration block.
+//! A selector is a **complex** selector: a sequence of **compounds** joined by
+//! combinators. A compound is an optional leading type/tag name followed by any run of
+//! `.class`, `#id`, and `[attr]` parts, plus an optional `:hover` pseudo-class on the
+//! subject (rightmost) compound. `*` is the universal (matches anything). A descendant
+//! combinator is whitespace; a child combinator is `>`. Commas group several selectors
+//! onto one declaration block.
 //!
 //! ```text
 //! div                   /* type            */
@@ -27,11 +29,21 @@
 //! .card                 /* class           */
 //! button.primary#go     /* compound: all parts must match */
 //! .btn:hover            /* class + state   */
+//! .card .title          /* descendant: a .title inside any .card */
+//! nav > .item           /* child: a direct .item child of nav */
+//! [data-role="nav"]     /* attribute (exact) */
+//! a[href^="https"]      /* type + attribute (prefix) */
 //! *                     /* universal       */
 //! ```
 //!
-//! Matching is resolved against a [`MatchTarget`] (the element's type name, id, and
-//! class list). [`Stylesheet::resolve_for`] is the **cascade resolver**: it gathers
+//! Attribute selectors support `[name]` (present), `[name="v"]` (exact), and the substring
+//! operators `[name^="v"]` (prefix), `[name$="v"]` (suffix), `[name*="v"]` (contains).
+//!
+//! Matching is resolved against a [`MatchTarget`] (the element's own [`ElementIdentity`] —
+//! type name, id, classes, attributes — plus its ancestor chain). Complex selectors match
+//! right-to-left: the subject compound must match the element, then each earlier compound is
+//! satisfied by an ancestor (any depth for descendant, the immediate parent for child).
+//! [`Stylesheet::resolve_for`] is the **cascade resolver**: it gathers
 //! every rule whose selector matches, orders them by CSS **specificity** (id = 100,
 //! class/pseudo = 10, type = 1; ties broken by source order), and folds their
 //! declarations **last-wins** per [`PropId`] — a higher-specificity (or later) rule
@@ -71,10 +83,11 @@
 //!
 //! This is a deliberate subset, not a full CSS engine:
 //!
-//! - Selectors are a single compound only — no **descendant/child/sibling
-//!   combinators**, no attribute selectors, and no pseudo-classes beyond `:hover`;
-//!   no media queries. Box shorthands *are* expanded, but `!important` is only
-//!   stripped (its precedence is not yet honored).
+//! - Selectors support the **descendant** (` `) and **child** (`>`) combinators and
+//!   **attribute selectors** (`[name]`, `[name="v"]`, `^=`/`$=`/`*=`), but not the
+//!   sibling combinators (`+`, `~`), the `~=`/`|=` attribute operators, or any
+//!   pseudo-class beyond `:hover`; no media queries. Box shorthands *are* expanded, but
+//!   `!important` is only stripped (its precedence is not yet honored).
 //! - The cascade matches each node against its own identity; there is no inheritance
 //!   here (the host folds matched rules in as inline styles, and author inline styles
 //!   win, mirroring CSS specificity where inline beats a selector).
@@ -128,8 +141,7 @@ enum State {
 }
 
 /// One part of a **compound** selector. A compound is an AND of these against a single
-/// element: `button.primary#go` is `[Type("button"), Class("primary"), Id("go")]`. There are
-/// no combinators (descendant/child) in this lite subset — each rule targets one element.
+/// element: `button.primary#go` is `[Type("button"), Class("primary"), Id("go")]`.
 #[derive(Clone, PartialEq, Eq)]
 enum Simple {
     /// A type/tag selector (`button`, `div`) — matches the element's type name.
@@ -138,6 +150,58 @@ enum Simple {
     Id(String),
     /// A class selector (`.primary`) — matches if the element carries that class.
     Class(String),
+    /// An attribute selector (`[name]`, `[name="v"]`, `[name^="v"]`, …) — matches against
+    /// the element's attribute pairs per [`AttrMatch`].
+    Attr(AttrSelector),
+}
+
+/// One attribute selector: the attribute name plus the test applied to its value.
+#[derive(Clone, PartialEq, Eq)]
+struct AttrSelector {
+    /// The attribute name (case-sensitive), e.g. `id` or `data-role`.
+    name: String,
+    /// How the attribute's value must relate to [`AttrSelector::value`].
+    op: AttrMatch,
+    /// The comparison value (empty + [`AttrMatch::Present`] for a bare `[name]`).
+    value: String,
+}
+
+/// The test an [`AttrSelector`] applies to an attribute's value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttrMatch {
+    /// `[name]` — the attribute is present (value ignored).
+    Present,
+    /// `[name="v"]` — the attribute equals `v` exactly.
+    Exact,
+    /// `[name^="v"]` — the attribute value starts with `v`.
+    Prefix,
+    /// `[name$="v"]` — the attribute value ends with `v`.
+    Suffix,
+    /// `[name*="v"]` — the attribute value contains `v`.
+    Contains,
+}
+
+/// A combinator describing how the compound on its **left** relates to the compound on its
+/// **right** in a complex selector (e.g. `.card > .title`: the `.card` compound carries a
+/// [`Combinator::Child`] edge to `.title`). The subject (rightmost) compound has no edge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Combinator {
+    /// A descendant combinator (whitespace): some ancestor at any depth must match.
+    Descendant,
+    /// A child combinator (`>`): the immediate parent must match.
+    Child,
+}
+
+/// One compound in a complex selector, plus the [`Combinator`] tying it to the compound on
+/// its right. The subject compound (the last in the sequence) carries the placeholder
+/// [`Combinator::Descendant`], which is never consulted (matching starts from the subject and
+/// walks leftward, reading each *earlier* compound's edge).
+#[derive(Clone, PartialEq, Eq)]
+struct ComplexPart {
+    /// How this compound relates to the compound on its right.
+    combinator: Combinator,
+    /// The simple selectors AND-ed against one element (`button.primary` → two simples).
+    simples: Vec<Simple>,
 }
 
 /// CSS **specificity** as the standard `(a, b, c)` tuple — `a` = id count, `b` = class +
@@ -147,9 +211,14 @@ enum Simple {
 /// and 11 classes outrank 10). Ties break on source order at the call site.
 type Spec = (u32, u32, u32);
 
-/// A compound selector plus its pseudo-state and CSS **specificity** (see [`Spec`]).
+/// A **complex** selector — a sequence of compounds joined by combinators — plus its
+/// pseudo-state and CSS **specificity** (see [`Spec`]).
+///
+/// `parts` reads left-to-right as written: `parts.last()` is the **subject** (matches the
+/// element itself) and each earlier part carries the [`Combinator`] relating it to the part on
+/// its right. A single-compound selector (`button.primary`) is a one-element `parts`.
 struct Selector {
-    simples: Vec<Simple>,
+    parts: Vec<ComplexPart>,
     state: State,
     specificity: Spec,
 }
@@ -162,17 +231,82 @@ struct Rule {
     decls: Vec<Decl>,
 }
 
-/// The element a stylesheet is resolved against: its type/tag name, id, and class list. A
-/// `Type`/`Id` simple selector only matches when the corresponding field is `Some` and equal,
-/// so the legacy class-only [`Stylesheet::resolve`] (which leaves both `None`) keeps matching
-/// exactly the pure-class rules it always did.
-pub struct MatchTarget<'a> {
+/// One element's identity for selector matching: its type/tag name, id, classes, and
+/// attribute pairs. The element a stylesheet is resolved against ([`MatchTarget`]) carries its
+/// own identity plus its ancestors' as a slice of these, so a complex (descendant/child)
+/// selector can walk the chain.
+///
+/// A `Type`/`Id`/`Class`/`Attr` simple only matches when the corresponding field is present and
+/// the test passes, so an identity with empty `attrs` (and a target with empty `ancestors`)
+/// matches exactly the pure type/id/class/compound rules it did before this wave.
+#[derive(Clone, Copy)]
+pub struct ElementIdentity<'a> {
     /// The element's type/tag name (e.g. `"button"`), or `None`.
     pub type_name: Option<&'a str>,
     /// The element's id, or `None`.
     pub id: Option<&'a str>,
     /// The element's classes.
     pub classes: &'a [&'a str],
+    /// The element's attribute `(name, value)` pairs (for attribute selectors). Empty when no
+    /// attribute context is available — attribute selectors then simply do not match.
+    pub attrs: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> ElementIdentity<'a> {
+    /// An identity with the given type/id/classes and **no** attributes — the common case for a
+    /// caller that has no attribute context.
+    #[must_use]
+    pub fn new(type_name: Option<&'a str>, id: Option<&'a str>, classes: &'a [&'a str]) -> Self {
+        Self {
+            type_name,
+            id,
+            classes,
+            attrs: &[],
+        }
+    }
+}
+
+/// The element a stylesheet is resolved against: its own [`ElementIdentity`] (type/tag name,
+/// id, classes, attrs) plus its `ancestors` — each ancestor's identity ordered **nearest-first**
+/// (`ancestors[0]` is the parent, `ancestors[1]` the grandparent, …), which complex
+/// (descendant/child) selectors walk leftward.
+///
+/// Build one with [`MatchTarget::new`] (defaults attrs + ancestors to empty, so a caller with no
+/// such context matches exactly the pure type/id/class/compound rules it always did) and layer on
+/// [`MatchTarget::with_attrs`] / [`MatchTarget::with_ancestors`] when the context is available.
+pub struct MatchTarget<'a> {
+    /// This element's own identity.
+    own: ElementIdentity<'a>,
+    /// The ancestor chain, nearest-first (index 0 = parent). Empty by default.
+    ancestors: &'a [ElementIdentity<'a>],
+}
+
+impl<'a> MatchTarget<'a> {
+    /// A target for an element with the given type/id/classes, **no** attributes, and **no**
+    /// ancestor context. This is the backward-compatible entry point: against a stylesheet with
+    /// no combinators or attribute selectors it resolves exactly as the pre-wave engine did.
+    #[must_use]
+    pub fn new(type_name: Option<&'a str>, id: Option<&'a str>, classes: &'a [&'a str]) -> Self {
+        Self {
+            own: ElementIdentity::new(type_name, id, classes),
+            ancestors: &[],
+        }
+    }
+
+    /// Attach the element's attribute `(name, value)` pairs, enabling attribute selectors.
+    #[must_use]
+    pub fn with_attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
+        self.own.attrs = attrs;
+        self
+    }
+
+    /// Attach the ancestor chain (nearest-first; index 0 = parent), enabling descendant/child
+    /// combinators.
+    #[must_use]
+    pub fn with_ancestors(mut self, ancestors: &'a [ElementIdentity<'a>]) -> Self {
+        self.ancestors = ancestors;
+        self
+    }
 }
 
 /// A parsed CSS-lite stylesheet: a set of class rules, each resolved to
@@ -203,8 +337,9 @@ impl Stylesheet {
     pub fn declarations(&self, class: &str) -> &[Decl] {
         for rule in &self.rules {
             if rule.selector.state == State::Base
-                && rule.selector.simples.len() == 1
-                && matches!(&rule.selector.simples[0], Simple::Class(c) if c == class)
+                && rule.selector.parts.len() == 1
+                && rule.selector.parts[0].simples.len() == 1
+                && matches!(&rule.selector.parts[0].simples[0], Simple::Class(c) if c == class)
             {
                 return &rule.decls;
             }
@@ -230,7 +365,7 @@ impl Stylesheet {
                 State::Base => true,
                 State::Hover => hovered,
             };
-            if state_ok && selector_matches(&rule.selector.simples, target) {
+            if state_ok && complex_matches(&rule.selector.parts, target) {
                 matched.push((rule.selector.specificity, idx));
             }
         }
@@ -247,14 +382,7 @@ impl Stylesheet {
     /// The legacy class-only resolve: a [`resolve_for`](Self::resolve_for) with no type/id, so it
     /// matches exactly the pure-class rules it always did. Kept for `canopy-ui` / `LiteEngine`.
     pub fn resolve(&self, classes: &[&str], hovered: bool) -> Vec<Decl> {
-        self.resolve_for(
-            &MatchTarget {
-                type_name: None,
-                id: None,
-                classes,
-            },
-            hovered,
-        )
+        self.resolve_for(&MatchTarget::new(None, None, classes), hovered)
     }
 
     /// Whether any of `classes` has a `:hover` rule, i.e. the node would restyle when
@@ -266,8 +394,9 @@ impl Stylesheet {
             rule.selector.state == State::Hover
                 && rule
                     .selector
-                    .simples
+                    .parts
                     .iter()
+                    .flat_map(|part| part.simples.iter())
                     .any(|s| matches!(s, Simple::Class(c) if classes.contains(&c.as_str())))
         })
     }
@@ -375,49 +504,192 @@ pub fn parse(css: &str) -> Stylesheet {
     Stylesheet { rules }
 }
 
-/// Parse one selector — a compound (`button.primary#go`) plus an optional `:hover` — into a
-/// [`Selector`] with its specificity. Returns `None` for an empty selector or one carrying an
-/// unsupported pseudo-class (`:focus`, `::before`, …) so it is dropped (not mistaken for a base).
+/// Parse one selector — a **complex** selector (`.card > button.primary#go`, descendant/child
+/// combinators between compounds) plus an optional `:hover` on the subject — into a [`Selector`]
+/// with its specificity. Returns `None` for an empty selector, an empty compound, or one carrying
+/// an unsupported pseudo-class (`:focus`, `::before`, …), so it is dropped (not mistaken for a
+/// base). Specificity is the sum over every compound's simples (plus the `:hover` pseudo).
 fn parse_selector(sel: &str) -> Option<Selector> {
+    let sel = sel.trim();
     if sel.is_empty() {
         return None;
     }
-    let (compound, state) = match sel.split_once(':') {
-        // Pseudo-classes are ASCII case-insensitive (`:HOVER` == `:hover`).
-        Some((compound, pseudo)) if pseudo.eq_ignore_ascii_case("hover") => {
-            (compound, State::Hover)
-        }
-        Some(_) => return None, // unsupported pseudo-class -> drop this selector
-        None => (sel, State::Base),
-    };
-    let simples = parse_compound(compound)?;
-    let (mut ids, mut classes, mut types) = (0u32, 0u32, 0u32);
-    for simple in &simples {
-        match simple {
-            Simple::Id(_) => ids += 1,
-            Simple::Class(_) => classes += 1,
-            Simple::Type(_) => types += 1,
-        }
+    // Tokenize the complex selector into `(combinator-to-the-right, compound-text)` parts.
+    let tokens = tokenize_complex(sel)?;
+    if tokens.is_empty() {
+        return None;
     }
+
+    let mut parts: Vec<ComplexPart> = Vec::with_capacity(tokens.len());
+    let (mut ids, mut classes, mut types) = (0u32, 0u32, 0u32);
+    let last = tokens.len() - 1;
+    let mut state = State::Base;
+
+    for (idx, (combinator, compound_text)) in tokens.into_iter().enumerate() {
+        // `:hover` is only honored on the subject (rightmost) compound; on an ancestor compound an
+        // unsupported pseudo drops the selector (handled by the `Some(_) => return None` arm).
+        let compound_text = if idx == last {
+            match compound_text.split_once(':') {
+                Some((head, pseudo)) if pseudo.eq_ignore_ascii_case("hover") => {
+                    state = State::Hover;
+                    head
+                }
+                Some(_) => return None, // unsupported pseudo-class -> drop this selector
+                None => compound_text,
+            }
+        } else if compound_text.contains(':') {
+            return None; // a pseudo on a non-subject compound is unsupported -> drop
+        } else {
+            compound_text
+        };
+
+        let simples = parse_compound(compound_text)?;
+        for simple in &simples {
+            match simple {
+                Simple::Id(_) => ids += 1,
+                Simple::Class(_) | Simple::Attr(_) => classes += 1,
+                Simple::Type(_) => types += 1,
+            }
+        }
+        parts.push(ComplexPart {
+            combinator,
+            simples,
+        });
+    }
+
     if state == State::Hover {
         classes += 1; // a pseudo-class counts at the class level of specificity
     }
     Some(Selector {
-        simples,
+        parts,
         state,
         specificity: (ids, classes, types),
     })
 }
 
+/// Tokenize a complex selector into a left-to-right `Vec` of `(combinator-relating-this-compound-
+/// to-the-one-on-its-right, compound-text)`. The subject (last) part carries the placeholder
+/// [`Combinator::Descendant`] (never consulted, since matching starts at the subject and reads each
+/// *earlier* part's edge). Whitespace is a descendant combinator; `>` is a child combinator
+/// (surrounding whitespace is absorbed). Returns `None` on a malformed run (a leading, trailing, or
+/// doubled `>`).
+fn tokenize_complex(sel: &str) -> Option<Vec<(Combinator, &str)>> {
+    // Collect each compound's text and the combinator that PRECEDES it (relates the compound on its
+    // left to it). The first compound has no preceding edge; default the rest to descendant unless a
+    // `>` set it to child.
+    let mut compounds: Vec<&str> = Vec::new();
+    let mut preceding: Vec<Combinator> = Vec::new(); // preceding[k] relates compound k-1 -> k (k>=1)
+    let bytes = sel.as_bytes();
+    let mut i = 0;
+    let mut start = 0;
+    let mut have_open = false; // a compound's bytes are accumulating from `start`
+    let mut pending_child = false; // a `>` was seen since the last compound was closed
+
+    /// Close the open compound (if any), recording the combinator that precedes it.
+    fn close<'s>(
+        compounds: &mut Vec<&'s str>,
+        preceding: &mut Vec<Combinator>,
+        text: &'s str,
+        pending_child: &mut bool,
+    ) -> Option<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Some(());
+        }
+        if !compounds.is_empty() {
+            preceding.push(if *pending_child {
+                Combinator::Child
+            } else {
+                Combinator::Descendant
+            });
+        } else if *pending_child {
+            return None; // leading `>` with no compound on its left
+        }
+        *pending_child = false;
+        compounds.push(text);
+        Some(())
+    }
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'>' {
+            if have_open {
+                close(
+                    &mut compounds,
+                    &mut preceding,
+                    &sel[start..i],
+                    &mut pending_child,
+                )?;
+                have_open = false;
+            }
+            if pending_child {
+                return None; // `>>` is malformed
+            }
+            pending_child = true;
+            i += 1;
+            start = i;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            if have_open {
+                close(
+                    &mut compounds,
+                    &mut preceding,
+                    &sel[start..i],
+                    &mut pending_child,
+                )?;
+                have_open = false;
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+        if !have_open {
+            start = i;
+            have_open = true;
+        }
+        i += 1;
+    }
+    if have_open {
+        close(
+            &mut compounds,
+            &mut preceding,
+            &sel[start..],
+            &mut pending_child,
+        )?;
+    }
+    if pending_child {
+        return None; // trailing `>` with no following compound
+    }
+    if compounds.is_empty() {
+        return None;
+    }
+
+    // Our model stores, per compound, the combinator tying it to the compound on ITS RIGHT — i.e.
+    // compound k carries `preceding[k]` (the edge between k and k+1, which we recorded as preceding
+    // k+1). The subject (last) compound carries the never-consulted placeholder.
+    let mut out: Vec<(Combinator, &str)> = Vec::with_capacity(compounds.len());
+    for (k, text) in compounds.iter().enumerate() {
+        let comb = preceding.get(k).copied().unwrap_or(Combinator::Descendant);
+        out.push((comb, *text));
+    }
+    Some(out)
+}
+
 /// Parse a compound selector into its simple parts: an optional leading **type** name, then a run
-/// of `.class` / `#id`. A bare `*` (universal) yields an empty list (matches every element).
-/// Returns `None` on a malformed identifier.
+/// of `.class` / `#id` / `[attr]` parts (in any order after the type). A bare `*` (universal)
+/// yields an empty list (matches every element). Returns `None` on a malformed identifier or
+/// attribute selector, or an empty compound.
 fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
+    let compound = compound.trim();
+    if compound.is_empty() {
+        return None;
+    }
     let mut simples = Vec::new();
     let bytes = compound.as_bytes();
     let mut i = 0;
-    // Optional leading type/tag name (anything before the first `.`/`#`).
-    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+    // Optional leading type/tag name (anything before the first `.`/`#`/`[`).
+    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' && bytes[i] != b'[' {
         i += 1;
     }
     let head = &compound[..i];
@@ -427,12 +699,20 @@ fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
         }
         simples.push(Simple::Type(head.to_string()));
     }
-    // Then a run of `.class` / `#id` parts.
+    // Then a run of `.class` / `#id` / `[attr...]` parts.
     while i < bytes.len() {
         let kind = bytes[i];
+        if kind == b'[' {
+            // Read the bracketed attribute selector up to the matching `]`.
+            let close = compound[i..].find(']')? + i;
+            let inner = &compound[i + 1..close];
+            simples.push(Simple::Attr(parse_attr_selector(inner)?));
+            i = close + 1;
+            continue;
+        }
         i += 1;
         let name_start = i;
-        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' && bytes[i] != b'[' {
             i += 1;
         }
         let name = &compound[name_start..i];
@@ -448,6 +728,59 @@ fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
     Some(simples)
 }
 
+/// Parse the inside of an attribute selector (the text between `[` and `]`): `name`, `name="v"`,
+/// `name^="v"`, `name$="v"`, or `name*="v"`. The value's surrounding quotes (single or double) are
+/// optional and stripped. Returns `None` on a malformed name or operator.
+fn parse_attr_selector(inner: &str) -> Option<AttrSelector> {
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    // Find the operator (`=`, `^=`, `$=`, `*=`) if any.
+    if let Some(eq) = inner.find('=') {
+        let (name_part, op) = match inner.as_bytes().get(eq.wrapping_sub(1)) {
+            Some(b'^') => (&inner[..eq - 1], AttrMatch::Prefix),
+            Some(b'$') => (&inner[..eq - 1], AttrMatch::Suffix),
+            Some(b'*') => (&inner[..eq - 1], AttrMatch::Contains),
+            _ => (&inner[..eq], AttrMatch::Exact),
+        };
+        let name = name_part.trim();
+        if !is_ident(name) {
+            return None;
+        }
+        let value = strip_attr_quotes(inner[eq + 1..].trim());
+        Some(AttrSelector {
+            name: name.to_string(),
+            op,
+            value: value.to_string(),
+        })
+    } else {
+        // Bare `[name]`: presence test.
+        if !is_ident(inner) {
+            return None;
+        }
+        Some(AttrSelector {
+            name: inner.to_string(),
+            op: AttrMatch::Present,
+            value: String::new(),
+        })
+    }
+}
+
+/// Strip a matching pair of surrounding single or double quotes from an attribute value; an
+/// unquoted value passes through unchanged.
+fn strip_attr_quotes(v: &str) -> &str {
+    let bytes = v.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    }
+}
+
 /// A valid (lite) CSS identifier: non-empty, only `[A-Za-z0-9_-]`.
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
@@ -455,17 +788,86 @@ fn is_ident(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Whether a compound selector's simple parts all match `target` (an AND).
+/// Whether a **complex** selector matches `target`, by standard right-to-left CSS matching: the
+/// subject compound (`parts.last()`) must match the target's own identity, then walk leftward —
+/// for a [`Combinator::Descendant`] edge SOME ancestor (at any depth) must match the next compound
+/// (and matching continues from above that ancestor); for a [`Combinator::Child`] edge the
+/// IMMEDIATE parent must match. A single-compound selector matches iff its subject matches.
+fn complex_matches(parts: &[ComplexPart], target: &MatchTarget) -> bool {
+    let Some((subject, rest)) = parts.split_last() else {
+        return false;
+    };
+    if !compound_matches(&subject.simples, &target.own) {
+        return false;
+    }
+    // The combinator on each compound describes how it relates to the compound on its RIGHT; so
+    // walking the `rest` from rightmost to leftmost, the edge to consult for compound `rest[k]` is
+    // `rest[k].combinator` (its relation to compound k+1, which we just satisfied). We track a
+    // cursor into `target.ancestors` (0 = parent) marking how far up the chain we've consumed.
+    let ancestors = target.ancestors;
+    let mut cursor = 0usize; // index of the next ancestor to consider (0 = immediate parent)
+    for part in rest.iter().rev() {
+        match part.combinator {
+            Combinator::Child => {
+                // The immediate parent (relative to the cursor) must match this compound.
+                let Some(parent) = ancestors.get(cursor) else {
+                    return false;
+                };
+                if !compound_matches(&part.simples, parent) {
+                    return false;
+                }
+                cursor += 1;
+            }
+            Combinator::Descendant => {
+                // Some ancestor at or above the cursor must match; continue from above it.
+                let mut found = None;
+                for (offset, anc) in ancestors[cursor..].iter().enumerate() {
+                    if compound_matches(&part.simples, anc) {
+                        found = Some(cursor + offset + 1);
+                        break;
+                    }
+                }
+                match found {
+                    Some(next) => cursor = next,
+                    None => return false,
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Whether a single compound selector's simple parts all match `identity` (an AND).
 ///
 /// Type names are matched ASCII case-insensitively (`BUTTON` matches `<button>`), per HTML's
-/// case-insensitive tag names. Classes and ids stay case-**sensitive**, per CSS.
-fn selector_matches(simples: &[Simple], target: &MatchTarget) -> bool {
+/// case-insensitive tag names. Classes, ids, and attribute names/values stay case-**sensitive**,
+/// per CSS.
+fn compound_matches(simples: &[Simple], identity: &ElementIdentity) -> bool {
     simples.iter().all(|simple| match simple {
-        Simple::Type(t) => target
+        Simple::Type(t) => identity
             .type_name
             .is_some_and(|name| name.eq_ignore_ascii_case(t)),
-        Simple::Id(id) => target.id == Some(id.as_str()),
-        Simple::Class(c) => target.classes.contains(&c.as_str()),
+        Simple::Id(id) => identity.id == Some(id.as_str()),
+        Simple::Class(c) => identity.classes.contains(&c.as_str()),
+        Simple::Attr(attr) => attr_matches(attr, identity.attrs),
+    })
+}
+
+/// Whether `attr` matches some `(name, value)` pair in `attrs` per its [`AttrMatch`] test. The
+/// name must match exactly (case-sensitive); the value test is presence / exact / prefix / suffix
+/// / contains. An empty substring value (`[x*=""]`) never matches (mirrors CSS).
+fn attr_matches(attr: &AttrSelector, attrs: &[(&str, &str)]) -> bool {
+    attrs.iter().any(|(name, value)| {
+        if *name != attr.name {
+            return false;
+        }
+        match attr.op {
+            AttrMatch::Present => true,
+            AttrMatch::Exact => *value == attr.value,
+            AttrMatch::Prefix => !attr.value.is_empty() && value.starts_with(&attr.value),
+            AttrMatch::Suffix => !attr.value.is_empty() && value.ends_with(&attr.value),
+            AttrMatch::Contains => !attr.value.is_empty() && value.contains(&attr.value),
+        }
     })
 }
 
@@ -1697,11 +2099,7 @@ mod tests {
     fn type_and_id_selectors_match() {
         let sheet =
             parse("button { background:#111111 } #go { color:#222222 } .btn { padding:4px }");
-        let hit = MatchTarget {
-            type_name: Some("button"),
-            id: Some("go"),
-            classes: &["btn"],
-        };
+        let hit = MatchTarget::new(Some("button"), Some("go"), &["btn"]);
         let r = sheet.resolve_for(&hit, false);
         assert!(
             r.contains(&(BG, "#111111".to_string())),
@@ -1715,11 +2113,7 @@ mod tests {
             r.contains(&(PADDING, "4".to_string())),
             "class selector matched"
         );
-        let miss = MatchTarget {
-            type_name: Some("div"),
-            id: None,
-            classes: &[],
-        };
+        let miss = MatchTarget::new(Some("div"), None, &[]);
         assert!(
             sheet.resolve_for(&miss, false).is_empty(),
             "no selector matches a bare div"
@@ -1729,29 +2123,17 @@ mod tests {
     #[test]
     fn compound_selector_requires_all_parts() {
         let sheet = parse("button.primary { background:#abcdef }");
-        let both = MatchTarget {
-            type_name: Some("button"),
-            id: None,
-            classes: &["primary"],
-        };
+        let both = MatchTarget::new(Some("button"), None, &["primary"]);
         assert_eq!(
             sheet.resolve_for(&both, false),
             vec![(BG, "#abcdef".to_string())]
         );
-        let only_type = MatchTarget {
-            type_name: Some("button"),
-            id: None,
-            classes: &[],
-        };
+        let only_type = MatchTarget::new(Some("button"), None, &[]);
         assert!(
             sheet.resolve_for(&only_type, false).is_empty(),
             "missing the .primary class"
         );
-        let only_class = MatchTarget {
-            type_name: Some("div"),
-            id: None,
-            classes: &["primary"],
-        };
+        let only_class = MatchTarget::new(Some("div"), None, &["primary"]);
         assert!(
             sheet.resolve_for(&only_class, false).is_empty(),
             "wrong type"
@@ -1765,11 +2147,7 @@ mod tests {
         let sheet = parse(
             "#x { background:#111111 } .c { background:#222222 } button { background:#333333 }",
         );
-        let hit = MatchTarget {
-            type_name: Some("button"),
-            id: Some("x"),
-            classes: &["c"],
-        };
+        let hit = MatchTarget::new(Some("button"), Some("x"), &["c"]);
         assert_eq!(
             sheet.resolve_for(&hit, false),
             vec![(BG, "#111111".to_string())]
@@ -1780,21 +2158,9 @@ mod tests {
     fn selector_grouping_shares_declarations() {
         let sheet = parse(".a, .b, button { color:#445566 }");
         let targets = [
-            MatchTarget {
-                type_name: None,
-                id: None,
-                classes: &["a"],
-            },
-            MatchTarget {
-                type_name: None,
-                id: None,
-                classes: &["b"],
-            },
-            MatchTarget {
-                type_name: Some("button"),
-                id: None,
-                classes: &[],
-            },
+            MatchTarget::new(None, None, &["a"]),
+            MatchTarget::new(None, None, &["b"]),
+            MatchTarget::new(Some("button"), None, &[]),
         ];
         for target in &targets {
             assert_eq!(
@@ -1802,6 +2168,208 @@ mod tests {
                 vec![(FG, "#445566".to_string())]
             );
         }
+    }
+
+    // --- Wave 3a: descendant/child combinators + attribute selectors -------
+
+    #[test]
+    fn descendant_combinator_matches_a_title_inside_a_card_not_outside() {
+        // `.card .title` styles a `.title` nested anywhere under a `.card`, but not a `.title`
+        // with no `.card` ancestor.
+        let sheet = parse(".card .title { color:#abcdef }");
+        // A `.title` whose parent is a `.card`.
+        let card = ElementIdentity::new(None, None, &["card"]);
+        let wrapper = ElementIdentity::new(None, None, &["wrapper"]);
+        let parent_card = [card];
+        let inside = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent_card);
+        assert_eq!(
+            sheet.resolve_for(&inside, false),
+            vec![(FG, "#abcdef".to_string())]
+        );
+        // A `.title` nested deeper (grandparent is the `.card`) still matches (any depth).
+        let deep_chain = [wrapper, card];
+        let deep = MatchTarget::new(None, None, &["title"]).with_ancestors(&deep_chain);
+        assert_eq!(
+            sheet.resolve_for(&deep, false),
+            vec![(FG, "#abcdef".to_string())]
+        );
+        // A `.title` with no `.card` ancestor does NOT match.
+        let no_card = [wrapper];
+        let outside = MatchTarget::new(None, None, &["title"]).with_ancestors(&no_card);
+        assert!(sheet.resolve_for(&outside, false).is_empty());
+        // A `.title` with NO ancestors does not match either.
+        let bare = MatchTarget::new(None, None, &["title"]);
+        assert!(sheet.resolve_for(&bare, false).is_empty());
+    }
+
+    #[test]
+    fn child_combinator_matches_only_direct_children() {
+        // `nav > .item` matches only a `.item` whose IMMEDIATE parent is `nav`.
+        let sheet = parse("nav > .item { background:#222222 }");
+        let nav = ElementIdentity::new(Some("nav"), None, &[]);
+        let list = ElementIdentity::new(None, None, &["list"]);
+        // Direct child of nav: matches.
+        let parent_nav = [nav];
+        let direct = MatchTarget::new(None, None, &["item"]).with_ancestors(&parent_nav);
+        assert_eq!(
+            sheet.resolve_for(&direct, false),
+            vec![(BG, "#222222".to_string())]
+        );
+        // A `.item` whose immediate parent is a `.list` (nav is the grandparent): NO match.
+        let list_then_nav = [list, nav];
+        let grandchild = MatchTarget::new(None, None, &["item"]).with_ancestors(&list_then_nav);
+        assert!(
+            sheet.resolve_for(&grandchild, false).is_empty(),
+            "child combinator requires the immediate parent"
+        );
+    }
+
+    #[test]
+    fn child_then_descendant_chain_matches_mixed_combinators() {
+        // `#root > .card .title`: subject `.title` has SOME `.card` ancestor, and that `.card`
+        // is a DIRECT child of `#root`.
+        let sheet = parse("#root > .card .title { color:#0a0b0c }");
+        let root = ElementIdentity::new(None, Some("root"), &[]);
+        let card = ElementIdentity::new(None, None, &["card"]);
+        let inner = ElementIdentity::new(None, None, &["inner"]);
+        let wrap = ElementIdentity::new(None, None, &["wrap"]);
+        // title <- inner <- card <- root: card is a direct child of root, title descends from card.
+        let chain = [inner, card, root];
+        let hit = MatchTarget::new(None, None, &["title"]).with_ancestors(&chain);
+        assert_eq!(
+            sheet.resolve_for(&hit, false),
+            vec![(FG, "#0a0b0c".to_string())]
+        );
+        // If `.card` is NOT a direct child of root (a wrapper sits between), the `>` edge fails.
+        let chain_with_wrap = [inner, card, wrap, root];
+        let miss = MatchTarget::new(None, None, &["title"]).with_ancestors(&chain_with_wrap);
+        assert!(sheet.resolve_for(&miss, false).is_empty());
+    }
+
+    #[test]
+    fn combinator_specificity_sums_all_compounds() {
+        // `.card .title` (two classes -> spec (0,2,0)) must beat a single `.title` (0,1,0) even
+        // though the single-class rule appears later in source order.
+        let sheet = parse(".title { color:#111111 } .card .title { color:#222222 }");
+        let card = ElementIdentity::new(None, None, &["card"]);
+        let parent_card = [card];
+        let target = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent_card);
+        assert_eq!(
+            sheet.resolve_for(&target, false),
+            vec![(FG, "#222222".to_string())],
+            "the 2-compound rule outranks the 1-compound rule by specificity"
+        );
+        // And `nav > .item.lead` (type + 2 classes -> (0,2,1)) outscores `.item` (0,1,0).
+        let sheet2 = parse(".item { color:#111111 } nav > .item.lead { color:#333333 }");
+        let nav = ElementIdentity::new(Some("nav"), None, &[]);
+        let parent_nav = [nav];
+        let item = MatchTarget::new(None, None, &["item", "lead"]).with_ancestors(&parent_nav);
+        assert_eq!(
+            sheet2.resolve_for(&item, false),
+            vec![(FG, "#333333".to_string())]
+        );
+    }
+
+    #[test]
+    fn attribute_present_selector_matches_when_attr_exists() {
+        let sheet = parse("[data-role] { background:#010203 }");
+        let role_attr = [("data-role", "nav")];
+        let with = MatchTarget::new(Some("div"), None, &[]).with_attrs(&role_attr);
+        assert_eq!(
+            sheet.resolve_for(&with, false),
+            vec![(BG, "#010203".to_string())]
+        );
+        let other_attr = [("other", "x")];
+        let without = MatchTarget::new(Some("div"), None, &[]).with_attrs(&other_attr);
+        assert!(sheet.resolve_for(&without, false).is_empty());
+        // No attribute context at all: the attribute selector cannot match.
+        let none = MatchTarget::new(Some("div"), None, &[]);
+        assert!(sheet.resolve_for(&none, false).is_empty());
+    }
+
+    #[test]
+    fn attribute_exact_selector_matches_value() {
+        let sheet = parse("[data-role=\"nav\"] { color:#445566 }");
+        let nav_attr = [("data-role", "nav")];
+        let hit = MatchTarget::new(None, None, &[]).with_attrs(&nav_attr);
+        assert_eq!(
+            sheet.resolve_for(&hit, false),
+            vec![(FG, "#445566".to_string())]
+        );
+        // A different value does not match exact.
+        let main_attr = [("data-role", "main")];
+        let miss = MatchTarget::new(None, None, &[]).with_attrs(&main_attr);
+        assert!(sheet.resolve_for(&miss, false).is_empty());
+    }
+
+    #[test]
+    fn attribute_prefix_suffix_contains_operators_match_substrings() {
+        let sheet = parse(
+            "a[href^=\"https\"] { color:#111111 } \
+             a[href$=\".pdf\"] { color:#222222 } \
+             a[href*=\"docs\"] { color:#333333 }",
+        );
+        // prefix: starts with https
+        let all_attr = [("href", "https://example.com/docs/x.pdf")];
+        let pre = MatchTarget::new(Some("a"), None, &[]).with_attrs(&all_attr);
+        let r = sheet.resolve_for(&pre, false);
+        // All three match this url (starts with https, ends with .pdf, contains docs); the last in
+        // source order wins on equal specificity (each is type+attr = (0,1,1)).
+        assert_eq!(r, vec![(FG, "#333333".to_string())]);
+
+        // A url matching only the prefix rule.
+        let pre_attr = [("href", "https://example.com/page")];
+        let only_pre = MatchTarget::new(Some("a"), None, &[]).with_attrs(&pre_attr);
+        assert_eq!(
+            sheet.resolve_for(&only_pre, false),
+            vec![(FG, "#111111".to_string())]
+        );
+        // A url matching only the suffix rule.
+        let suf_attr = [("href", "ftp://host/file.pdf")];
+        let only_suf = MatchTarget::new(Some("a"), None, &[]).with_attrs(&suf_attr);
+        assert_eq!(
+            sheet.resolve_for(&only_suf, false),
+            vec![(FG, "#222222".to_string())]
+        );
+    }
+
+    #[test]
+    fn attribute_selector_adds_class_level_specificity() {
+        // An attribute simple counts at the class level (10): `[data-x="1"]` (0,1,0) beats a bare
+        // type rule (0,0,1) regardless of source order.
+        let sheet = parse("div { color:#111111 } [data-x=\"1\"] { color:#222222 }");
+        let data_x = [("data-x", "1")];
+        let target = MatchTarget::new(Some("div"), None, &[]).with_attrs(&data_x);
+        assert_eq!(
+            sheet.resolve_for(&target, false),
+            vec![(FG, "#222222".to_string())]
+        );
+    }
+
+    #[test]
+    fn plain_class_and_type_sheet_is_unaffected_by_the_new_engine() {
+        // A sheet with NO combinators/attribute selectors, resolved against a target with empty
+        // ancestors/attrs, must behave exactly as before this wave.
+        let sheet = parse(".a { color:#445566 } button { background:#111111 } #x { padding:4px }");
+        // Class only.
+        assert_eq!(
+            sheet.resolve_for(&MatchTarget::new(None, None, &["a"]), false),
+            vec![(FG, "#445566".to_string())]
+        );
+        // Type only.
+        assert_eq!(
+            sheet.resolve_for(&MatchTarget::new(Some("button"), None, &[]), false),
+            vec![(BG, "#111111".to_string())]
+        );
+        // Id only.
+        assert_eq!(
+            sheet.resolve_for(&MatchTarget::new(None, Some("x"), &[]), false),
+            vec![(PADDING, "4".to_string())]
+        );
+        // A non-matching target stays empty.
+        assert!(sheet
+            .resolve_for(&MatchTarget::new(Some("div"), None, &["nope"]), false)
+            .is_empty());
     }
 
     #[test]
@@ -2060,13 +2628,13 @@ mod tests {
         css.push(' ');
         css.push_str(one_id);
         let sheet = parse(&css);
-        let target = MatchTarget {
-            type_name: None,
-            id: Some("x"),
-            classes: &[
+        let target = MatchTarget::new(
+            None,
+            Some("x"),
+            &[
                 "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
             ],
-        };
+        );
         // The id rule wins despite appearing later and having far fewer simple selectors.
         assert_eq!(
             sheet.resolve_for(&target, false),
@@ -2078,11 +2646,7 @@ mod tests {
     fn type_name_match_is_ascii_case_insensitive() {
         // A `BUTTON` selector matches a `<button>` element (HTML tag names are case-insensitive).
         let sheet = parse("BUTTON { background:#abcdef }");
-        let target = MatchTarget {
-            type_name: Some("button"),
-            id: None,
-            classes: &[],
-        };
+        let target = MatchTarget::new(Some("button"), None, &[]);
         assert_eq!(
             sheet.resolve_for(&target, false),
             vec![(BG, "#abcdef".to_string())]
@@ -2093,11 +2657,7 @@ mod tests {
     fn class_match_stays_case_sensitive() {
         // Classes remain case-sensitive per CSS: `.Btn` does not match the `btn` class.
         let sheet = parse(".Btn { background:#abcdef }");
-        let target = MatchTarget {
-            type_name: None,
-            id: None,
-            classes: &["btn"],
-        };
+        let target = MatchTarget::new(None, None, &["btn"]);
         assert!(sheet.resolve_for(&target, false).is_empty());
     }
 

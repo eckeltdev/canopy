@@ -343,9 +343,17 @@ impl Ui {
 
     /// Resolve `classes` (with the node's recorded identity) at the given `hovered` state
     /// through the lite [`Stylesheet`] and replay the resulting inline-style ops onto
-    /// `node`. The identity (type-name + id) is what makes type/id/compound selectors take
-    /// effect on the in-process tier; for a purely class-based sheet it folds back to the
-    /// legacy class-only result (type/id are simply unmatched).
+    /// `node`. The identity (type-name + id, and the id exposed as an `[id]` attribute) is what
+    /// makes type/id/compound and `[id…]` attribute selectors take effect on the in-process tier;
+    /// for a purely class-based sheet it folds back to the legacy class-only result.
+    ///
+    /// **Known limitation:** `Ui` records each node's own identity but not the parent/child tree
+    /// relationship (it forwards `mount` straight to the emitter and never retains the edges), so
+    /// `apply_node` has **no ancestor context** and passes an empty ancestor chain. Descendant
+    /// (` `) and child (`>`) combinators therefore do not yet take effect in the in-process Rust DX
+    /// path; they DO work in the freestanding/C-ABI host path (`canopy-abi`), which walks the full
+    /// retained tree. Wiring `Ui` to retain the tree so these combinators resolve author-side is a
+    /// follow-up. Attribute selectors are limited to `[id…]` (the only recorded attribute).
     fn apply_node(&self, node: NodeId, classes: &[&str], hovered: bool) {
         let ident = self
             .identity
@@ -355,11 +363,9 @@ impl Ui {
             .unwrap_or_default();
         let type_name = ident.type_name();
         let id = ident.id.as_deref();
-        let target = canopy_style_css::MatchTarget {
-            type_name,
-            id,
-            classes,
-        };
+        // Expose the recorded id under its CSS attribute name so `[id="x"]` / `[id^="…"]` match.
+        let attrs: Vec<(&str, &str)> = id.map(|v| ("id", v)).into_iter().collect();
+        let target = canopy_style_css::MatchTarget::new(type_name, id, classes).with_attrs(&attrs);
         for (prop, value) in self.css.borrow().resolve_for(&target, hovered) {
             self.app.style(node, prop, &value);
         }
@@ -771,6 +777,53 @@ mod tests {
         );
         // The button also still gets the bare `button {}` rule (cascade across selectors).
         assert_eq!(dom.style(primary, BG), Some("#111111"));
+    }
+
+    #[test]
+    fn lite_id_attribute_selector_styles_in_process() {
+        // The recorded id is exposed under its CSS attribute name `id`, so an `[id="…"]` attribute
+        // selector (distinct from the `#submit` id selector) styles the in-process node too.
+        const SHEET: &str =
+            "[id=\"submit\"] { background: #abcdef } [id^=\"sub\"] { color: #102030 }";
+        let ui = Ui::with_css(SHEET);
+        let btn = ui.button("ok");
+        ui.set_id(btn, "submit");
+        ui.class(btn, &[]);
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#abcdef"),
+            "[id=\"submit\"] exact attribute selector matches the recorded id"
+        );
+        assert_eq!(
+            dom.style(btn, FG),
+            Some("#102030"),
+            "[id^=\"sub\"] prefix attribute selector matches the recorded id"
+        );
+    }
+
+    #[test]
+    fn lite_descendant_combinator_is_a_documented_in_process_limitation() {
+        // KNOWN LIMITATION: `Ui` records each node's own identity but not the parent/child tree,
+        // so `apply_node` passes NO ancestor context. A descendant selector therefore does NOT
+        // style the in-process tree (it DOES work on the freestanding/C-ABI host path, which walks
+        // the full retained tree). This test pins that documented behavior; flip it when `Ui` is
+        // wired to retain the tree.
+        const SHEET: &str = ".card .title { background: #abcdef }";
+        let ui = Ui::with_css(SHEET);
+        let card = ui.column();
+        ui.class(card, &["card"]);
+        ui.mount_root(card);
+        let title = ui.column();
+        ui.class(title, &["title"]);
+        ui.mount(card, title);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(title, BG),
+            None,
+            "descendant combinators are not yet resolved author-side (no ancestor context in Ui)"
+        );
     }
 
     #[test]

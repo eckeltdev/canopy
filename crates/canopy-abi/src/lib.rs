@@ -71,7 +71,7 @@ use std::collections::BTreeMap;
 use canopy_dom::{Dom, ROOT};
 use canopy_protocol::{AttrId, EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
-use canopy_style_css::{MatchTarget, Stylesheet};
+use canopy_style_css::{ElementIdentity, MatchTarget, Stylesheet};
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
@@ -184,6 +184,7 @@ impl CanopyHost {
                 &hover_path,
                 child,
                 &BTreeMap::new(),
+                &[],
                 &mut overlay,
             );
         }
@@ -396,7 +397,9 @@ fn element_type_name(node: &canopy_dom::Node) -> Option<&str> {
 }
 
 /// Walk `node`'s subtree top-down (parent before children), folding the lite cascade into
-/// `overlay` and threading inherited properties down through `inherited`.
+/// `overlay`, threading inherited properties down through `inherited`, and threading the
+/// **ancestor stack** (`ancestors`, root-first) down so descendant/child combinators and the
+/// node's attribute pairs join its [`MatchTarget`].
 ///
 /// For each node, in CSS source order of weakening strength:
 /// 1. compute its **own resolved styles** = its author-inline styles ([`canopy_dom::Node::styles`])
@@ -417,6 +420,7 @@ fn collect_cascade(
     hover_path: &[NodeId],
     node: NodeId,
     inherited: &BTreeMap<PropId, String>,
+    ancestors: &[NodeIdentity<'_>],
     overlay: &mut Vec<(NodeId, PropId, String)>,
 ) {
     let Some(n) = dom.node(node) else { return };
@@ -424,18 +428,26 @@ fn collect_cascade(
     // (1) The node's own resolved styles: author inline first, then matched-rule decls it didn't
     // set itself. Keyed by PropId so a child can look up "did I resolve this myself?" in step (2).
     let mut own: BTreeMap<PropId, String> = n.styles.clone();
-    // Match the full lite selector model (type / id / class / compound, with specificity) against
-    // this node's identity. Skip bare text nodes: they aren't elements, so only an element-ish node
-    // (a tag, a declared name, classes, or an id) participates in matching.
-    let id = n.attrs.get(&AttrId::ID).map(String::as_str);
-    let type_name = element_type_name(n);
-    if type_name.is_some() || id.is_some() || !n.classes.is_empty() {
-        let classes: Vec<&str> = n.classes.iter().map(String::as_str).collect();
-        let target = MatchTarget {
-            type_name,
-            id,
-            classes: &classes,
-        };
+    // This node's identity (type / id / class / attrs), borrowing strings from the cloned Dom that
+    // lives for the whole walk. Built up-front so it can both drive this node's match AND be pushed
+    // onto the ancestor stack handed to the children.
+    let identity = NodeIdentity::from_node(n);
+    // Match the full lite selector model (type / id / class / compound / attr / combinators, with
+    // specificity) against this node's identity and its ancestor chain. Skip bare text nodes: they
+    // aren't elements, so only an element-ish node (a tag, a declared name, classes, an id, or any
+    // attr) participates in matching.
+    if identity.type_name.is_some()
+        || identity.id.is_some()
+        || !identity.classes.is_empty()
+        || !identity.attrs.is_empty()
+    {
+        // The matcher wants ancestors nearest-first (index 0 = parent); our `ancestors` stack is
+        // root-first, so reverse it into borrowed `ElementIdentity`s for this resolve call.
+        let chain: Vec<ElementIdentity> = ancestors.iter().rev().map(|a| a.as_element()).collect();
+        let target = identity
+            .as_match_target()
+            .with_attrs(&identity.attrs)
+            .with_ancestors(&chain);
         for (prop, value) in sheet.resolve_for(&target, hover_path.contains(&node)) {
             // Author inline styles win over class rules (CSS specificity: inline beats a class
             // selector), so only fold in a property the node didn't set itself. The matched-rule
@@ -466,9 +478,81 @@ fn collect_cascade(
         }
     }
 
-    // (4) Recurse, processing each child after this parent (top-down order).
+    // (4) Recurse, processing each child after this parent (top-down order). Extend the ancestor
+    // stack (root-first) with THIS node's identity, so each child sees its full chain. A bare text
+    // node carries no identity worth matching, but pushing it keeps the chain structurally complete
+    // (it simply never matches a compound).
+    let mut child_ancestors: Vec<NodeIdentity> = ancestors.to_vec();
+    child_ancestors.push(identity);
     for &child in &n.children {
-        collect_cascade(dom, sheet, hover_path, child, &child_inherited, overlay);
+        collect_cascade(
+            dom,
+            sheet,
+            hover_path,
+            child,
+            &child_inherited,
+            &child_ancestors,
+            overlay,
+        );
+    }
+}
+
+/// One node's borrowed identity for selector matching, owning the small `Vec`s that back the
+/// `&[&str]` / `&[(&str, &str)]` slices [`ElementIdentity`] needs. Strings are borrowed from the
+/// cloned `Dom`, which outlives the whole cascade walk, so an instance can sit on the ancestor
+/// stack and be re-borrowed for each descendant's `resolve_for`.
+struct NodeIdentity<'a> {
+    type_name: Option<&'a str>,
+    id: Option<&'a str>,
+    classes: Vec<&'a str>,
+    /// The CSS attribute `(name, value)` pairs. Only the well-known **id** attribute has a known
+    /// CSS name (`"id"`) — there is no attr-name registry for host-minted numeric attr ids yet, so
+    /// other attributes are not exposed to attribute selectors (a documented limitation).
+    attrs: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> NodeIdentity<'a> {
+    /// Derive a node's identity from its retained [`canopy_dom::Node`].
+    fn from_node(n: &'a canopy_dom::Node) -> Self {
+        let id = n.attrs.get(&AttrId::ID).map(String::as_str);
+        // Expose the id attribute under its CSS name so `[id="x"]` / `[id^="…"]` selectors work.
+        // Other attrs have no CSS-name mapping (no registry), so they are intentionally omitted.
+        let attrs: Vec<(&str, &str)> = id.map(|v| ("id", v)).into_iter().collect();
+        Self {
+            type_name: element_type_name(n),
+            id,
+            classes: n.classes.iter().map(String::as_str).collect(),
+            attrs,
+        }
+    }
+
+    /// A [`MatchTarget`] for this node's own identity (type/id/classes), without attrs/ancestors —
+    /// the caller layers those on with the builder methods.
+    fn as_match_target(&self) -> MatchTarget<'_> {
+        MatchTarget::new(self.type_name, self.id, &self.classes)
+    }
+
+    /// Borrow this identity as an [`ElementIdentity`] (for an ancestor in another node's chain).
+    fn as_element(&self) -> ElementIdentity<'_> {
+        ElementIdentity {
+            type_name: self.type_name,
+            id: self.id,
+            classes: &self.classes,
+            attrs: &self.attrs,
+        }
+    }
+}
+
+// `NodeIdentity` is cloneable so the ancestor stack can be extended per child (the inner `&str`s
+// are cheap `Copy` borrows into the long-lived cloned Dom).
+impl Clone for NodeIdentity<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            type_name: self.type_name,
+            id: self.id,
+            classes: self.classes.clone(),
+            attrs: self.attrs.clone(),
+        }
     }
 }
 
@@ -1318,6 +1402,130 @@ mod tests {
         );
         // The div is NOT a button, so it never picked up the button rule.
         assert_eq!(prop(&styled, div, BG), Some("#000080"), "div bg unchanged");
+    }
+
+    #[test]
+    fn descendant_selector_styles_a_nested_node_not_a_sibling_at_the_wrong_depth() {
+        use canopy_paint::BG;
+        // Tree:
+        //   div.card                       (the card)
+        //     div.inner                     (a wrapper)
+        //       button.title  <- matches `.card .title`
+        //   button.title      <- sibling of the card at ROOT depth: NO `.card` ancestor
+        // `.card .title` must style the nested `.title` (any depth under a `.card`) but NOT the
+        // outside `.title`, proving the ancestor chain is threaded into `resolve_for`.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1)); // div
+        e.append(ROOT, card);
+        e.set_class(card, "card");
+        let inner = e.create_element(ElementTag::new(1)); // div
+        e.append(card, inner);
+        e.set_class(inner, "inner");
+        let nested_title = e.create_element(ElementTag::new(3)); // button
+        e.append(inner, nested_title);
+        e.set_class(nested_title, "title");
+        // A `.title` OUTSIDE any `.card`, at ROOT depth.
+        let outside_title = e.create_element(ElementTag::new(3)); // button
+        e.append(ROOT, outside_title);
+        e.set_class(outside_title, "title");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".card .title { background: #abcdef }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        fn prop(dom: &Dom, node: NodeId, p: PropId) -> Option<&str> {
+            dom.node(node)
+                .and_then(|n| n.styles.get(&p))
+                .map(String::as_str)
+        }
+        assert_eq!(
+            prop(&styled, nested_title, BG),
+            Some("#abcdef"),
+            "the .title nested under a .card is styled by the descendant selector"
+        );
+        assert_eq!(
+            prop(&styled, outside_title, BG),
+            None,
+            "the .title with no .card ancestor is NOT styled"
+        );
+    }
+
+    #[test]
+    fn child_selector_requires_the_immediate_parent() {
+        use canopy_paint::BG;
+        // `div > .item` matches only a `.item` whose IMMEDIATE parent is a div. A `.item` whose
+        // immediate parent is a ROW element (CSS type "row", not "div") must NOT be styled — even
+        // though a div (the outer container) sits higher up the chain.
+        let mut e = Emitter::new();
+        let outer = e.create_element(ElementTag::new(1)); // div
+        e.append(ROOT, outer);
+        let direct = e.create_element(ElementTag::new(1)); // div.item, immediate child of the div
+        e.append(outer, direct);
+        e.set_class(direct, "item");
+        let row = e.create_element(ElementTag::new(2)); // row (CSS type name "row")
+        e.append(outer, row);
+        let deep = e.create_element(ElementTag::new(1)); // div.item, immediate parent is the row
+        e.append(row, deep);
+        e.set_class(deep, "item");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet("div > .item { background: #010203 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        fn prop(dom: &Dom, node: NodeId, p: PropId) -> Option<&str> {
+            dom.node(node)
+                .and_then(|n| n.styles.get(&p))
+                .map(String::as_str)
+        }
+        assert_eq!(
+            prop(&styled, direct, BG),
+            Some("#010203"),
+            "the .item that is a direct child of a div is styled"
+        );
+        assert_eq!(
+            prop(&styled, deep, BG),
+            None,
+            "the .item whose immediate parent is a row is NOT styled by `div > .item`"
+        );
+    }
+
+    #[test]
+    fn attribute_selector_styles_the_node_by_its_id_attr() {
+        use canopy_paint::BG;
+        // The id attribute is exposed under its CSS name `id`, so `[id="hero"]` (an attribute
+        // selector, distinct from the `#hero` id selector) styles exactly the node carrying it.
+        let mut e = Emitter::new();
+        let hero = e.create_element(ElementTag::new(1));
+        e.append(ROOT, hero);
+        e.set_attribute(hero, AttrId::ID, "hero");
+        let other = e.create_element(ElementTag::new(1));
+        e.append(ROOT, other);
+        e.set_attribute(other, AttrId::ID, "footer");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(
+            "[id=\"hero\"] { background: #111111 } [id^=\"foot\"] { background: #222222 }",
+        );
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        fn prop(dom: &Dom, node: NodeId, p: PropId) -> Option<&str> {
+            dom.node(node)
+                .and_then(|n| n.styles.get(&p))
+                .map(String::as_str)
+        }
+        assert_eq!(
+            prop(&styled, hero, BG),
+            Some("#111111"),
+            "[id=\"hero\"] exact attribute selector styles the hero node"
+        );
+        assert_eq!(
+            prop(&styled, other, BG),
+            Some("#222222"),
+            "[id^=\"foot\"] prefix attribute selector styles the footer node"
+        );
     }
 
     #[test]
