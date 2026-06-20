@@ -61,13 +61,26 @@ use canopy_dom::{Dom, ROOT};
 use canopy_layout_taffy::{hit_test, layout};
 use canopy_protocol::{ElementTag, EventPayload, HandlerId, NodeId, PropId};
 use canopy_signals::{Memo, Runtime, Signal};
-use canopy_style_css::{ElementStates, Stylesheet};
+use canopy_style_css::{resolve_value, ElementStates, ResolveCtx, Stylesheet};
 use canopy_traits::{Point, Size};
 use canopy_view::{App, CLICK};
 
 /// A class list as the macro and hand-written code supply it: `'static` so it can be
 /// retained in the styled registry and replayed on hover/reload without allocating.
 pub type Classes = &'static [&'static str];
+
+/// The default element/root font-size (px) the in-process lite resolver uses as the `em` / `rem`
+/// basis when a node sets no `font-size` — the CSS initial `medium`, 16px.
+const DEFAULT_FONT_PX: f32 = 16.0;
+
+/// The default viewport the in-process lite resolver uses for `vw` / `vh` at style time. Unlike the
+/// `canopy-abi` host, `Ui` holds no live viewport (the host passes one per call to
+/// [`Ui::click_handler`] / [`Ui::hover_target`], not when styles are resolved), so a sane fixed
+/// default — a common 1280×720 logical window — backs `vw`/`vh` author-side.
+const DEFAULT_VIEWPORT: Size = Size {
+    w: 1280.0,
+    h: 720.0,
+};
 
 /// The lite-tier element identity `Ui` records per styled node so it can resolve the
 /// **full** selector model (type / id / class / compound) author-side — the same triple
@@ -382,6 +395,18 @@ impl Ui {
     /// pseudo-classes (`:not`/`:is`/`:where`) over type/id/class/`[id…]` DO work in-process, since
     /// they only inspect the node's own identity. Attribute selectors are limited to `[id…]` (the
     /// only recorded attribute).
+    ///
+    /// **Wave 4b (var/calc/units) limitation:** the same missing-tree-edges gap means custom
+    /// properties (`--name`) are resolved only from the node's **own** matched rules — they do NOT
+    /// inherit from an ancestor here (custom-prop *inheritance* needs the parent context that only
+    /// the `canopy-abi` host path threads). A `var(--x)` referencing a property declared on the same
+    /// node (or with a fallback) resolves; one relying on a parent's `--x` does not (it falls back or
+    /// drops). Relative units resolve against the node's own resolved `font-size` (default 16px) and
+    /// the fixed 16px `rem` root; `vw`/`vh` resolve against a default [`DEFAULT_VIEWPORT`] (the
+    /// in-process `Ui` holds no live viewport — the host passes one per call to `click_handler` /
+    /// `hover_target`, not at style time). `calc()`/`min()`/`max()`/`clamp()` over absolute lengths
+    /// resolve fully; a `%` inside `calc` drops the declaration (deferred), and a bare `%` passes
+    /// through for Taffy.
     fn apply_node(&self, node: NodeId, classes: &[&str], states: ElementStates) {
         let ident = self
             .identity
@@ -399,8 +424,50 @@ impl Ui {
         // dynamic-state pseudos resolve against `states` (which the caller computes from the node's
         // current hover/focus/active membership).
         let target = canopy_style_css::MatchTarget::new(type_name, id, classes).with_attrs(&attrs);
-        for (prop, value) in self.css.borrow().resolve_for(&target, states) {
-            self.app.style(node, prop, &value);
+        let css = self.css.borrow();
+
+        // The node's OWN custom properties (no ancestor inheritance in-process — see the doc above),
+        // as `(name, raw-value)` for `var()` lookup.
+        let custom_owned = css.resolve_custom_for(&target, states);
+        let custom: Vec<(&str, &str)> = custom_owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let resolved = css.resolve_for(&target, states);
+        // Resolve the node's own font-size first (default 16px) so its `em` lengths resolve against
+        // it. No inheritance here: only an own/matched `font-size` counts.
+        let font_px = resolved
+            .iter()
+            .find(|(p, _)| *p == canopy_paint::FONT_SIZE)
+            .and_then(|(_, v)| {
+                resolve_value(
+                    v,
+                    &ResolveCtx {
+                        custom: &custom,
+                        font_px: DEFAULT_FONT_PX,
+                        root_px: DEFAULT_FONT_PX,
+                        vw_px: DEFAULT_VIEWPORT.w / 100.0,
+                        vh_px: DEFAULT_VIEWPORT.h / 100.0,
+                    },
+                )
+            })
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(DEFAULT_FONT_PX);
+
+        let ctx = ResolveCtx {
+            custom: &custom,
+            font_px,
+            root_px: DEFAULT_FONT_PX,
+            vw_px: DEFAULT_VIEWPORT.w / 100.0,
+            vh_px: DEFAULT_VIEWPORT.h / 100.0,
+        };
+        for (prop, value) in resolved {
+            // Resolve var()/units/calc; a declaration that drops (undefined var with no fallback, a
+            // `%` inside calc) is skipped, leaving the property unset (CSS drops an invalid value).
+            if let Some(final_value) = resolve_value(&value, &ctx) {
+                self.app.style(node, prop, &final_value);
+            }
         }
     }
 
@@ -1367,6 +1434,51 @@ mod tests {
         let dom = mount(&ui);
         let node = dom.node(btn).unwrap();
         assert!(node.listeners.iter().any(|(ev, _)| *ev == CLICK));
+    }
+
+    // --- Wave 4b: var() + relative units + calc() in-process -------------------------
+
+    #[test]
+    fn lite_var_and_rem_resolve_in_process() {
+        use canopy_paint::{FG, PADDING};
+        // `--accent` declared on the SAME node (no ancestor inheritance in-process), used by
+        // `var(--accent)`; a `2rem` length resolves to 32 against the fixed 16px root.
+        let ui = Ui::with_css(".box { --accent: #ff0000; color: var(--accent); padding: 2rem }");
+        let box_node = ui.column();
+        ui.class(box_node, &["box"]);
+        ui.mount_root(box_node);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(box_node, FG),
+            Some("#ff0000"),
+            "var(--accent) resolves from the node's own custom property"
+        );
+        assert_eq!(
+            dom.style(box_node, PADDING),
+            Some("32"),
+            "2rem resolves to 32 against the fixed 16px root in-process"
+        );
+    }
+
+    #[test]
+    fn lite_calc_and_var_fallback_resolve_in_process() {
+        use canopy_paint::{FG, WIDTH};
+        // `calc(8px + 4px)` -> 12; `var(--missing, #00ff00)` falls back when undefined.
+        let ui = Ui::with_css(".c { width: calc(8px + 4px); color: var(--missing, #00ff00) }");
+        let c = ui.column();
+        ui.class(c, &["c"]);
+        ui.mount_root(c);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(c, WIDTH),
+            Some("12"),
+            "calc(8px + 4px) resolves to 12 in-process"
+        );
+        assert_eq!(
+            dom.style(c, FG),
+            Some("#00ff00"),
+            "an undefined var falls back in-process"
+        );
     }
 
     /// Tiny no_std integer formatter for the test above (avoids pulling `format!`

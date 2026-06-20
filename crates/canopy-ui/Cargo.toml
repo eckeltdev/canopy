@@ -16,8 +16,9 @@ canopy-signals = { path = "../canopy-signals" }
 canopy-style-css = { path = "../canopy-style-css" }
 canopy-layout-taffy = { path = "../canopy-layout-taffy" }
 canopy-rsx = { path = "../canopy-rsx" }
-
-[dev-dependencies]
+# The `PropId` registry: `apply_node` needs `FONT_SIZE` to resolve the node's font-size first (so
+# `em` lengths resolve against it). Previously a dev-dependency only; promoted for the Wave 4b
+# var()/units/calc resolution.
 canopy-paint = { path = "../canopy-paint" }
 
 [lints]

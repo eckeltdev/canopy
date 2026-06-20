@@ -366,12 +366,21 @@ struct Selector {
     specificity: Spec,
 }
 
+/// A **custom-property** declaration: its full name (with the leading `--`, e.g. `"--accent"`) and
+/// its RAW, *un-normalized* value (custom properties hold arbitrary tokens — `var()`, lengths,
+/// colors, `calc()` — so their value is never folded through [`normalize_value`]). Resolved lazily
+/// by [`resolve_value`] when a normal declaration references it through `var(--name)`.
+type CustomDecl = (String, String);
+
 /// One parsed rule: a compound selector and the declarations it sets. Selector grouping
 /// (`.a, .b { … }`) expands at parse time to one `Rule` per selector, sharing the decls.
 struct Rule {
     selector: Selector,
     /// Declarations whose property name mapped to a known [`PropId`], in order.
     decls: Vec<Decl>,
+    /// **Custom-property** declarations (`--name: value`) on this rule, raw + un-normalized, in
+    /// source order. Gathered in cascade order by [`Stylesheet::resolve_custom_for`].
+    custom_decls: Vec<CustomDecl>,
 }
 
 /// One element's identity for selector matching: its type/tag name, id, classes, and
@@ -571,6 +580,40 @@ impl Stylesheet {
         resolved
     }
 
+    /// Resolve the **custom properties** (`--name`) matching an element, in cascade order, as
+    /// `(name, raw-value)` pairs. Mirrors [`resolve_for`](Self::resolve_for): every rule whose
+    /// compound selector matches `target` (its state pseudos satisfied by `states`) is collected,
+    /// ordered by `(specificity, source position)`, and its custom-prop decls folded **last-wins**
+    /// per name — so a higher-specificity (or, at equal specificity, later) rule overrides an
+    /// earlier `--name`, while names no matching rule touches are absent.
+    ///
+    /// The returned values are the **raw**, un-normalized tokens (a custom property may itself hold
+    /// `var()` / a relative unit / `calc()`); [`resolve_value`] substitutes and resolves them when a
+    /// normal declaration references one through `var(--name)`.
+    pub fn resolve_custom_for(
+        &self,
+        target: &MatchTarget,
+        states: ElementStates,
+    ) -> Vec<CustomDecl> {
+        let mut matched: Vec<(Spec, usize)> = Vec::new();
+        for (idx, rule) in self.rules.iter().enumerate() {
+            // Only rules that actually carry custom props are worth ordering.
+            if !rule.custom_decls.is_empty()
+                && complex_matches(&rule.selector.parts, target, states)
+            {
+                matched.push((rule.selector.specificity, idx));
+            }
+        }
+        matched.sort_unstable(); // ascending (specificity, idx): lowest precedence applied first
+        let mut resolved: Vec<CustomDecl> = Vec::new();
+        for (_, idx) in matched {
+            for (name, value) in &self.rules[idx].custom_decls {
+                cascade_custom(&mut resolved, name, value);
+            }
+        }
+        resolved
+    }
+
     /// The legacy class-only resolve: a [`resolve_for`](Self::resolve_for) with no type/id and a
     /// single `hover` flag, so it matches exactly the pure-class rules it always did. Kept for
     /// `canopy-ui` / `LiteEngine`; maps `hovered` onto `ElementStates { hover: hovered, .. }`.
@@ -660,6 +703,20 @@ fn cascade(resolved: &mut Vec<Decl>, prop: PropId, value: &str) {
     resolved.push((prop, value.to_string()));
 }
 
+/// Fold one custom-property declaration into the resolved set with last-wins semantics: overwrite
+/// the raw value if `name` is already present (preserving its original position), otherwise append
+/// it. The custom-property twin of [`cascade`], keyed by the property's `--name`.
+fn cascade_custom(resolved: &mut Vec<CustomDecl>, name: &str, value: &str) {
+    for entry in resolved.iter_mut() {
+        if entry.0 == name {
+            entry.1.clear();
+            entry.1.push_str(value);
+            return;
+        }
+    }
+    resolved.push((name.to_string(), value.to_string()));
+}
+
 /// Parse a CSS-lite stylesheet of class rules into a [`Stylesheet`].
 ///
 /// Whitespace and newlines are flexible; `/* … */` comments are stripped. Each rule
@@ -697,9 +754,9 @@ pub fn parse(css: &str) -> Stylesheet {
             i += 1; // consume `}`
         }
 
-        let decls = parse_block(body);
-        if decls.is_empty() {
-            continue; // a rule with no known declarations contributes nothing
+        let (decls, custom_decls) = parse_block(body);
+        if decls.is_empty() && custom_decls.is_empty() {
+            continue; // a rule with no known (normal or custom) declarations contributes nothing
         }
         // Selector grouping: `.a, button#b { … }` expands to one Rule per selector, sharing decls.
         // Split on TOP-LEVEL commas only, so a functional pseudo's own comma-separated argument
@@ -709,6 +766,7 @@ pub fn parse(css: &str) -> Stylesheet {
                 rules.push(Rule {
                     selector,
                     decls: decls.clone(),
+                    custom_decls: custom_decls.clone(),
                 });
             }
         }
@@ -1445,14 +1503,20 @@ fn strip_comments(css: &str) -> String {
 /// Parse a `prop: value; prop: value` block body into resolved declarations,
 /// skipping unknown properties and malformed `prop: value` pairs.
 ///
+/// Returns `(decls, custom_decls)`: the normal mapped+normalized [`Decl`]s, and the
+/// **custom-property** declarations (any name starting with `--`) kept as `(name, raw-value)` with
+/// the value **un-normalized** (custom properties hold arbitrary tokens — `var()`, lengths, colors,
+/// `calc()` — resolved later by [`resolve_value`], not at parse time).
+///
 /// Box shorthands (`margin`, `padding`, `inset`, `gap`, `border`, `flex`, `outline`) are
 /// **expanded at parse time** into their per-side / per-axis longhands (see
 /// [`expand_shorthand`]), each then normalized exactly as a directly written longhand would be.
 /// A trailing `!important` is stripped (its precedence is not yet honored) so it never drops the
 /// declaration, and the CSS-wide keywords `inherit`/`initial`/`unset` drop their single
 /// declaration cleanly (real semantics land in a later wave) rather than failing a value parse.
-fn parse_block(body: &str) -> Vec<Decl> {
+fn parse_block(body: &str) -> (Vec<Decl>, Vec<CustomDecl>) {
     let mut decls = Vec::new();
+    let mut custom_decls = Vec::new();
     for stmt in body.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -1462,6 +1526,14 @@ fn parse_block(body: &str) -> Vec<Decl> {
             continue;
         };
         let name = name.trim();
+        // A custom property (`--foo`): keep its full name and RAW value verbatim — no `!important`
+        // strip, no normalization, no shorthand expansion (custom props are arbitrary token lists,
+        // substituted into `var()` later). An empty value still registers the property (CSS allows
+        // an empty custom-property value), but a name that is just `--` is dropped.
+        if name.starts_with("--") && name.len() > 2 {
+            custom_decls.push((name.to_string(), value.trim().to_string()));
+            continue;
+        }
         // Strip a trailing `!important` (any casing) and re-trim, so `color: red !important`
         // resolves to red instead of dropping. Full precedence comes later.
         let value = strip_important(value.trim()).trim();
@@ -1475,7 +1547,7 @@ fn parse_block(body: &str) -> Vec<Decl> {
         }
         expand_shorthand(name, value, &mut decls);
     }
-    decls
+    (decls, custom_decls)
 }
 
 /// Strip a trailing `!important` (ASCII case-insensitive, optional whitespace before the `!`)
@@ -1513,8 +1585,11 @@ fn is_css_wide_keyword(value: &str) -> bool {
 /// known [`PropId`] is normalized through [`normalize_value`]; unknown names are silently skipped,
 /// mirroring the longhand path.
 fn expand_shorthand(name: &str, value: &str, decls: &mut Vec<Decl>) {
-    // Split the value into whitespace-separated tokens (shorthands are space-delimited).
-    let parts: Vec<&str> = value.split_ascii_whitespace().collect();
+    // Split the value into whitespace-separated tokens (shorthands are space-delimited), but treat a
+    // function value (`calc(8px + 4px)`, `var(--w, 1px)`, `min(1px, 2px)`) as ONE token: its inner
+    // whitespace/commas are part of the function, not a shorthand separator. Without this a
+    // `padding: calc(8px + 4px)` would mis-split into three "sides".
+    let parts: Vec<&str> = split_top_level_ws(value);
 
     match name {
         // `margin`/`padding`: single value keeps the uniform PropId (unchanged behavior); a
@@ -2181,6 +2256,39 @@ fn normalize_box_shadow(value: &str) -> Option<String> {
     Some(out)
 }
 
+/// Split `s` on runs of ASCII whitespace that are **not** nested inside parentheses, returning the
+/// non-empty tokens. A function value (`calc(8px + 4px)`, `var(--w, 1px)`) stays a single token —
+/// its inner spaces/commas belong to the function, not the surrounding shorthand. Plain
+/// space-separated shorthands (`8 16`, `2 solid red`) split exactly as `split_ascii_whitespace` did.
+fn split_top_level_ws(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let (mut depth, mut start) = (0i32, 0usize);
+    let mut have = false; // a token's bytes are accumulating from `start`
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && b.is_ascii_whitespace() => {
+                if have {
+                    out.push(&s[start..i]);
+                    have = false;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if !have {
+            start = i;
+            have = true;
+        }
+    }
+    if have {
+        out.push(&s[start..]);
+    }
+    out
+}
+
 /// Split `s` on commas that are **not** nested inside parentheses, returning each segment (untrimmed).
 /// Used to separate `linear-gradient` arguments without breaking a `rgb(r, g, b)` color stop apart.
 fn split_top_level_commas(s: &str) -> Vec<&str> {
@@ -2239,6 +2347,569 @@ fn push_int(out: &mut String, n: i32) {
     while mag > 0 {
         digits[len] = b'0' + (mag % 10) as u8;
         mag /= 10;
+        len += 1;
+    }
+    for &d in digits[..len].iter().rev() {
+        out.push(d as char);
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Wave 4b: custom properties + var() + relative units (rem/em/vw/vh) + calc/min/max/clamp.
+//
+// `resolve_value` is the pure resolver the host cascade (`canopy-abi`/`canopy-ui`) runs over each
+// declaration's value once it knows the element's context (the matched custom props, the element +
+// root font-size, and the viewport). It is a no-op for a value with no var/relative-unit/math
+// function, so every existing absolute value resolves to itself.
+//
+// DEFERRED (per the Wave 4b scope): `%` does not resolve here — a bare `%` length passes through
+// VERBATIM (Taffy resolves it natively against the layout box), and a `%` token appearing inside a
+// math function drops the whole declaration (`resolve_value` returns `None`), since we can't resolve
+// it without layout. The root font-size is a fixed 16px (no `:root`-tracked root); container/media
+// queries are out of scope.
+// ---------------------------------------------------------------------------------
+
+/// The element context [`resolve_value`] needs to resolve a declaration's value: the matched custom
+/// properties (for `var()`), the element + root font-size (for `em` / `rem`), and the viewport (for
+/// `vw` / `vh`). Built per node by the host cascade.
+pub struct ResolveCtx<'a> {
+    /// The element's effective custom properties as `(name, raw-value)` — the inherited map overlaid
+    /// with the node's own matched `--name` decls. Looked up by `var(--name)`; a name may itself hold
+    /// a `var()` (chained/nested vars are followed up to a small recursion bound).
+    pub custom: &'a [(&'a str, &'a str)],
+    /// The element's own font-size in px — the basis for `em`. The host resolves the node's
+    /// `font-size` first (so `em` works) and passes it here for the node's other properties.
+    pub font_px: f32,
+    /// The root element's font-size in px — the basis for `rem`. Fixed at 16 this wave (no
+    /// `:root`-tracked root font-size).
+    pub root_px: f32,
+    /// 1% of the viewport width in px — the basis for `vw` (so `10vw` is `10 * vw_px`).
+    pub vw_px: f32,
+    /// 1% of the viewport height in px — the basis for `vh`.
+    pub vh_px: f32,
+}
+
+/// The recursion/iteration bound on `var()` substitution: a `var()` whose value is itself a `var()`
+/// is followed up to this many times, then resolution gives up (returns `None`) — a guard against a
+/// cyclic `--a: var(--b); --b: var(--a)` definition.
+const VAR_DEPTH_LIMIT: u32 = 16;
+
+/// Resolve one declaration `value` against the element `ctx`: substitute every `var(--name[,
+/// fallback])`, resolve the relative units `rem`/`em`/`vw`/`vh` to a px number, and evaluate a
+/// `calc()` / `min()` / `max()` / `clamp()` math function — in that order. A bare `px` / number is
+/// unchanged, and a `%` is left **verbatim** (Taffy resolves it). Returns the final value string, or
+/// `None` to **drop the declaration** when a `var()` is undefined with no fallback, or a `%` appears
+/// inside a math function (can't resolve without layout — deferred).
+///
+/// A value with no `var()`, no relative unit, and no math function returns unchanged, so every
+/// existing absolute value resolves to itself (the back-compat contract).
+pub fn resolve_value(value: &str, ctx: &ResolveCtx) -> Option<String> {
+    // (a) var() substitution. Returns None if a var is undefined and has no fallback.
+    let substituted = substitute_vars(value.trim(), ctx, 0)?;
+    let trimmed = substituted.trim();
+    // (b)+(c) A single top-level math function (`calc(...)` / `min(...)` / `max(...)` / `clamp(...)`)
+    // is evaluated as a numeric expression (units resolved inside it); any other value has its
+    // relative-unit tokens resolved across whitespace.
+    if let Some((func, inner)) = parse_math_function(trimmed) {
+        let n = eval_math(func, inner, ctx)?;
+        return Some(format_number(n));
+    }
+    Some(resolve_units_in_tokens(trimmed, ctx))
+}
+
+/// Substitute every `var(--name[, fallback])` in `value` with the matched custom value (or the
+/// fallback when the name is undefined), recursively (a substituted value may itself hold a `var()`,
+/// followed up to [`VAR_DEPTH_LIMIT`]). Returns the substituted string, or `None` when a `var()` is
+/// undefined and carries no fallback (the declaration is dropped) or the recursion bound is hit.
+///
+/// A value with no `var(` substring returns unchanged (the fast, allocation-free common path is the
+/// caller's `find`).
+fn substitute_vars(value: &str, ctx: &ResolveCtx, depth: u32) -> Option<String> {
+    if depth > VAR_DEPTH_LIMIT {
+        return None; // a var cycle / pathological nesting: give up and drop the declaration
+    }
+    // Find the first top-level `var(`; if none, the value is already var-free.
+    let Some(start) = find_var(value) else {
+        return Some(value.into());
+    };
+    let mut out = String::with_capacity(value.len());
+    out.push_str(&value[..start]);
+    // Read the balanced `(...)` of this `var(`. `start + 3` indexes the `(`.
+    let (inner, after) = read_balanced_parens(value, start + 3)?;
+    // Split `--name[, fallback]` on the FIRST top-level comma: name before, fallback (verbatim,
+    // possibly itself containing commas/`var()`) after.
+    let (name, fallback) = split_var_args(inner);
+    let replacement = match lookup_custom(ctx.custom, name) {
+        Some(v) => v.to_string(),
+        None => match fallback {
+            Some(fb) => fb.to_string(),
+            None => return None, // undefined and no fallback -> drop the declaration
+        },
+    };
+    // The replacement may itself contain `var()` — resolve it before appending (nested/chained).
+    out.push_str(&substitute_vars(&replacement, ctx, depth + 1)?);
+    // Resolve any remaining `var()`s in the tail of the value.
+    out.push_str(&substitute_vars(&value[after..], ctx, depth + 1)?);
+    Some(out)
+}
+
+/// Find the byte index of the first top-level `var(` token in `value` (the `v` of `var(`), or
+/// `None`. "Token" = preceded by a non-identifier byte (or start), so a `xvar(` substring inside a
+/// larger ident is not matched.
+fn find_var(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if (bytes[i] | 0x20) == b'v'
+            && value[i..].len() >= 4
+            && value[i..i + 4].eq_ignore_ascii_case("var(")
+        {
+            let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            if prev_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `b` is an identifier byte (`[A-Za-z0-9_-]`) — used to ensure a `var(` / function name is a
+/// whole token, not the tail of a larger identifier.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// Split a `var(...)` argument into `(name, optional-fallback)` on the FIRST top-level comma. The
+/// name is trimmed; the fallback is the remainder verbatim (it may itself contain commas / `var()`).
+fn split_var_args(inner: &str) -> (&str, Option<&str>) {
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                return (inner[..i].trim(), Some(inner[i + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    (inner.trim(), None)
+}
+
+/// Look up a custom property's raw value by `--name` (exact, case-sensitive — custom-property names
+/// are case-sensitive in CSS). `None` if undefined.
+fn lookup_custom<'a>(custom: &'a [(&'a str, &'a str)], name: &str) -> Option<&'a str> {
+    custom.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
+/// Resolve the relative-unit tokens of a (non-math-function) value across whitespace: a `<num>rem`
+/// becomes `num * root_px`, `<num>em` -> `num * font_px`, `<num>vw` -> `num * vw_px`, `<num>vh` ->
+/// `num * vh_px`. A bare `<num>px` keeps its number (the existing length contract), a bare number /
+/// `%` / keyword is left untouched. Each resolved length is a plain number string (no `px` suffix).
+fn resolve_units_in_tokens(value: &str, ctx: &ResolveCtx) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut first = true;
+    for tok in value.split_ascii_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        match resolve_unit_token(tok, ctx) {
+            Some(px) => out.push_str(&format_number(px)),
+            None => out.push_str(tok),
+        }
+    }
+    out
+}
+
+/// Resolve a single length token (`2rem`, `1.5em`, `10vw`, `50vh`) to its px value via `ctx`, or
+/// `None` if the token is not a relative-unit length (a bare number, `px`, `%`, or a keyword — which
+/// the caller then keeps verbatim). `px` is intentionally NOT resolved here: the existing contract
+/// already carries a `px`-stripped bare number, and a raw `<n>px` here is left to the caller (it is
+/// a number-with-unit a downstream reader handles), matching pre-wave behavior.
+fn resolve_unit_token(tok: &str, ctx: &ResolveCtx) -> Option<f32> {
+    let lower = tok.to_ascii_lowercase();
+    let (unit_len, per_unit) = if lower.ends_with("rem") {
+        (3, ctx.root_px)
+    } else if lower.ends_with("em") {
+        (2, ctx.font_px)
+    } else if lower.ends_with("vw") {
+        (2, ctx.vw_px)
+    } else if lower.ends_with("vh") {
+        (2, ctx.vh_px)
+    } else {
+        return None;
+    };
+    let num = &tok[..tok.len() - unit_len];
+    let n: f32 = num.trim().parse().ok()?;
+    Some(n * per_unit)
+}
+
+/// Which math function a value is (the four CSS math functions this wave evaluates).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MathFunc {
+    /// `calc(expr)` — a single arithmetic expression.
+    Calc,
+    /// `min(a, b, …)` — the minimum of its comma-separated arguments.
+    Min,
+    /// `max(a, b, …)` — the maximum.
+    Max,
+    /// `clamp(lo, val, hi)` — `val` bounded to `[lo, hi]`.
+    Clamp,
+}
+
+/// If `value` is exactly a single top-level math function (`calc(...)` / `min(...)` / `max(...)` /
+/// `clamp(...)`, case-insensitive), return `(which, inner-text)`; else `None` (the value is a plain
+/// length-token list). Requires the function to span the WHOLE value (a trailing token after the
+/// `)` means it is not a lone math function).
+fn parse_math_function(value: &str) -> Option<(MathFunc, &str)> {
+    let v = value.trim();
+    for (kw, func) in [
+        ("calc(", MathFunc::Calc),
+        ("min(", MathFunc::Min),
+        ("max(", MathFunc::Max),
+        ("clamp(", MathFunc::Clamp),
+    ] {
+        if v.len() > kw.len() && v[..kw.len()].eq_ignore_ascii_case(kw) {
+            let open = kw.len() - 1; // index of the `(`
+            let (inner, after) = read_balanced_parens(v, open)?;
+            // The function must be the whole value — nothing but trailing whitespace after `)`.
+            if v[after..].trim().is_empty() {
+                return Some((func, inner));
+            }
+        }
+    }
+    None
+}
+
+/// Evaluate a math function over **absolute lengths / unitless** numbers, returning the numeric
+/// result, or `None` if any operand can't be resolved to a number (notably a `%` token, which is
+/// deferred — the declaration is dropped). `calc` evaluates its single expression; `min`/`max` fold
+/// over their comma-separated arguments; `clamp(lo, val, hi)` bounds `val` to `[lo, hi]`.
+fn eval_math(func: MathFunc, inner: &str, ctx: &ResolveCtx) -> Option<f32> {
+    match func {
+        MathFunc::Calc => eval_expr(inner, ctx),
+        MathFunc::Min | MathFunc::Max => {
+            let mut acc: Option<f32> = None;
+            for arg in split_top_level_commas(inner) {
+                let v = eval_expr(arg, ctx)?;
+                acc = Some(match acc {
+                    None => v,
+                    Some(cur) if func == MathFunc::Min => {
+                        if v < cur {
+                            v
+                        } else {
+                            cur
+                        }
+                    }
+                    Some(cur) => {
+                        if v > cur {
+                            v
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+            acc // None when there were no arguments -> drop the declaration
+        }
+        MathFunc::Clamp => {
+            let args = split_top_level_commas(inner);
+            if args.len() != 3 {
+                return None; // clamp takes exactly (lo, val, hi)
+            }
+            let lo = eval_expr(args[0], ctx)?;
+            let val = eval_expr(args[1], ctx)?;
+            let hi = eval_expr(args[2], ctx)?;
+            // clamp = max(lo, min(val, hi)); CSS lets lo win when lo > hi (lo is applied last).
+            let upper = if val < hi { val } else { hi };
+            Some(if upper > lo { upper } else { lo })
+        }
+    }
+}
+
+/// A tiny recursive-descent evaluator for a `calc()`-style arithmetic expression over numbers with
+/// `+ - * /` and parentheses. Each operand is a length/unitless number resolved through `ctx` (so a
+/// nested `calc(...)`/`min(...)`/`max(...)`/`clamp(...)`, a `2rem`, a `10vw`, a bare number, or a
+/// `<n>px` all reduce to a px/number). Returns `None` on a malformed expression, a divide-by-zero,
+/// or a `%` operand (deferred — the whole declaration is dropped).
+///
+/// `*`/`/` per CSS need at least one unitless operand; we relax to plain numeric arithmetic (all
+/// operands are already px-or-unitless numbers here), which gives the same answer for the supported
+/// absolute-length inputs.
+fn eval_expr(expr: &str, ctx: &ResolveCtx) -> Option<f32> {
+    let tokens = tokenize_expr(expr)?;
+    let mut p = ExprParser {
+        tokens: &tokens,
+        pos: 0,
+        ctx,
+    };
+    let v = p.parse_sum()?;
+    if p.pos != p.tokens.len() {
+        return None; // trailing tokens -> malformed
+    }
+    Some(v)
+}
+
+/// One token of a `calc()` expression: an operator, a parenthesis, or a value (a length/number/
+/// nested-function text, resolved to a number when the parser consumes it).
+enum ExprTok<'a> {
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Open,
+    Close,
+    /// A value token's raw text (`8px`, `2rem`, `50%`, or a nested `min(...)`), resolved lazily.
+    Value(&'a str),
+}
+
+/// Tokenize a `calc()` expression into [`ExprTok`]s. Operators (`+ - * /`) must be surrounded by the
+/// surrounding text appropriately, but we are lenient: a value token is any maximal run that is not
+/// an operator/paren at depth 0, with nested `(...)` (a sub-`calc`/`min`/...) captured whole as one
+/// value token. A leading-sign number (`-8px`) is handled by the parser's unary rule. Returns `None`
+/// on an unbalanced paren.
+fn tokenize_expr(expr: &str) -> Option<Vec<ExprTok<'_>>> {
+    let mut out = Vec::new();
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // A function-call value (`min(...)`, `calc(...)`, a parenthesized sub-expr) — capture the
+        // balanced `(...)` whole. Distinguish `(` that opens a group vs. a function: an ident run
+        // immediately before `(` makes it a function value; a bare `(` is a grouping paren.
+        if b == b'(' {
+            out.push(ExprTok::Open);
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            out.push(ExprTok::Close);
+            i += 1;
+            continue;
+        }
+        match b {
+            b'+' => {
+                out.push(ExprTok::Plus);
+                i += 1;
+                continue;
+            }
+            b'-' => {
+                out.push(ExprTok::Minus);
+                i += 1;
+                continue;
+            }
+            b'*' => {
+                out.push(ExprTok::Star);
+                i += 1;
+                continue;
+            }
+            b'/' => {
+                out.push(ExprTok::Slash);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // A value token: a run of ident/number/`.`/`%` bytes. If it is a function name immediately
+        // followed by `(`, fold the whole balanced call into this one value token.
+        let start = i;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_whitespace()
+                || c == b'+'
+                || c == b'-'
+                || c == b'*'
+                || c == b'/'
+                || c == b'('
+                || c == b')'
+            {
+                break;
+            }
+            i += 1;
+        }
+        // A function call: the next non-space byte is `(` -> swallow the balanced group into the
+        // value, so `min(1px, 2px)` is one value token.
+        if i < bytes.len() && bytes[i] == b'(' {
+            let (_, after) = read_balanced_parens(expr, i)?;
+            i = after;
+            out.push(ExprTok::Value(&expr[start..i]));
+        } else {
+            out.push(ExprTok::Value(&expr[start..i]));
+        }
+    }
+    Some(out)
+}
+
+/// The recursive-descent state for [`eval_expr`]: the token stream + a cursor + the element context.
+struct ExprParser<'a> {
+    tokens: &'a [ExprTok<'a>],
+    pos: usize,
+    ctx: &'a ResolveCtx<'a>,
+}
+
+impl ExprParser<'_> {
+    /// `sum := product (('+' | '-') product)*` — additive precedence (lowest).
+    fn parse_sum(&mut self) -> Option<f32> {
+        let mut acc = self.parse_product()?;
+        loop {
+            match self.tokens.get(self.pos) {
+                Some(ExprTok::Plus) => {
+                    self.pos += 1;
+                    acc += self.parse_product()?;
+                }
+                Some(ExprTok::Minus) => {
+                    self.pos += 1;
+                    acc -= self.parse_product()?;
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+
+    /// `product := unary (('*' | '/') unary)*` — multiplicative precedence.
+    fn parse_product(&mut self) -> Option<f32> {
+        let mut acc = self.parse_unary()?;
+        loop {
+            match self.tokens.get(self.pos) {
+                Some(ExprTok::Star) => {
+                    self.pos += 1;
+                    acc *= self.parse_unary()?;
+                }
+                Some(ExprTok::Slash) => {
+                    self.pos += 1;
+                    let rhs = self.parse_unary()?;
+                    if rhs == 0.0 {
+                        return None; // divide-by-zero -> drop the declaration
+                    }
+                    acc /= rhs;
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+
+    /// `unary := ('+' | '-')* atom` — a leading sign on an atom (`-8px`, `+2`).
+    fn parse_unary(&mut self) -> Option<f32> {
+        match self.tokens.get(self.pos) {
+            Some(ExprTok::Plus) => {
+                self.pos += 1;
+                self.parse_unary()
+            }
+            Some(ExprTok::Minus) => {
+                self.pos += 1;
+                Some(-self.parse_unary()?)
+            }
+            _ => self.parse_atom(),
+        }
+    }
+
+    /// `atom := '(' sum ')' | value` — a parenthesized sub-expression or a single resolved value.
+    fn parse_atom(&mut self) -> Option<f32> {
+        match self.tokens.get(self.pos) {
+            Some(ExprTok::Open) => {
+                self.pos += 1;
+                let v = self.parse_sum()?;
+                match self.tokens.get(self.pos) {
+                    Some(ExprTok::Close) => {
+                        self.pos += 1;
+                        Some(v)
+                    }
+                    _ => None, // missing `)`
+                }
+            }
+            Some(ExprTok::Value(text)) => {
+                self.pos += 1;
+                resolve_expr_value(text, self.ctx)
+            }
+            _ => None, // an operator/`)`/EOF where an atom was expected -> malformed
+        }
+    }
+}
+
+/// Resolve a single value token inside a `calc()` expression to a number: a nested math function is
+/// evaluated, a relative-unit length is resolved via `ctx`, a `<n>px` keeps its number, a bare
+/// number parses directly. A `%` token returns `None` (deferred — drops the declaration), as does a
+/// non-numeric keyword.
+fn resolve_expr_value(text: &str, ctx: &ResolveCtx) -> Option<f32> {
+    let t = text.trim();
+    // A `%` length can't be resolved without layout — defer (drop the whole declaration).
+    if t.ends_with('%') {
+        return None;
+    }
+    // A nested math function (`min(...)`, `calc(...)`, …).
+    if let Some((func, inner)) = parse_math_function(t) {
+        return eval_math(func, inner, ctx);
+    }
+    // A relative-unit length (`2rem`, `10vw`, …) resolves via the context.
+    if let Some(px) = resolve_unit_token(t, ctx) {
+        return Some(px);
+    }
+    // A `<n>px` absolute length: strip the unit and parse the number.
+    let body = t
+        .strip_suffix("px")
+        .or_else(|| t.strip_suffix("PX"))
+        .unwrap_or(t);
+    body.trim().parse::<f32>().ok()
+}
+
+/// Format a resolved numeric length as a plain number string (no `px` suffix — matching the existing
+/// length contract). The value is rounded to 3 decimal places; an integer result renders with no
+/// fractional part (`12` not `12.0`), and a fractional result trims trailing zeros (`12.5`, not
+/// `12.500`). Built by hand (no `format!`, to stay `no_std`-clean).
+///
+/// The 3-decimal rounding also absorbs float error, so `8.0 + 4.0` is `12` and `2.0 * 16.0` is `32`
+/// rather than `12.0001` / `31.9998`.
+fn format_number(n: f32) -> String {
+    let neg = n < 0.0;
+    let mag = if neg { -n } else { n };
+    // Scale to thousandths and round to the nearest integer (so the whole number — integer AND
+    // fraction — is one carry-correct integer; no separate integer/fraction carry to get wrong).
+    let total = (mag * 1000.0 + 0.5) as u64; // mag >= 0, so a single +0.5 rounds correctly
+    let int_part = total / 1000;
+    let frac = total % 1000;
+    let mut out = String::new();
+    if neg && total != 0 {
+        out.push('-'); // never emit "-0"
+    }
+    push_u64(&mut out, int_part);
+    if frac != 0 {
+        // Render the three fraction digits, then trim trailing zeros.
+        let mut buf = [0u8; 3];
+        let mut f = frac;
+        for slot in buf.iter_mut().rev() {
+            *slot = b'0' + (f % 10) as u8;
+            f /= 10;
+        }
+        let mut end = 3;
+        while end > 0 && buf[end - 1] == b'0' {
+            end -= 1;
+        }
+        out.push('.');
+        for &d in &buf[..end] {
+            out.push(d as char);
+        }
+    }
+    out
+}
+
+/// Append an unsigned integer to `out` in decimal, by hand (no `format!`, `no_std`-clean).
+fn push_u64(out: &mut String, mut n: u64) {
+    if n == 0 {
+        out.push('0');
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    while n > 0 {
+        digits[len] = b'0' + (n % 10) as u8;
+        n /= 10;
         len += 1;
     }
     for &d in digits[..len].iter().rev() {
@@ -4285,6 +4956,213 @@ mod tests {
             not_sheet.resolve_for(&p, ElementStates::default()),
             vec![(FG, "#222222".to_string())],
             ":not() matches everything (no inner compound to exclude)"
+        );
+    }
+
+    // --- Wave 4b: custom properties + var() + relative units + calc() ----------------
+
+    /// A `ResolveCtx` with no custom props and a font/root of 16px, viewport 100×100 (so vw/vh = 1).
+    fn ctx16<'a>(custom: &'a [(&'a str, &'a str)]) -> ResolveCtx<'a> {
+        ResolveCtx {
+            custom,
+            font_px: 16.0,
+            root_px: 16.0,
+            vw_px: 1.0,
+            vh_px: 1.0,
+        }
+    }
+
+    #[test]
+    fn custom_property_decls_are_kept_raw_and_separate() {
+        // A `--name` declaration is parsed as a custom prop (raw value, un-normalized) and does NOT
+        // appear among the normal decls; a normal decl in the same rule still resolves as usual.
+        let sheet = parse(".t { --accent: #ff0000; color: blue }");
+        let target = MatchTarget::new(None, None, &["t"]);
+        // Normal decls: only `color` (the custom prop is not normalized into a PropId decl).
+        assert_eq!(
+            sheet.resolve_for(&target, ElementStates::default()),
+            vec![(FG, "#0000ff".to_string())]
+        );
+        // Custom decls expose the raw `--accent` value verbatim (NOT folded to `#rrggbb`).
+        assert_eq!(
+            sheet.resolve_custom_for(&target, ElementStates::default()),
+            vec![("--accent".to_string(), "#ff0000".to_string())]
+        );
+    }
+
+    #[test]
+    fn custom_props_cascade_last_wins_by_specificity() {
+        // `--c` set by a class and overridden by an id (higher specificity) -> the id value wins.
+        let sheet = parse(".t { --c: 1px } #x.t { --c: 2px }");
+        let target = MatchTarget::new(None, Some("x"), &["t"]);
+        assert_eq!(
+            sheet.resolve_custom_for(&target, ElementStates::default()),
+            vec![("--c".to_string(), "2px".to_string())]
+        );
+    }
+
+    #[test]
+    fn var_substitutes_a_defined_custom_property() {
+        let custom = [("--accent", "#112233")];
+        assert_eq!(
+            resolve_value("var(--accent)", &ctx16(&custom)),
+            Some("#112233".to_string())
+        );
+    }
+
+    #[test]
+    fn var_uses_fallback_when_undefined() {
+        // `var(--x, red)` with `--x` undefined yields the fallback `red` verbatim (resolve_value does
+        // not color-normalize — only var/unit/calc); an undefined var with NO fallback drops it.
+        let custom: [(&str, &str); 0] = [];
+        assert_eq!(
+            resolve_value("var(--x, red)", &ctx16(&custom)),
+            Some("red".to_string())
+        );
+        assert_eq!(resolve_value("var(--x)", &ctx16(&custom)), None);
+    }
+
+    #[test]
+    fn var_chains_and_nests() {
+        // A var whose value is itself a var resolves through; a var inside another var's name slot.
+        let custom = [("--a", "var(--b)"), ("--b", "7")];
+        assert_eq!(
+            resolve_value("var(--a)", &ctx16(&custom)),
+            Some("7".to_string())
+        );
+        // A var used inside a calc.
+        let custom2 = [("--pad", "8px")];
+        assert_eq!(
+            resolve_value("calc(var(--pad) + 4px)", &ctx16(&custom2)),
+            Some("12".to_string())
+        );
+    }
+
+    #[test]
+    fn rem_em_vw_vh_resolve_to_px_numbers() {
+        // root=16, font=20, vw_px=2 (200px wide), vh_px=4 (400px tall).
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ResolveCtx {
+            custom: &custom,
+            font_px: 20.0,
+            root_px: 16.0,
+            vw_px: 2.0,
+            vh_px: 4.0,
+        };
+        assert_eq!(resolve_value("2rem", &ctx), Some("32".to_string())); // 2 * 16
+        assert_eq!(resolve_value("1.5em", &ctx), Some("30".to_string())); // 1.5 * 20
+        assert_eq!(resolve_value("10vw", &ctx), Some("20".to_string())); // 10 * 2
+        assert_eq!(resolve_value("50vh", &ctx), Some("200".to_string())); // 50 * 4
+    }
+
+    #[test]
+    fn absolute_and_percent_values_pass_through_unchanged() {
+        // A plain absolute value (no var/unit/calc) resolves to itself; `%` is left verbatim.
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ctx16(&custom);
+        assert_eq!(resolve_value("12", &ctx), Some("12".to_string()));
+        assert_eq!(resolve_value("12px", &ctx), Some("12px".to_string()));
+        assert_eq!(resolve_value("100%", &ctx), Some("100%".to_string()));
+        assert_eq!(resolve_value("auto", &ctx), Some("auto".to_string()));
+        assert_eq!(resolve_value("#ff8800", &ctx), Some("#ff8800".to_string()));
+    }
+
+    #[test]
+    fn calc_min_max_clamp_over_absolute_lengths() {
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ctx16(&custom);
+        assert_eq!(
+            resolve_value("calc(8px + 4px)", &ctx),
+            Some("12".to_string())
+        );
+        assert_eq!(
+            resolve_value("calc(10px * 2 - 5px)", &ctx),
+            Some("15".to_string())
+        );
+        assert_eq!(
+            resolve_value("calc((2 + 3) * 4px)", &ctx),
+            Some("20".to_string())
+        );
+        assert_eq!(
+            resolve_value("min(10px, 4px, 8px)", &ctx),
+            Some("4".to_string())
+        );
+        assert_eq!(
+            resolve_value("max(10px, 4px, 8px)", &ctx),
+            Some("10".to_string())
+        );
+        assert_eq!(
+            resolve_value("clamp(5px, 2px, 10px)", &ctx),
+            Some("5".to_string())
+        );
+        assert_eq!(
+            resolve_value("clamp(5px, 7px, 10px)", &ctx),
+            Some("7".to_string())
+        );
+    }
+
+    #[test]
+    fn calc_resolves_relative_units_inside() {
+        // 2rem (root 16 -> 32) + 8px = 40; em uses font_px.
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ResolveCtx {
+            custom: &custom,
+            font_px: 10.0,
+            root_px: 16.0,
+            vw_px: 1.0,
+            vh_px: 1.0,
+        };
+        assert_eq!(
+            resolve_value("calc(2rem + 8px)", &ctx),
+            Some("40".to_string())
+        );
+        assert_eq!(resolve_value("calc(3em)", &ctx), Some("30".to_string()));
+    }
+
+    #[test]
+    fn percent_inside_calc_drops_the_declaration() {
+        // A `%` inside a math function can't be resolved without layout -> the whole value is dropped
+        // (the host then leaves the property unset). This is the deferred-`%` contract.
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ctx16(&custom);
+        assert_eq!(resolve_value("calc(100% - 8px)", &ctx), None);
+        assert_eq!(resolve_value("min(50%, 8px)", &ctx), None);
+    }
+
+    #[test]
+    fn malformed_calc_and_divide_by_zero_drop() {
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ctx16(&custom);
+        assert_eq!(resolve_value("calc(8px +)", &ctx), None);
+        assert_eq!(resolve_value("calc(8px / 0)", &ctx), None);
+    }
+
+    #[test]
+    fn fractional_results_render_trimmed() {
+        let custom: [(&str, &str); 0] = [];
+        let ctx = ctx16(&custom);
+        assert_eq!(
+            resolve_value("calc(10px / 4)", &ctx),
+            Some("2.5".to_string())
+        );
+        assert_eq!(
+            resolve_value("calc(1px / 3)", &ctx),
+            Some("0.333".to_string())
+        );
+        assert_eq!(
+            resolve_value("calc(0px - 6px)", &ctx),
+            Some("-6".to_string())
+        );
+    }
+
+    #[test]
+    fn calc_value_survives_parse_block_without_mis_splitting() {
+        // `padding: calc(8px + 4px)` must NOT mis-split on the inner spaces into a 3-value box
+        // shorthand: it parses as ONE padding value, kept verbatim for resolve_value to evaluate.
+        let sheet = parse(".p { padding: calc(8px + 4px) }");
+        assert_eq!(
+            sheet.declarations("p"),
+            &[(PADDING, "calc(8px + 4px)".to_string())]
         );
     }
 }

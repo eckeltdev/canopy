@@ -71,7 +71,9 @@ use std::collections::BTreeMap;
 use canopy_dom::{Dom, ROOT};
 use canopy_protocol::{AttrId, EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
-use canopy_style_css::{ElementIdentity, ElementStates, MatchTarget, Stylesheet};
+use canopy_style_css::{
+    resolve_value, ElementIdentity, ElementStates, MatchTarget, ResolveCtx, Stylesheet,
+};
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
@@ -189,6 +191,11 @@ impl CanopyHost {
         // structural pseudo-classes (`:first-child`, `:nth-child`, …) resolve on the host path.
         let root_children = dom.children(ROOT);
         let root_count = root_children.len() as u32;
+        // Viewport context for the relative units `vw` / `vh` (1% of each viewport dimension). The
+        // host's stored `viewport` is the same field the renderer/hit-test lay out within; `0×0`
+        // until `set_viewport`, in which case `vw`/`vh` resolve to 0 (no layout box yet).
+        let vw_px = self.viewport.w / 100.0;
+        let vh_px = self.viewport.h / 100.0;
         for (idx, &child) in root_children.iter().enumerate() {
             collect_cascade(
                 &dom,
@@ -200,6 +207,10 @@ impl CanopyHost {
                 idx as u32,
                 root_count,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
+                ROOT_FONT_PX,
+                vw_px,
+                vh_px,
                 &[],
                 &mut overlay,
             );
@@ -472,6 +483,10 @@ fn collect_cascade(
     sibling_index: u32,
     sibling_count: u32,
     inherited: &BTreeMap<PropId, String>,
+    parent_custom: &BTreeMap<String, String>,
+    parent_font_px: f32,
+    vw_px: f32,
+    vh_px: f32,
     ancestors: &[NodeIdentity<'_>],
     overlay: &mut Vec<(NodeId, PropId, String)>,
 ) {
@@ -484,50 +499,129 @@ fn collect_cascade(
     // lives for the whole walk. Built up-front so it can both drive this node's match AND be pushed
     // onto the ancestor stack handed to the children.
     let identity = NodeIdentity::from_node(n);
-    // Match the full lite selector model (type / id / class / compound / attr / combinators, with
-    // specificity) against this node's identity and its ancestor chain. Skip bare text nodes: they
-    // aren't elements, so only an element-ish node (a tag, a declared name, classes, an id, or any
-    // attr) participates in matching.
-    if identity.type_name.is_some()
+
+    // The node's effective custom-property map = the parent's (custom props always inherit) overlaid
+    // with this node's OWN matched `--name` decls (last-wins). Built before any `var()` resolution so
+    // both the font-size and the node's other values resolve against the same map.
+    let mut custom_map = parent_custom.clone();
+    // The element-ish gate also governs whether this node has matched custom decls; a bare text node
+    // never matches a rule, so it just carries the parent map through.
+    let is_element = identity.type_name.is_some()
         || identity.id.is_some()
         || !identity.classes.is_empty()
-        || !identity.attrs.is_empty()
-    {
-        // The matcher wants ancestors nearest-first (index 0 = parent); our `ancestors` stack is
-        // root-first, so reverse it into borrowed `ElementIdentity`s for this resolve call.
-        let chain: Vec<ElementIdentity> = ancestors.iter().rev().map(|a| a.as_element()).collect();
-        // Thread this node's structural context so `:first-child`/`:nth-child`/`:empty`/… resolve:
-        // its 0-based index among its siblings, the total sibling count, and its own child count.
-        let target = identity
-            .as_match_target()
-            .with_attrs(&identity.attrs)
-            .with_ancestors(&chain)
-            .with_structure(sibling_index, sibling_count, n.children.len() as u32);
-        // This node's current dynamic interaction state, fed to the state pseudos
-        // (`:hover`/`:focus`/`:active`). `:hover` fires for the node and every ancestor of the
-        // hovered leaf (the hover_path, CSS semantics); `:focus`/`:active` fire only on the focused
-        // / active node itself (no ancestor walk this wave). `:disabled`/`:checked` are NOT here —
-        // they match off this node's `disabled`/`checked` attribute via `target` instead.
-        let states = ElementStates {
-            hover: hover_path.contains(&node),
-            focus: focused == Some(node),
-            active: active == Some(node),
-        };
-        for (prop, value) in sheet.resolve_for(&target, states) {
-            // Author inline styles win over class rules (CSS specificity: inline beats a class
-            // selector), so only fold in a property the node didn't set itself. The matched-rule
-            // value is overlaid onto the live tree below; record it in `own` too so it shadows any
-            // inherited value of the same prop and propagates to this node's children.
-            if !n.styles.contains_key(&prop) {
-                overlay.push((node, prop, value.clone()));
-                own.insert(prop, value);
+        || !identity.attrs.is_empty();
+
+    // The matcher wants ancestors nearest-first (index 0 = parent); our `ancestors` stack is
+    // root-first, so reverse it into borrowed `ElementIdentity`s for this resolve call.
+    let chain: Vec<ElementIdentity> = ancestors.iter().rev().map(|a| a.as_element()).collect();
+    // Thread this node's structural context so `:first-child`/`:nth-child`/`:empty`/… resolve:
+    // its 0-based index among its siblings, the total sibling count, and its own child count.
+    let target = identity
+        .as_match_target()
+        .with_attrs(&identity.attrs)
+        .with_ancestors(&chain)
+        .with_structure(sibling_index, sibling_count, n.children.len() as u32);
+    // This node's current dynamic interaction state, fed to the state pseudos
+    // (`:hover`/`:focus`/`:active`). `:hover` fires for the node and every ancestor of the
+    // hovered leaf (the hover_path, CSS semantics); `:focus`/`:active` fire only on the focused
+    // / active node itself (no ancestor walk this wave). `:disabled`/`:checked` are NOT here —
+    // they match off this node's `disabled`/`checked` attribute via `target` instead.
+    let states = ElementStates {
+        hover: hover_path.contains(&node),
+        focus: focused == Some(node),
+        active: active == Some(node),
+    };
+
+    if is_element {
+        // Overlay this node's own matched custom props onto the inherited map (last-wins by cascade
+        // order, already applied inside `resolve_custom_for`).
+        for (name, value) in sheet.resolve_custom_for(&target, states) {
+            custom_map.insert(name, value);
+        }
+    }
+
+    // (1a) Resolve the node's FONT-SIZE first, so `em` (relative to the element's own font-size)
+    // works for the node's other properties. Take the font-size it resolves itself (author inline or
+    // a matched rule) or, failing that, the inherited value; default to the parent font-size. The
+    // font-size value is resolved with the PARENT font-size as the `em` basis (an `em` font-size is
+    // relative to the parent's, per CSS).
+    let matched = if is_element {
+        sheet.resolve_for(&target, states)
+    } else {
+        Vec::new()
+    };
+    let raw_font = n
+        .styles
+        .get(&canopy_paint::FONT_SIZE)
+        .or_else(|| {
+            matched
+                .iter()
+                .find(|(p, _)| *p == canopy_paint::FONT_SIZE)
+                .map(|(_, v)| v)
+        })
+        .or_else(|| inherited.get(&canopy_paint::FONT_SIZE));
+    let node_font_px = match raw_font {
+        Some(raw) => {
+            let parent_ctx = ResolveCtx {
+                custom: &borrow_custom(&custom_map),
+                font_px: parent_font_px,
+                root_px: ROOT_FONT_PX,
+                vw_px,
+                vh_px,
+            };
+            resolve_value(raw, &parent_ctx)
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(parent_font_px)
+        }
+        None => parent_font_px,
+    };
+
+    // The context for THIS node's other properties: the effective custom map, the node's own
+    // font-size as the `em` basis, the fixed root font-size for `rem`, and the viewport for `vw`/`vh`.
+    let owned_custom = borrow_custom(&custom_map);
+    let ctx = ResolveCtx {
+        custom: &owned_custom,
+        font_px: node_font_px,
+        root_px: ROOT_FONT_PX,
+        vw_px,
+        vh_px,
+    };
+
+    // (1b) Author-inline values may themselves carry var()/units/calc — resolve them in place so the
+    // overlaid tree always holds final values. A value that drops (undefined var, `%` in calc) is
+    // removed from `own` (the property goes unset, as CSS drops an invalid declaration).
+    let inline_keys: Vec<PropId> = n.styles.keys().copied().collect();
+    for prop in inline_keys {
+        let raw = own.get(&prop).cloned().unwrap_or_default();
+        match resolve_value(&raw, &ctx) {
+            Some(resolved) if resolved != raw => {
+                overlay.push((node, prop, resolved.clone()));
+                own.insert(prop, resolved);
             }
+            Some(_) => { /* unchanged absolute value: already on the live tree, leave as-is */ }
+            None => {
+                own.remove(&prop);
+            }
+        }
+    }
+
+    // (1c) Fold the matched-rule decls the node didn't set inline, resolving each value through the
+    // context. Author inline wins (CSS specificity: inline beats a class selector), so only a prop
+    // the node didn't set itself is considered. A value that drops is skipped (unset).
+    for (prop, value) in matched {
+        if n.styles.contains_key(&prop) {
+            continue;
+        }
+        if let Some(resolved) = resolve_value(&value, &ctx) {
+            overlay.push((node, prop, resolved.clone()));
+            own.insert(prop, resolved);
         }
     }
 
     // (2) Inherit: for every inherited prop the node does not resolve itself, take the parent's
     // value. Inheritance is the weakest source — it only fills what neither inline nor a matched
-    // rule set (both already live in `own`).
+    // rule set (both already live in `own`). Inherited values were resolved on the parent, so they
+    // are already final.
     for (prop, value) in inherited {
         if !own.contains_key(prop) {
             overlay.push((node, *prop, value.clone()));
@@ -546,7 +640,8 @@ fn collect_cascade(
     // (4) Recurse, processing each child after this parent (top-down order). Extend the ancestor
     // stack (root-first) with THIS node's identity, so each child sees its full chain. A bare text
     // node carries no identity worth matching, but pushing it keeps the chain structurally complete
-    // (it simply never matches a compound).
+    // (it simply never matches a compound). The custom map + node font-size flow down so a child's
+    // `var()` (custom props always inherit) and `em` resolve against this node's context.
     let mut child_ancestors: Vec<NodeIdentity> = ancestors.to_vec();
     child_ancestors.push(identity);
     // Each child knows its 0-based index among its siblings and the total sibling count, so its own
@@ -563,10 +658,26 @@ fn collect_cascade(
             idx as u32,
             child_count,
             &child_inherited,
+            &custom_map,
+            node_font_px,
+            vw_px,
+            vh_px,
             &child_ancestors,
             overlay,
         );
     }
+}
+
+/// The fixed root font-size (px) used as the `rem` basis. This wave does not track a `:root`-driven
+/// root font-size (see the Wave 4b deferral note in `canopy-style-css`), so a constant 16px — the
+/// CSS initial `medium` — is the root for every `rem`.
+const ROOT_FONT_PX: f32 = 16.0;
+
+/// Borrow an owned `BTreeMap<String, String>` custom-property map as the `&[(&str, &str)]` slice
+/// [`ResolveCtx::custom`] needs (the `no_std` resolver takes borrowed slices, the std host owns the
+/// map). A fresh `Vec` per call keeps the borrow lifetimes simple at the cost of a small allocation.
+fn borrow_custom(map: &BTreeMap<String, String>) -> Vec<(&str, &str)> {
+    map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 }
 
 /// The reference-host **attribute** ids whose CSS names the lite cascade understands, beyond the
@@ -2518,6 +2629,146 @@ mod tests {
             styled_prop(&styled, ul, BG),
             None,
             "the ul has a child, so ul:empty does not match"
+        );
+    }
+
+    // --- Wave 4b: custom properties + var() + relative units + calc() (host cascade) --------
+
+    #[test]
+    fn custom_prop_inherits_and_var_substitutes_on_a_child() {
+        use canopy_paint::FG;
+        // `--accent` is set on a parent div; a child uses `var(--accent)` for its color. Custom props
+        // always inherit, so the child resolves the parent's value through `var()`.
+        let mut e = Emitter::new();
+        let parent = e.create_element(ElementTag::new(1));
+        e.append(ROOT, parent);
+        e.set_class(parent, "theme");
+        let child = e.create_element(ElementTag::new(1));
+        e.append(parent, child);
+        e.set_class(child, "label");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".theme { --accent: #ff0000 } .label { color: var(--accent) }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, child, FG).as_deref(),
+            Some("#ff0000"),
+            "the child resolves var(--accent) from the inherited custom property"
+        );
+    }
+
+    #[test]
+    fn var_fallback_when_undefined_in_host_cascade() {
+        use canopy_paint::FG;
+        // `var(--missing, #00ff00)` with `--missing` undefined falls back to the fallback value. The
+        // color was normalized to `#00ff00` at parse time (the declaration's value is `var(...)`,
+        // which passes normalization through; the fallback inside it is already a canonical hex).
+        let (host, btn) = host_with_btn(".btn { color: var(--missing, #00ff00) }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, FG).as_deref(),
+            Some("#00ff00"),
+            "an undefined var falls back to its fallback value"
+        );
+    }
+
+    #[test]
+    fn font_size_rem_resolves_against_fixed_root() {
+        use canopy_paint::FONT_SIZE;
+        // `font-size: 2rem` -> 2 * 16 (fixed root) = 32.
+        let (host, btn) = host_with_btn(".btn { font-size: 2rem }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, FONT_SIZE).as_deref(),
+            Some("32"),
+            "2rem resolves to 32 against the fixed 16px root"
+        );
+    }
+
+    #[test]
+    fn width_vw_resolves_against_the_viewport() {
+        use canopy_paint::WIDTH;
+        // `width: 10vw` with a 200px-wide viewport -> 10 * (200/100) = 20.
+        let (mut host, btn) = host_with_btn(".btn { width: 10vw }");
+        host.set_viewport(200.0, 100.0);
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, WIDTH).as_deref(),
+            Some("20"),
+            "10vw resolves to 20 against a 200px-wide viewport"
+        );
+    }
+
+    #[test]
+    fn padding_calc_sum_resolves() {
+        use canopy_paint::PADDING;
+        // `padding: calc(8px + 4px)` -> 12.
+        let (host, btn) = host_with_btn(".btn { padding: calc(8px + 4px) }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, PADDING).as_deref(),
+            Some("12"),
+            "calc(8px + 4px) resolves to 12"
+        );
+    }
+
+    #[test]
+    fn em_resolves_against_the_elements_own_font_size() {
+        use canopy_paint::{PADDING, WIDTH};
+        // `font-size` is resolved first, so a sibling property's `em` uses THIS element's font-size:
+        // font-size 20 -> `width: 2em` is 40. A child's `em` uses its OWN font-size, falling back to
+        // the inherited 20 when it sets none.
+        let mut e = Emitter::new();
+        let parent = e.create_element(ElementTag::new(1));
+        e.append(ROOT, parent);
+        e.set_class(parent, "p");
+        let child = e.create_element(ElementTag::new(1));
+        e.append(parent, child);
+        e.set_class(child, "c");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".p { font-size: 20px; width: 2em } .c { padding: 3em }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, parent, WIDTH).as_deref(),
+            Some("40"),
+            "2em on the parent uses its own 20px font-size -> 40"
+        );
+        assert_eq!(
+            styled_prop(&styled, child, PADDING).as_deref(),
+            Some("60"),
+            "3em on the child uses the inherited 20px font-size -> 60"
+        );
+    }
+
+    #[test]
+    fn calc_with_percent_is_dropped() {
+        use canopy_paint::WIDTH;
+        // A `%` inside calc can't be resolved without layout -> the declaration is dropped, so the
+        // property is unset (no width resolved on the node).
+        let (host, btn) = host_with_btn(".btn { width: calc(100% - 8px) }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, WIDTH),
+            None,
+            "calc containing a % is dropped (deferred), leaving width unset"
+        );
+    }
+
+    #[test]
+    fn bare_percent_width_passes_through_verbatim() {
+        use canopy_paint::WIDTH;
+        // A plain `%` (not inside calc) is left VERBATIM for Taffy to resolve natively.
+        let (host, btn) = host_with_btn(".btn { width: 50% }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, WIDTH).as_deref(),
+            Some("50%"),
+            "a bare % width passes through unchanged"
         );
     }
 }
