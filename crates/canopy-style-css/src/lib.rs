@@ -44,13 +44,28 @@
 //! # Supported properties and colors
 //!
 //! Box / flex / paint properties map to their [`canopy_paint`] ids: `background`,
-//! `color`, `width`/`height`, `min-width`/`min-height`/`max-width`/`max-height`,
-//! `margin`, `padding`, `gap`, `flex-grow`, `border-width`, `border-color`,
-//! `radius`, `opacity`, `direction`, `align`, `justify`, `text-align`, and the
-//! `translate-x`/`translate-y` offsets. Lengths accept a bare number or a `px`
-//! suffix. Colors accept a named keyword (`navy`, `red`, …), `#rgb`, `#rrggbb`, or
-//! `rgb(r, g, b)` — all normalized to `#rrggbb` (`transparent` is intentionally
-//! absent, so it falls through to paint-nothing).
+//! `color`, `width`/`height`, `min-`/`max-` sizing, the `margin`/`padding`/`inset`
+//! box edges (each as a shorthand *and* its per-side longhands), `gap`/`row-gap`/
+//! `column-gap`, `display`/`visibility`/`position`/`overflow`/`box-sizing`,
+//! `z-index`/`aspect-ratio`, the flex item/container props (`flex` shorthand,
+//! `flex-grow`/`-shrink`/`-basis`/`-wrap`, `align-self`), the border frame
+//! (`border` shorthand, per-side widths/colors, `border-style`, per-corner radii),
+//! `font-size`/`font-weight`/`line-height`/`text-decoration`, the `outline`
+//! shorthand + `outline-width`/`-color`/`-offset`, `box-shadow`,
+//! `background-image`, `opacity`, `direction`, `align`, `justify`, `text-align`,
+//! and the `translate-x`/`translate-y` offsets.
+//!
+//! **Shorthand + per-side expansion** happens at parse time: `margin: 8 16`
+//! expands to the four `margin-*` longhands per the CSS 1/2/3/4-value rules
+//! (`padding`/`inset` likewise), `gap: a b` -> `row-gap`/`column-gap`,
+//! `border: 2 solid red` / `flex: 1 0 auto` / `outline: 1 solid red` split by
+//! token shape. Lengths accept a bare number or a `px` suffix and preserve a
+//! leading `-` (negatives) and a trailing `%`; `auto` passes through. Colors accept
+//! a named keyword (`navy`, `red`, `transparent`, …), `#rgb`/`#rgba`/`#rrggbb`/
+//! `#rrggbbaa`, `rgb(r, g, b)`, or `rgba(r, g, b, a)` — normalized to `#rrggbb` when
+//! opaque and `#rrggbbaa` when alpha < 255. A trailing `!important` is stripped
+//! (precedence not yet honored) and the CSS-wide keywords `inherit`/`initial`/
+//! `unset` drop their declaration cleanly.
 //!
 //! # What this is *not*
 //!
@@ -58,7 +73,8 @@
 //!
 //! - Selectors are a single compound only — no **descendant/child/sibling
 //!   combinators**, no attribute selectors, and no pseudo-classes beyond `:hover`;
-//!   no media queries, `!important`, or shorthand expansion.
+//!   no media queries. Box shorthands *are* expanded, but `!important` is only
+//!   stripped (its precedence is not yet honored).
 //! - The cascade matches each node against its own identity; there is no inheritance
 //!   here (the host folds matched rules in as inline styles, and author inline styles
 //!   win, mirroring CSS specificity where inline beats a selector).
@@ -79,9 +95,17 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use canopy_paint::{
-    ALIGN, BG, BORDER_COLOR, BORDER_WIDTH, DIRECTION, FG, FLEX_GROW, GAP, HEIGHT, JUSTIFY, MARGIN,
-    MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
-    TRANSLATE_X, TRANSLATE_Y, WIDTH,
+    ALIGN, ALIGN_SELF, ASPECT_RATIO, BACKGROUND_IMAGE, BG, BORDER_BOTTOM_COLOR,
+    BORDER_BOTTOM_LEFT_RADIUS, BORDER_BOTTOM_RIGHT_RADIUS, BORDER_BOTTOM_WIDTH, BORDER_COLOR,
+    BORDER_LEFT_COLOR, BORDER_LEFT_WIDTH, BORDER_RIGHT_COLOR, BORDER_RIGHT_WIDTH, BORDER_STYLE,
+    BORDER_TOP_COLOR, BORDER_TOP_LEFT_RADIUS, BORDER_TOP_RIGHT_RADIUS, BORDER_TOP_WIDTH,
+    BORDER_WIDTH, BOX_SHADOW, BOX_SIZING, COLUMN_GAP, DIRECTION, DISPLAY, FG, FLEX_BASIS,
+    FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE, FONT_WEIGHT, GAP, HEIGHT, INSET_BOTTOM,
+    INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, LINE_HEIGHT, MARGIN, MARGIN_BOTTOM, MARGIN_LEFT,
+    MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, OUTLINE_COLOR,
+    OUTLINE_OFFSET, OUTLINE_WIDTH, OVERFLOW, PADDING, PADDING_BOTTOM, PADDING_LEFT, PADDING_RIGHT,
+    PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TEXT_DECORATION, TRANSLATE_X, TRANSLATE_Y,
+    VISIBILITY, WIDTH, Z_INDEX,
 };
 use canopy_protocol::{NodeId, PropId};
 use canopy_view::App;
@@ -116,13 +140,18 @@ enum Simple {
     Class(String),
 }
 
-/// A compound selector plus its pseudo-state and CSS **specificity**. Specificity is
-/// `ids*100 + (classes + pseudos)*10 + types*1`, the standard `(a, b, c)` collapsed to one
-/// number (no part exceeds 99 for any realistic lite stylesheet); ties break on source order.
+/// CSS **specificity** as the standard `(a, b, c)` tuple — `a` = id count, `b` = class +
+/// pseudo-class count, `c` = type count — compared lexicographically (it derives `Ord`, so
+/// the tuple order *is* the comparison order). Unlike a packed `a*100 + b*10 + c` integer, this
+/// never overflows or mis-orders past 10 of any kind (e.g. 11 classes still beats 1 id correctly,
+/// and 11 classes outrank 10). Ties break on source order at the call site.
+type Spec = (u32, u32, u32);
+
+/// A compound selector plus its pseudo-state and CSS **specificity** (see [`Spec`]).
 struct Selector {
     simples: Vec<Simple>,
     state: State,
-    specificity: u32,
+    specificity: Spec,
 }
 
 /// One parsed rule: a compound selector and the declarations it sets. Selector grouping
@@ -192,8 +221,10 @@ impl Stylesheet {
     /// appearance order (the order [`apply_state`] replays inline-style ops).
     pub fn resolve_for(&self, target: &MatchTarget, hovered: bool) -> Vec<Decl> {
         // Collect matching rules with their (specificity, source index) so we can order the
-        // cascade correctly regardless of the order classes appear on the element.
-        let mut matched: Vec<(u32, usize)> = Vec::new();
+        // cascade correctly regardless of the order classes appear on the element. The
+        // specificity is the `(a, b, c)` tuple, so the sort below is a true lexicographic
+        // CSS comparison (id > class/pseudo > type) with the source index as the tie-break.
+        let mut matched: Vec<(Spec, usize)> = Vec::new();
         for (idx, rule) in self.rules.iter().enumerate() {
             let state_ok = match rule.selector.state {
                 State::Base => true,
@@ -352,26 +383,29 @@ fn parse_selector(sel: &str) -> Option<Selector> {
         return None;
     }
     let (compound, state) = match sel.split_once(':') {
-        Some((compound, "hover")) => (compound, State::Hover),
+        // Pseudo-classes are ASCII case-insensitive (`:HOVER` == `:hover`).
+        Some((compound, pseudo)) if pseudo.eq_ignore_ascii_case("hover") => {
+            (compound, State::Hover)
+        }
         Some(_) => return None, // unsupported pseudo-class -> drop this selector
         None => (sel, State::Base),
     };
     let simples = parse_compound(compound)?;
-    let (mut ids, mut tens, mut types) = (0u32, 0u32, 0u32);
+    let (mut ids, mut classes, mut types) = (0u32, 0u32, 0u32);
     for simple in &simples {
         match simple {
             Simple::Id(_) => ids += 1,
-            Simple::Class(_) => tens += 1,
+            Simple::Class(_) => classes += 1,
             Simple::Type(_) => types += 1,
         }
     }
     if state == State::Hover {
-        tens += 1; // a pseudo-class counts at the class level of specificity
+        classes += 1; // a pseudo-class counts at the class level of specificity
     }
     Some(Selector {
         simples,
         state,
-        specificity: ids * 100 + tens * 10 + types,
+        specificity: (ids, classes, types),
     })
 }
 
@@ -422,9 +456,14 @@ fn is_ident(s: &str) -> bool {
 }
 
 /// Whether a compound selector's simple parts all match `target` (an AND).
+///
+/// Type names are matched ASCII case-insensitively (`BUTTON` matches `<button>`), per HTML's
+/// case-insensitive tag names. Classes and ids stay case-**sensitive**, per CSS.
 fn selector_matches(simples: &[Simple], target: &MatchTarget) -> bool {
     simples.iter().all(|simple| match simple {
-        Simple::Type(t) => target.type_name == Some(t.as_str()),
+        Simple::Type(t) => target
+            .type_name
+            .is_some_and(|name| name.eq_ignore_ascii_case(t)),
         Simple::Id(id) => target.id == Some(id.as_str()),
         Simple::Class(c) => target.classes.contains(&c.as_str()),
     })
@@ -454,6 +493,13 @@ fn strip_comments(css: &str) -> String {
 
 /// Parse a `prop: value; prop: value` block body into resolved declarations,
 /// skipping unknown properties and malformed `prop: value` pairs.
+///
+/// Box shorthands (`margin`, `padding`, `inset`, `gap`, `border`, `flex`, `outline`) are
+/// **expanded at parse time** into their per-side / per-axis longhands (see
+/// [`expand_shorthand`]), each then normalized exactly as a directly written longhand would be.
+/// A trailing `!important` is stripped (its precedence is not yet honored) so it never drops the
+/// declaration, and the CSS-wide keywords `inherit`/`initial`/`unset` drop their single
+/// declaration cleanly (real semantics land in a later wave) rather than failing a value parse.
 fn parse_block(body: &str) -> Vec<Decl> {
     let mut decls = Vec::new();
     for stmt in body.split(';') {
@@ -465,16 +511,190 @@ fn parse_block(body: &str) -> Vec<Decl> {
             continue;
         };
         let name = name.trim();
-        let value = value.trim();
+        // Strip a trailing `!important` (any casing) and re-trim, so `color: red !important`
+        // resolves to red instead of dropping. Full precedence comes later.
+        let value = strip_important(value.trim()).trim();
         if value.is_empty() {
             continue;
         }
-        let Some(prop) = map_property(name) else {
+        // CSS-wide keywords have no lite semantics yet: drop the declaration cleanly rather than
+        // feed `inherit`/`initial`/`unset` into a color/number parse that would fail.
+        if is_css_wide_keyword(value) {
             continue;
-        };
-        decls.push((prop, normalize_value(prop, value)));
+        }
+        expand_shorthand(name, value, &mut decls);
     }
     decls
+}
+
+/// Strip a trailing `!important` (ASCII case-insensitive, optional whitespace before the `!`)
+/// from a declaration value, returning the remainder. If there is no `!important`, the value is
+/// returned unchanged. Precedence is not yet modeled — this just keeps the declaration alive.
+fn strip_important(value: &str) -> &str {
+    // Find the last `!` and check the suffix is `important` (case-insensitive) after trimming.
+    if let Some(bang) = value.rfind('!') {
+        let after = value[bang + 1..].trim();
+        if after.eq_ignore_ascii_case("important") {
+            return value[..bang].trim_end();
+        }
+    }
+    value
+}
+
+/// Whether `value` is a CSS-wide keyword (`inherit` / `initial` / `unset`), matched ASCII
+/// case-insensitively. These are dropped by [`parse_block`] until a later wave gives them meaning.
+fn is_css_wide_keyword(value: &str) -> bool {
+    value.eq_ignore_ascii_case("inherit")
+        || value.eq_ignore_ascii_case("initial")
+        || value.eq_ignore_ascii_case("unset")
+}
+
+/// Expand a (possibly shorthand) declaration into one or more normalized longhand [`Decl`]s,
+/// pushing them onto `decls`.
+///
+/// Single-value `margin`/`padding`/`gap` keep their historical uniform mapping (`MARGIN`,
+/// `PADDING`, `GAP`); a multi-value form expands to the per-side / per-axis longhands following
+/// the CSS 1/2/3/4-value box rules. `inset` always expands to the four `INSET_*` sides. `border`,
+/// `flex`, and `outline` split their space-separated parts by shape (length / keyword / color).
+/// Any longhand whose name maps to a known [`PropId`] is normalized through [`normalize_value`];
+/// unknown names are silently skipped, mirroring the longhand path.
+fn expand_shorthand(name: &str, value: &str, decls: &mut Vec<Decl>) {
+    // Split the value into whitespace-separated tokens (shorthands are space-delimited).
+    let parts: Vec<&str> = value.split_ascii_whitespace().collect();
+
+    match name {
+        // `margin`/`padding`: single value keeps the uniform PropId (unchanged behavior); a
+        // multi-value form expands per side. `inset` has no uniform PropId, so even a single
+        // value sets all four sides.
+        "margin" if parts.len() == 1 => push_decl(decls, MARGIN, value),
+        "margin" => expand_box(
+            decls,
+            &parts,
+            [MARGIN_TOP, MARGIN_RIGHT, MARGIN_BOTTOM, MARGIN_LEFT],
+        ),
+        "padding" if parts.len() == 1 => push_decl(decls, PADDING, value),
+        "padding" => expand_box(
+            decls,
+            &parts,
+            [PADDING_TOP, PADDING_RIGHT, PADDING_BOTTOM, PADDING_LEFT],
+        ),
+        "inset" => expand_box(
+            decls,
+            &parts,
+            [INSET_TOP, INSET_RIGHT, INSET_BOTTOM, INSET_LEFT],
+        ),
+        // `gap`: single -> uniform GAP (unchanged); `gap: row column` -> ROW_GAP, COLUMN_GAP.
+        "gap" if parts.len() == 1 => push_decl(decls, GAP, value),
+        "gap" => {
+            if let [row, col, ..] = parts.as_slice() {
+                push_decl(decls, ROW_GAP, row);
+                push_decl(decls, COLUMN_GAP, col);
+            }
+        }
+        // `border: <width> <style> <color>` in any order: width is the length, style is one of the
+        // border-style keywords, color is whatever normalizes to a color; missing parts omitted.
+        "border" => expand_border(decls, &parts),
+        // `flex: grow [shrink [basis]]`.
+        "flex" => match parts.as_slice() {
+            [g] => push_decl(decls, FLEX_GROW, g),
+            [g, s] => {
+                push_decl(decls, FLEX_GROW, g);
+                push_decl(decls, FLEX_SHRINK, s);
+            }
+            [g, s, basis, ..] => {
+                push_decl(decls, FLEX_GROW, g);
+                push_decl(decls, FLEX_SHRINK, s);
+                push_decl(decls, FLEX_BASIS, basis);
+            }
+            [] => {}
+        },
+        // `outline: <width> <style> <color>`: width + color are kept, style ignored for now.
+        "outline" => expand_outline(decls, &parts),
+        // Not a shorthand: map the single property name directly.
+        _ => {
+            if let Some(prop) = map_property(name) {
+                push_decl(decls, prop, value);
+            }
+        }
+    }
+}
+
+/// Push one normalized longhand `Decl` for an already-resolved `PropId`.
+fn push_decl(decls: &mut Vec<Decl>, prop: PropId, value: &str) {
+    decls.push((prop, normalize_value(prop, value)));
+}
+
+/// Expand a per-side box shorthand (`margin`/`padding`/`inset`) over its `[top, right, bottom,
+/// left]` PropIds, applying the CSS 1/2/3/4-value rules:
+/// - 1 value  -> all four sides
+/// - 2 values -> `a`=top/bottom, `b`=right/left
+/// - 3 values -> `a`=top, `b`=right/left, `c`=bottom
+/// - 4 values -> top, right, bottom, left
+///
+/// Each side's value is normalized as the corresponding longhand. A 0- or >4-token value is
+/// ignored (malformed).
+fn expand_box(decls: &mut Vec<Decl>, parts: &[&str], sides: [PropId; 4]) {
+    let [top_id, right_id, bottom_id, left_id] = sides;
+    let (top, right, bottom, left) = match parts {
+        [a] => (*a, *a, *a, *a),
+        [a, b] => (*a, *b, *a, *b),
+        [a, b, c] => (*a, *b, *c, *b),
+        [a, b, c, d] => (*a, *b, *c, *d),
+        _ => return,
+    };
+    push_decl(decls, top_id, top);
+    push_decl(decls, right_id, right);
+    push_decl(decls, bottom_id, bottom);
+    push_decl(decls, left_id, left);
+}
+
+/// Expand `border: <width> <style> <color>` (any order, parts optional) into `BORDER_WIDTH`,
+/// `BORDER_STYLE`, and `BORDER_COLOR`. A token is classified as the width if it is a length, the
+/// style if it is a border-style keyword, else the color.
+fn expand_border(decls: &mut Vec<Decl>, parts: &[&str]) {
+    for &tok in parts {
+        if is_length(tok) {
+            push_decl(decls, BORDER_WIDTH, tok);
+        } else if is_border_style(tok) {
+            push_decl(decls, BORDER_STYLE, tok);
+        } else {
+            push_decl(decls, BORDER_COLOR, tok);
+        }
+    }
+}
+
+/// Expand `outline: <width> <style> <color>` into `OUTLINE_WIDTH` + `OUTLINE_COLOR`; the style
+/// token is recognized but ignored for now.
+fn expand_outline(decls: &mut Vec<Decl>, parts: &[&str]) {
+    for &tok in parts {
+        if is_length(tok) {
+            push_decl(decls, OUTLINE_WIDTH, tok);
+        } else if is_border_style(tok) {
+            // style ignored for now
+        } else {
+            push_decl(decls, OUTLINE_COLOR, tok);
+        }
+    }
+}
+
+/// Whether `tok` is one of the recognized border-style keywords (ASCII case-insensitive).
+fn is_border_style(tok: &str) -> bool {
+    matches!(
+        tok.to_ascii_lowercase().as_str(),
+        "none" | "solid" | "dashed" | "dotted" | "double"
+    )
+}
+
+/// Whether `tok` looks like a CSS length: an optional leading `-`, digits with an optional decimal
+/// point, and an optional `px` suffix (a bare number also qualifies). Used by the `border`/
+/// `outline` shorthands to tell a width token apart from a color/style.
+fn is_length(tok: &str) -> bool {
+    let body = tok.strip_suffix("px").unwrap_or(tok);
+    let body = body.strip_prefix('-').unwrap_or(body);
+    !body.is_empty()
+        && body.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && body.bytes().filter(|&b| b == b'.').count() <= 1
+        && body.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Map a CSS property name to its [`canopy_paint`] [`PropId`], or `None` if the
@@ -499,16 +719,71 @@ fn map_property(name: &str) -> Option<PropId> {
         "justify-content" | "justify" => Some(JUSTIFY),
         // Text alignment keyword (left/center/right; passes through verbatim).
         "text-align" => Some(TEXT_ALIGN),
-        // Box model: outer margin + min/max sizing (all px lengths).
+        // Box model: outer margin + min/max sizing (all px lengths). The `margin`/`padding`
+        // shorthands are handled in `expand_shorthand`; the per-side longhands map here.
         "margin" => Some(MARGIN),
+        "margin-top" => Some(MARGIN_TOP),
+        "margin-right" => Some(MARGIN_RIGHT),
+        "margin-bottom" => Some(MARGIN_BOTTOM),
+        "margin-left" => Some(MARGIN_LEFT),
+        "padding-top" => Some(PADDING_TOP),
+        "padding-right" => Some(PADDING_RIGHT),
+        "padding-bottom" => Some(PADDING_BOTTOM),
+        "padding-left" => Some(PADDING_LEFT),
         "min-width" => Some(MIN_WIDTH),
         "min-height" => Some(MIN_HEIGHT),
         "max-width" => Some(MAX_WIDTH),
         "max-height" => Some(MAX_HEIGHT),
-        // Flex grow factor (unitless) + a border frame (width px + color).
+        // Box display / formatting.
+        "display" => Some(DISPLAY),
+        "visibility" => Some(VISIBILITY),
+        "position" => Some(POSITION),
+        // Box-edge offsets: `top`/`right`/`bottom`/`left` (the `inset` shorthand expands to these).
+        "top" => Some(INSET_TOP),
+        "right" => Some(INSET_RIGHT),
+        "bottom" => Some(INSET_BOTTOM),
+        "left" => Some(INSET_LEFT),
+        "z-index" => Some(Z_INDEX),
+        "box-sizing" => Some(BOX_SIZING),
+        "aspect-ratio" => Some(ASPECT_RATIO),
+        "overflow" => Some(OVERFLOW),
+        // Per-axis gaps (the `gap` shorthand expands to these for a two-value form).
+        "row-gap" => Some(ROW_GAP),
+        "column-gap" => Some(COLUMN_GAP),
+        // Flex item / container longhands.
         "flex-grow" => Some(FLEX_GROW),
+        "flex-shrink" => Some(FLEX_SHRINK),
+        "flex-basis" => Some(FLEX_BASIS),
+        "flex-wrap" => Some(FLEX_WRAP),
+        "align-self" => Some(ALIGN_SELF),
+        // Border frame: shorthand width/style/color + per-side widths/colors + per-corner radii.
         "border-width" => Some(BORDER_WIDTH),
         "border-color" => Some(BORDER_COLOR),
+        "border-style" => Some(BORDER_STYLE),
+        "border-top-width" => Some(BORDER_TOP_WIDTH),
+        "border-right-width" => Some(BORDER_RIGHT_WIDTH),
+        "border-bottom-width" => Some(BORDER_BOTTOM_WIDTH),
+        "border-left-width" => Some(BORDER_LEFT_WIDTH),
+        "border-top-color" => Some(BORDER_TOP_COLOR),
+        "border-right-color" => Some(BORDER_RIGHT_COLOR),
+        "border-bottom-color" => Some(BORDER_BOTTOM_COLOR),
+        "border-left-color" => Some(BORDER_LEFT_COLOR),
+        "border-top-left-radius" => Some(BORDER_TOP_LEFT_RADIUS),
+        "border-top-right-radius" => Some(BORDER_TOP_RIGHT_RADIUS),
+        "border-bottom-right-radius" => Some(BORDER_BOTTOM_RIGHT_RADIUS),
+        "border-bottom-left-radius" => Some(BORDER_BOTTOM_LEFT_RADIUS),
+        // Text / font properties.
+        "font-size" => Some(FONT_SIZE),
+        "font-weight" => Some(FONT_WEIGHT),
+        "line-height" => Some(LINE_HEIGHT),
+        "text-decoration" | "text-decoration-line" => Some(TEXT_DECORATION),
+        // Outline (the `outline` shorthand expands to width + color).
+        "outline-width" => Some(OUTLINE_WIDTH),
+        "outline-color" => Some(OUTLINE_COLOR),
+        "outline-offset" => Some(OUTLINE_OFFSET),
+        // Effects passed through verbatim (rendered in a later wave).
+        "box-shadow" => Some(BOX_SHADOW),
+        "background-image" => Some(BACKGROUND_IMAGE),
         _ => None,
     }
 }
@@ -524,77 +799,217 @@ fn map_property(name: &str) -> Option<PropId> {
 /// so a stray `px` is *not* stripped (an authoring slip like `opacity: 0.5px` is left
 /// intact to fail the float parse rather than silently becoming `0.5`).
 fn normalize_value(prop: PropId, value: &str) -> String {
-    // Colors (background / color / border-color): expand to `#rrggbb` so the renderers' hex
-    // `parse_color` accepts named colors, `#rgb`, and `rgb()` too. An unrecognized value is left
-    // verbatim (the renderer then ignores it — e.g. `background: transparent` paints nothing).
-    if prop == BG || prop == FG || prop == BORDER_COLOR {
+    // Colors (background / color / all border colors / outline color): expand to `#rrggbb` (opaque)
+    // or `#rrggbbaa` (alpha < 255) so the renderers' hex `parse_color` accepts named colors, `#rgb`,
+    // `rgba()`, and `transparent` too. An unrecognized value is left verbatim (the renderer then
+    // ignores it).
+    if is_color_prop(prop) {
         return normalize_color(value);
     }
-    let is_length = prop == WIDTH
-        || prop == HEIGHT
-        || prop == GAP
-        || prop == PADDING
-        || prop == RADIUS
-        || prop == TRANSLATE_X
-        || prop == TRANSLATE_Y
-        || prop == MARGIN
-        || prop == MIN_WIDTH
-        || prop == MIN_HEIGHT
-        || prop == MAX_WIDTH
-        || prop == MAX_HEIGHT
-        || prop == BORDER_WIDTH;
-    if is_length {
+    // `font-weight`: fold the `normal`/`bold` keywords to their numeric weights; pass a numeric
+    // value (or anything else) through.
+    if prop == FONT_WEIGHT {
+        if value.eq_ignore_ascii_case("normal") {
+            return "400".to_string();
+        }
+        if value.eq_ignore_ascii_case("bold") {
+            return "700".to_string();
+        }
+        return value.to_string();
+    }
+    // `display`: `block` is the lite alias for `flex` (the only block-ish layout we model); other
+    // values (`flex`, `none`, …) pass through verbatim.
+    if prop == DISPLAY && value.eq_ignore_ascii_case("block") {
+        return "flex".to_string();
+    }
+    // Lengths: strip a trailing `px`, keep a bare number, PRESERVE a leading `-` and a trailing `%`.
+    // The `auto` keyword passes through verbatim (margins / inset / flex-basis). Anything that is
+    // not a recognized length form (a stray keyword) also passes through untouched.
+    if is_length_prop(prop) {
+        if value.eq_ignore_ascii_case("auto") {
+            return value.to_string();
+        }
         if let Some(num) = value.strip_suffix("px") {
             return num.trim().to_string();
         }
     }
+    // Keywords and the verbatim-passthrough props (z-index, flex-shrink, aspect-ratio, box-shadow,
+    // background-image, display:flex|none, position, overflow, …): unchanged.
     value.to_string()
 }
 
-/// Normalize a CSS color to `#rrggbb`: a 6-digit hex passes through, `#rgb` expands, `rgb(r,g,b)`
-/// / `rgb(r g b)` converts, and a CSS named color maps via a small table. An unrecognized value is
-/// returned verbatim so the renderer's `parse_color` simply rejects it (no paint).
+/// Whether `prop` carries a color value (and so must round-trip through [`normalize_color`]).
+fn is_color_prop(prop: PropId) -> bool {
+    prop == BG
+        || prop == FG
+        || prop == BORDER_COLOR
+        || prop == BORDER_TOP_COLOR
+        || prop == BORDER_RIGHT_COLOR
+        || prop == BORDER_BOTTOM_COLOR
+        || prop == BORDER_LEFT_COLOR
+        || prop == OUTLINE_COLOR
+}
+
+/// Whether `prop` carries a CSS **length** (a `px`-strippable number that may keep a leading `-`,
+/// a trailing `%`, or be the `auto` keyword). Excludes the unitless props (opacity, flex-grow,
+/// flex-shrink, z-index, aspect-ratio) and the keyword props.
+fn is_length_prop(prop: PropId) -> bool {
+    prop == WIDTH
+        || prop == HEIGHT
+        || prop == GAP
+        || prop == ROW_GAP
+        || prop == COLUMN_GAP
+        || prop == PADDING
+        || prop == PADDING_TOP
+        || prop == PADDING_RIGHT
+        || prop == PADDING_BOTTOM
+        || prop == PADDING_LEFT
+        || prop == RADIUS
+        || prop == TRANSLATE_X
+        || prop == TRANSLATE_Y
+        || prop == MARGIN
+        || prop == MARGIN_TOP
+        || prop == MARGIN_RIGHT
+        || prop == MARGIN_BOTTOM
+        || prop == MARGIN_LEFT
+        || prop == INSET_TOP
+        || prop == INSET_RIGHT
+        || prop == INSET_BOTTOM
+        || prop == INSET_LEFT
+        || prop == MIN_WIDTH
+        || prop == MIN_HEIGHT
+        || prop == MAX_WIDTH
+        || prop == MAX_HEIGHT
+        || prop == FLEX_BASIS
+        || prop == FONT_SIZE
+        || prop == LINE_HEIGHT
+        || prop == BORDER_WIDTH
+        || prop == BORDER_TOP_WIDTH
+        || prop == BORDER_RIGHT_WIDTH
+        || prop == BORDER_BOTTOM_WIDTH
+        || prop == BORDER_LEFT_WIDTH
+        || prop == BORDER_TOP_LEFT_RADIUS
+        || prop == BORDER_TOP_RIGHT_RADIUS
+        || prop == BORDER_BOTTOM_RIGHT_RADIUS
+        || prop == BORDER_BOTTOM_LEFT_RADIUS
+        || prop == OUTLINE_WIDTH
+        || prop == OUTLINE_OFFSET
+}
+
+/// Normalize a CSS color: a 6-digit hex passes through, `#rgb`/`#rgba` expand, `#rrggbbaa` passes
+/// through, `rgb(r,g,b)` / `rgb(r g b)` and `rgba(r,g,b,a)` convert, and a CSS named color maps via
+/// a small table. The output is `#rrggbb` when the color is opaque (alpha 255) and `#rrggbbaa` when
+/// alpha < 255 — so existing opaque colors stay byte-stable. An unrecognized value is returned
+/// verbatim so the renderer's `parse_color` simply rejects it (no paint).
 fn normalize_color(value: &str) -> String {
     let value = value.trim();
     if let Some(hex) = value.strip_prefix('#') {
+        // `#rrggbb`: passes through unchanged (opaque).
         if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return value.to_string();
         }
+        // `#rrggbbaa`: an opaque alpha (`ff`) collapses to the 6-digit form for byte-stability;
+        // otherwise it passes through verbatim.
+        if hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if hex[6..8].eq_ignore_ascii_case("ff") {
+                let mut out = String::with_capacity(7);
+                out.push('#');
+                out.push_str(&hex[..6]);
+                return out;
+            }
+            return value.to_string();
+        }
+        // `#rgb` -> `#rrggbb` (each nibble doubled).
         if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             let mut out = String::with_capacity(7);
             out.push('#');
             for ch in hex.chars() {
-                out.push(ch); // `#abc` -> `#aabbcc`: each nibble doubled
+                out.push(ch);
+                out.push(ch);
+            }
+            return out;
+        }
+        // `#rgba` -> `#rrggbbaa` (each nibble doubled); an opaque `f` alpha collapses to `#rrggbb`.
+        if hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let alpha_nibble = hex.as_bytes()[3];
+            let opaque = alpha_nibble == b'f' || alpha_nibble == b'F';
+            let rgb = if opaque { &hex[..3] } else { hex };
+            let mut out = String::with_capacity(if opaque { 7 } else { 9 });
+            out.push('#');
+            for ch in rgb.chars() {
+                out.push(ch);
                 out.push(ch);
             }
             return out;
         }
     }
     if let Some(inner) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        let mut chans = inner
-            .split([',', ' ', '/'])
-            .filter(|p| !p.trim().is_empty());
-        if let (Some(r), Some(g), Some(b), None) =
-            (chans.next(), chans.next(), chans.next(), chans.next())
-        {
-            if let (Ok(r), Ok(g), Ok(b)) = (
-                r.trim().parse::<u8>(),
-                g.trim().parse::<u8>(),
-                b.trim().parse::<u8>(),
-            ) {
-                let mut out = String::with_capacity(7);
-                out.push('#');
-                push_hex_byte(&mut out, r);
-                push_hex_byte(&mut out, g);
-                push_hex_byte(&mut out, b);
-                return out;
-            }
+        if let Some((r, g, b)) = parse_rgb_channels(inner) {
+            return rgba_hex(r, g, b, 255);
+        }
+    }
+    if let Some(inner) = value
+        .strip_prefix("rgba(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        if let Some((r, g, b, a)) = parse_rgba_channels(inner) {
+            return rgba_hex(r, g, b, a);
         }
     }
     if let Some(hex) = named_color(value) {
         return hex.to_string();
     }
     value.to_string()
+}
+
+/// Parse the three `r,g,b` channels of an `rgb(...)` body (comma- or space-separated), each a
+/// `u8`; `None` if there are not exactly three valid channels.
+fn parse_rgb_channels(inner: &str) -> Option<(u8, u8, u8)> {
+    let mut chans = inner
+        .split([',', ' ', '/'])
+        .filter(|p| !p.trim().is_empty());
+    match (chans.next(), chans.next(), chans.next(), chans.next()) {
+        (Some(r), Some(g), Some(b), None) => Some((
+            r.trim().parse::<u8>().ok()?,
+            g.trim().parse::<u8>().ok()?,
+            b.trim().parse::<u8>().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+/// Parse the four channels of an `rgba(...)` body: `r,g,b` as `u8`, and the alpha as a `0..=1`
+/// float (per CSS), folded to a `0..=255` byte. `None` if malformed.
+fn parse_rgba_channels(inner: &str) -> Option<(u8, u8, u8, u8)> {
+    let mut chans = inner
+        .split([',', ' ', '/'])
+        .filter(|p| !p.trim().is_empty());
+    let (r, g, b, a) = (chans.next()?, chans.next()?, chans.next()?, chans.next()?);
+    if chans.next().is_some() {
+        return None; // too many channels
+    }
+    let r = r.trim().parse::<u8>().ok()?;
+    let g = g.trim().parse::<u8>().ok()?;
+    let b = b.trim().parse::<u8>().ok()?;
+    let alpha = a.trim().parse::<f32>().ok()?;
+    // Clamp to [0, 1] and round to the nearest byte (0.0 -> 0, 1.0 -> 255).
+    let alpha = alpha.clamp(0.0, 1.0);
+    let a = (alpha * 255.0 + 0.5) as u8;
+    Some((r, g, b, a))
+}
+
+/// Format an RGBA color as `#rrggbb` when opaque (`a == 255`) or `#rrggbbaa` otherwise, building
+/// the hex by hand (no `format!`, to stay `no_std`-clean).
+fn rgba_hex(r: u8, g: u8, b: u8, a: u8) -> String {
+    let mut out = String::with_capacity(if a == 255 { 7 } else { 9 });
+    out.push('#');
+    push_hex_byte(&mut out, r);
+    push_hex_byte(&mut out, g);
+    push_hex_byte(&mut out, b);
+    if a != 255 {
+        push_hex_byte(&mut out, a);
+    }
+    out
 }
 
 /// Append `byte` as two lowercase hex digits (no `format!`, to stay `no_std`-clean).
@@ -604,9 +1019,9 @@ fn push_hex_byte(out: &mut String, byte: u8) {
     out.push(HEX[(byte & 0x0f) as usize] as char);
 }
 
-/// Map a CSS named color (case-insensitive) to its `#rrggbb` hex. The 16 HTML basic colors plus a
-/// handful of common extras. `transparent` is intentionally absent — the lite `#rrggbb` color has
-/// no alpha, so it falls through to verbatim and paints nothing (the right result for a background).
+/// Map a CSS named color (case-insensitive) to its hex. The 16 HTML basic colors plus a handful of
+/// common extras, and `transparent` -> `#00000000` (fully transparent black) now that the lite
+/// color carries an alpha channel via the `#rrggbbaa` form.
 fn named_color(name: &str) -> Option<&'static str> {
     // ASCII-lowercase compare without allocating.
     let eq = |kw: &str| {
@@ -640,6 +1055,7 @@ fn named_color(name: &str) -> Option<&'static str> {
         ("pink", "#ffc0cb"),
         ("brown", "#a52a2a"),
         ("gold", "#ffd700"),
+        ("transparent", "#00000000"),
     ];
     table.iter().find(|(kw, _)| eq(kw)).map(|(_, hex)| *hex)
 }
@@ -800,10 +1216,9 @@ mod tests {
 
     #[test]
     fn unknown_property_is_ignored() {
-        let sheet = parse(".x { background: #fff; border: 1px; outline: none }");
-        // Only `background` maps; the `border` shorthand and `outline` are outside this subset
-        // and skipped (`border-width`/`border-color` ARE mapped, but the `border` shorthand is
-        // not). The `#fff` value is normalized to the 6-digit `#ffffff` form.
+        let sheet = parse(".x { background: #fff; -webkit-foo: 1px; zoom: 2 }");
+        // `background` maps and `#fff` normalizes to the 6-digit `#ffffff`; the two unsupported
+        // property names (`-webkit-foo`, `zoom`) are silently skipped.
         assert_eq!(sheet.declarations("x"), &[(BG, "#ffffff".to_string())]);
     }
 
@@ -1180,6 +1595,402 @@ mod tests {
         assert!(decls.contains(&(MAX_WIDTH, "200".to_string())));
         assert!(decls.contains(&(FLEX_GROW, "1".to_string())));
         assert!(decls.contains(&(BORDER_WIDTH, "2".to_string())));
+    }
+
+    // --- Shorthand + per-side expansion ------------------------------------
+
+    /// Look up the value a declaration set carries for `prop` (`None` if absent).
+    fn val(decls: &[Decl], prop: PropId) -> Option<&str> {
+        decls
+            .iter()
+            .find(|(p, _)| *p == prop)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn margin_one_value_keeps_uniform_margin() {
+        // The single-value form keeps the historical uniform MARGIN PropId unchanged.
+        let sheet = parse(".a { margin: 8px }");
+        assert_eq!(sheet.declarations("a"), &[(MARGIN, "8".to_string())]);
+    }
+
+    #[test]
+    fn margin_two_values_expand_top_bottom_and_right_left() {
+        // `margin: a b` -> top=bottom=a, right=left=b.
+        let sheet = parse(".a { margin: 8 16 }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, MARGIN_TOP), Some("8"));
+        assert_eq!(val(d, MARGIN_BOTTOM), Some("8"));
+        assert_eq!(val(d, MARGIN_RIGHT), Some("16"));
+        assert_eq!(val(d, MARGIN_LEFT), Some("16"));
+        assert_eq!(
+            val(d, MARGIN),
+            None,
+            "uniform MARGIN not emitted for multi-value"
+        );
+    }
+
+    #[test]
+    fn margin_three_values_expand_top_sides_bottom() {
+        // `margin: a b c` -> top=a, right=left=b, bottom=c.
+        let sheet = parse(".a { margin: 1px 2px 3px }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, MARGIN_TOP), Some("1"));
+        assert_eq!(val(d, MARGIN_RIGHT), Some("2"));
+        assert_eq!(val(d, MARGIN_LEFT), Some("2"));
+        assert_eq!(val(d, MARGIN_BOTTOM), Some("3"));
+    }
+
+    #[test]
+    fn margin_four_values_expand_each_side_clockwise() {
+        // `margin: a b c d` -> top, right, bottom, left (clockwise).
+        let sheet = parse(".a { margin: 1 2 3 4 }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, MARGIN_TOP), Some("1"));
+        assert_eq!(val(d, MARGIN_RIGHT), Some("2"));
+        assert_eq!(val(d, MARGIN_BOTTOM), Some("3"));
+        assert_eq!(val(d, MARGIN_LEFT), Some("4"));
+    }
+
+    #[test]
+    fn padding_shorthand_expands_per_side() {
+        // Single value keeps uniform PADDING; multi-value expands to the per-side longhands.
+        let one = parse(".a { padding: 5px }");
+        assert_eq!(one.declarations("a"), &[(PADDING, "5".to_string())]);
+        let two = parse(".b { padding: 4 8 }");
+        let d = two.declarations("b");
+        assert_eq!(val(d, PADDING_TOP), Some("4"));
+        assert_eq!(val(d, PADDING_BOTTOM), Some("4"));
+        assert_eq!(val(d, PADDING_RIGHT), Some("8"));
+        assert_eq!(val(d, PADDING_LEFT), Some("8"));
+    }
+
+    #[test]
+    fn inset_shorthand_sets_all_four_sides_even_for_one_value() {
+        // `inset` has no uniform PropId, so even a single value sets all four INSET_* sides.
+        let sheet = parse(".a { inset: 0 }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, INSET_TOP), Some("0"));
+        assert_eq!(val(d, INSET_RIGHT), Some("0"));
+        assert_eq!(val(d, INSET_BOTTOM), Some("0"));
+        assert_eq!(val(d, INSET_LEFT), Some("0"));
+    }
+
+    #[test]
+    fn top_right_bottom_left_map_to_inset_sides() {
+        let sheet = parse(".a { top: 1px; right: 2px; bottom: 3px; left: 4px }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, INSET_TOP), Some("1"));
+        assert_eq!(val(d, INSET_RIGHT), Some("2"));
+        assert_eq!(val(d, INSET_BOTTOM), Some("3"));
+        assert_eq!(val(d, INSET_LEFT), Some("4"));
+    }
+
+    #[test]
+    fn gap_one_value_uniform_two_values_split_axes() {
+        let one = parse(".a { gap: 8px }");
+        assert_eq!(one.declarations("a"), &[(GAP, "8".to_string())]);
+        let two = parse(".b { gap: 4 12 }");
+        let d = two.declarations("b");
+        assert_eq!(val(d, ROW_GAP), Some("4"));
+        assert_eq!(val(d, COLUMN_GAP), Some("12"));
+        assert_eq!(val(d, GAP), None);
+    }
+
+    #[test]
+    fn border_shorthand_splits_width_style_color_any_order() {
+        let sheet = parse(".a { border: 2px solid red } .b { border: red dashed 3 }");
+        let a = sheet.declarations("a");
+        assert_eq!(val(a, BORDER_WIDTH), Some("2"));
+        assert_eq!(val(a, BORDER_STYLE), Some("solid"));
+        assert_eq!(val(a, BORDER_COLOR), Some("#ff0000"));
+        // Order-tolerant: color first, then style, then width.
+        let b = sheet.declarations("b");
+        assert_eq!(val(b, BORDER_WIDTH), Some("3"));
+        assert_eq!(val(b, BORDER_STYLE), Some("dashed"));
+        assert_eq!(val(b, BORDER_COLOR), Some("#ff0000"));
+    }
+
+    #[test]
+    fn flex_shorthand_grow_shrink_basis() {
+        let g = parse(".a { flex: 1 }");
+        assert_eq!(g.declarations("a"), &[(FLEX_GROW, "1".to_string())]);
+        let gs = parse(".b { flex: 1 0 }");
+        let d = gs.declarations("b");
+        assert_eq!(val(d, FLEX_GROW), Some("1"));
+        assert_eq!(val(d, FLEX_SHRINK), Some("0"));
+        let gsb = parse(".c { flex: 1 0 auto }");
+        let d = gsb.declarations("c");
+        assert_eq!(val(d, FLEX_GROW), Some("1"));
+        assert_eq!(val(d, FLEX_SHRINK), Some("0"));
+        assert_eq!(
+            val(d, FLEX_BASIS),
+            Some("auto"),
+            "auto basis passes through"
+        );
+    }
+
+    #[test]
+    fn outline_shorthand_keeps_width_and_color_ignores_style() {
+        let sheet = parse(".a { outline: 1px solid blue }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, OUTLINE_WIDTH), Some("1"));
+        assert_eq!(val(d, OUTLINE_COLOR), Some("#0000ff"));
+        // The `solid` style token is recognized but not mapped to a PropId for now.
+        assert_eq!(d.len(), 2, "only width + color, no style decl");
+    }
+
+    // --- Color: alpha + transparent ----------------------------------------
+
+    #[test]
+    fn rgba_normalizes_to_rrggbbaa() {
+        // alpha 0.5 -> 128 (0x80); opaque alpha 1 collapses to #rrggbb.
+        let sheet = parse(".a { color: rgba(255, 0, 0, 0.5) } .b { color: rgba(0,0,255,1) }");
+        assert_eq!(sheet.declarations("a"), &[(FG, "#ff000080".to_string())]);
+        assert_eq!(sheet.declarations("b"), &[(FG, "#0000ff".to_string())]);
+    }
+
+    #[test]
+    fn short_hex_with_alpha_expands() {
+        // `#rgba` -> `#rrggbbaa`; an opaque `f` alpha collapses to `#rrggbb`.
+        let sheet = parse(".a { background: #f008 } .b { background: #0f0f }");
+        assert_eq!(sheet.declarations("a"), &[(BG, "#ff000088".to_string())]);
+        assert_eq!(sheet.declarations("b"), &[(BG, "#00ff00".to_string())]);
+    }
+
+    #[test]
+    fn eight_digit_hex_passes_through_and_opaque_collapses() {
+        let sheet = parse(".a { background: #11223344 } .b { background: #112233ff }");
+        assert_eq!(sheet.declarations("a"), &[(BG, "#11223344".to_string())]);
+        assert_eq!(sheet.declarations("b"), &[(BG, "#112233".to_string())]);
+    }
+
+    #[test]
+    fn transparent_normalizes_to_fully_transparent_black() {
+        let sheet = parse(".a { background: transparent }");
+        assert_eq!(sheet.declarations("a"), &[(BG, "#00000000".to_string())]);
+    }
+
+    #[test]
+    fn opaque_colors_stay_byte_stable() {
+        // The opaque normalization path must not change: 6-digit, #rgb, rgb(), and named all fold
+        // to the same `#rrggbb` form they always did.
+        let sheet = parse(
+            ".a { background: #313244 } .b { color: #0f0 } .c { border-color: rgb(0,0,255) } .d { background: navy }",
+        );
+        assert_eq!(sheet.declarations("a"), &[(BG, "#313244".to_string())]);
+        assert_eq!(sheet.declarations("b"), &[(FG, "#00ff00".to_string())]);
+        assert_eq!(
+            sheet.declarations("c"),
+            &[(BORDER_COLOR, "#0000ff".to_string())]
+        );
+        assert_eq!(sheet.declarations("d"), &[(BG, "#000080".to_string())]);
+    }
+
+    // --- Robustness: !important / inherit ----------------------------------
+
+    #[test]
+    fn important_is_stripped_not_dropped() {
+        // `!important` must not drop the declaration; the value resolves normally.
+        let sheet = parse(".a { color: red !important; padding: 8px !important }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, FG), Some("#ff0000"));
+        assert_eq!(val(d, PADDING), Some("8"));
+    }
+
+    #[test]
+    fn css_wide_keywords_drop_their_declaration_cleanly() {
+        // inherit/initial/unset have no lite semantics yet: each drops its own declaration, leaving
+        // the sibling declarations intact (and never feeding a bogus value into a color/number parse).
+        let sheet =
+            parse(".a { color: inherit; background: #111111; padding: initial; gap: unset }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, FG), None, "inherit dropped");
+        assert_eq!(val(d, PADDING), None, "initial dropped");
+        assert_eq!(val(d, GAP), None, "unset dropped");
+        assert_eq!(val(d, BG), Some("#111111"), "sibling declaration survives");
+    }
+
+    // --- Specificity overflow + case-insensitivity -------------------------
+
+    #[test]
+    fn specificity_does_not_overflow_at_eleven_classes() {
+        // 11 classes (b=11) must still lose to a single id (a=1). The old packed `a*100 + b*10`
+        // would score the 11-class rule at 110, tying/beating the id at 100 and mis-ordering the
+        // cascade; the (a, b, c) tuple keeps `id > any number of classes`.
+        let many = ".c1.c2.c3.c4.c5.c6.c7.c8.c9.c10.c11 { background:#222222 }";
+        let one_id = "#x { background:#111111 }";
+        let mut css = String::new();
+        css.push_str(many);
+        css.push(' ');
+        css.push_str(one_id);
+        let sheet = parse(&css);
+        let target = MatchTarget {
+            type_name: None,
+            id: Some("x"),
+            classes: &[
+                "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
+            ],
+        };
+        // The id rule wins despite appearing later and having far fewer simple selectors.
+        assert_eq!(
+            sheet.resolve_for(&target, false),
+            vec![(BG, "#111111".to_string())]
+        );
+    }
+
+    #[test]
+    fn type_name_match_is_ascii_case_insensitive() {
+        // A `BUTTON` selector matches a `<button>` element (HTML tag names are case-insensitive).
+        let sheet = parse("BUTTON { background:#abcdef }");
+        let target = MatchTarget {
+            type_name: Some("button"),
+            id: None,
+            classes: &[],
+        };
+        assert_eq!(
+            sheet.resolve_for(&target, false),
+            vec![(BG, "#abcdef".to_string())]
+        );
+    }
+
+    #[test]
+    fn class_match_stays_case_sensitive() {
+        // Classes remain case-sensitive per CSS: `.Btn` does not match the `btn` class.
+        let sheet = parse(".Btn { background:#abcdef }");
+        let target = MatchTarget {
+            type_name: None,
+            id: None,
+            classes: &["btn"],
+        };
+        assert!(sheet.resolve_for(&target, false).is_empty());
+    }
+
+    #[test]
+    fn hover_pseudo_is_case_insensitive() {
+        let sheet = parse(".btn:HOVER { background:#585b70 }");
+        assert_eq!(
+            sheet.resolve(&["btn"], true),
+            vec![(BG, "#585b70".to_string())]
+        );
+        assert!(sheet.resolve(&["btn"], false).is_empty(), "base unaffected");
+    }
+
+    // --- New keyword + numeric props ---------------------------------------
+
+    #[test]
+    fn display_none_and_block_alias_to_flex() {
+        let none = parse(".a { display: none }");
+        assert_eq!(none.declarations("a"), &[(DISPLAY, "none".to_string())]);
+        // `block` is the lite alias for `flex`.
+        let block = parse(".b { display: block }");
+        assert_eq!(block.declarations("b"), &[(DISPLAY, "flex".to_string())]);
+        let flex = parse(".c { display: flex }");
+        assert_eq!(flex.declarations("c"), &[(DISPLAY, "flex".to_string())]);
+    }
+
+    #[test]
+    fn position_and_visibility_and_overflow_pass_through() {
+        let sheet = parse(".a { position: absolute; visibility: hidden; overflow: scroll }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, POSITION), Some("absolute"));
+        assert_eq!(val(d, VISIBILITY), Some("hidden"));
+        assert_eq!(val(d, OVERFLOW), Some("scroll"));
+    }
+
+    #[test]
+    fn flex_wrap_and_align_self_and_box_sizing_pass_through() {
+        let sheet =
+            parse(".a { flex-wrap: wrap-reverse; align-self: center; box-sizing: border-box }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, FLEX_WRAP), Some("wrap-reverse"));
+        assert_eq!(val(d, ALIGN_SELF), Some("center"));
+        assert_eq!(val(d, BOX_SIZING), Some("border-box"));
+    }
+
+    #[test]
+    fn font_weight_keywords_fold_to_numbers() {
+        let sheet =
+            parse(".a { font-weight: bold } .b { font-weight: normal } .c { font-weight: 600 }");
+        assert_eq!(sheet.declarations("a"), &[(FONT_WEIGHT, "700".to_string())]);
+        assert_eq!(sheet.declarations("b"), &[(FONT_WEIGHT, "400".to_string())]);
+        assert_eq!(sheet.declarations("c"), &[(FONT_WEIGHT, "600".to_string())]);
+    }
+
+    #[test]
+    fn font_and_text_length_props_strip_px() {
+        let sheet = parse(".a { font-size: 14px; line-height: 20px; flex-basis: 120px }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, FONT_SIZE), Some("14"));
+        assert_eq!(val(d, LINE_HEIGHT), Some("20"));
+        assert_eq!(val(d, FLEX_BASIS), Some("120"));
+    }
+
+    #[test]
+    fn flex_basis_percent_and_auto_round_trip() {
+        let pct = parse(".a { flex-basis: 50% }");
+        assert_eq!(pct.declarations("a"), &[(FLEX_BASIS, "50%".to_string())]);
+        let auto = parse(".b { flex-basis: auto }");
+        assert_eq!(auto.declarations("b"), &[(FLEX_BASIS, "auto".to_string())]);
+    }
+
+    #[test]
+    fn negative_inset_and_outline_offset_preserve_sign() {
+        let sheet = parse(".a { top: -4px; outline-offset: -2px; margin-left: -8 }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, INSET_TOP), Some("-4"));
+        assert_eq!(val(d, OUTLINE_OFFSET), Some("-2"));
+        assert_eq!(val(d, MARGIN_LEFT), Some("-8"));
+    }
+
+    #[test]
+    fn unitless_props_pass_through() {
+        let sheet = parse(".a { z-index: 10; flex-shrink: 0; aspect-ratio: 16/9 }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, Z_INDEX), Some("10"));
+        assert_eq!(val(d, FLEX_SHRINK), Some("0"));
+        assert_eq!(val(d, ASPECT_RATIO), Some("16/9"));
+    }
+
+    #[test]
+    fn box_shadow_and_background_image_pass_through_verbatim() {
+        let sheet = parse(
+            ".a { box-shadow: 0 2px 4px rgba(0,0,0,0.3) } .b { background-image: linear-gradient(red, blue) }",
+        );
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(BOX_SHADOW, "0 2px 4px rgba(0,0,0,0.3)".to_string())]
+        );
+        assert_eq!(
+            sheet.declarations("b"),
+            &[(BACKGROUND_IMAGE, "linear-gradient(red, blue)".to_string())]
+        );
+    }
+
+    #[test]
+    fn border_style_and_per_side_and_radius_longhands_map() {
+        let sheet = parse(
+            ".a { border-style: dotted; border-top-width: 2px; border-left-color: red; border-top-left-radius: 6px }",
+        );
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, BORDER_STYLE), Some("dotted"));
+        assert_eq!(val(d, BORDER_TOP_WIDTH), Some("2"));
+        assert_eq!(val(d, BORDER_LEFT_COLOR), Some("#ff0000"));
+        assert_eq!(val(d, BORDER_TOP_LEFT_RADIUS), Some("6"));
+    }
+
+    #[test]
+    fn text_decoration_aliases_and_keyword_passthrough() {
+        let a = parse(".a { text-decoration: underline }");
+        assert_eq!(
+            a.declarations("a"),
+            &[(TEXT_DECORATION, "underline".to_string())]
+        );
+        let b = parse(".b { text-decoration-line: line-through }");
+        assert_eq!(
+            b.declarations("b"),
+            &[(TEXT_DECORATION, "line-through".to_string())]
+        );
     }
 
     #[test]

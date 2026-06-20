@@ -66,6 +66,8 @@
 //! (`[lints] workspace = true`), so only the FFI seam itself is unsafe.
 #![allow(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use canopy_dom::{Dom, ROOT};
 use canopy_protocol::{AttrId, EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
@@ -172,30 +174,18 @@ impl CanopyHost {
         let mut dom = self.dom.clone();
         // Collect (node, prop, value) first so the immutable walk doesn't overlap the mutation.
         let mut overlay: Vec<(NodeId, PropId, String)> = Vec::new();
-        let mut stack: Vec<NodeId> = dom.children(ROOT).to_vec();
-        while let Some(node) = stack.pop() {
-            let Some(n) = dom.node(node) else { continue };
-            // Match the full lite selector model (type / id / class / compound, with specificity)
-            // against this node's identity. Skip bare text nodes: they aren't elements, so only an
-            // element-ish node (a tag, a declared name, classes, or an id) participates in matching.
-            let id = n.attrs.get(&AttrId::ID).map(String::as_str);
-            let type_name = element_type_name(n);
-            if type_name.is_some() || id.is_some() || !n.classes.is_empty() {
-                let classes: Vec<&str> = n.classes.iter().map(String::as_str).collect();
-                let target = MatchTarget {
-                    type_name,
-                    id,
-                    classes: &classes,
-                };
-                for (prop, value) in sheet.resolve_for(&target, hover_path.contains(&node)) {
-                    // Author inline styles win over class rules (CSS specificity: inline beats
-                    // a class selector), so only fold in a property the node didn't set itself.
-                    if !n.styles.contains_key(&prop) {
-                        overlay.push((node, prop, value));
-                    }
-                }
-            }
-            stack.extend(n.children.iter().copied());
+        // Ordered top-down traversal (parent before its children) carrying the inherited-property
+        // map down the tree, so a child can take its parent's resolved value for any inherited prop.
+        // The root's children start from an empty map (no Dom-root defaults to seed).
+        for &child in dom.children(ROOT) {
+            collect_cascade(
+                &dom,
+                sheet,
+                &hover_path,
+                child,
+                &BTreeMap::new(),
+                &mut overlay,
+            );
         }
         for (node, prop, value) in overlay {
             dom.set_inline_style(node, prop, value);
@@ -403,6 +393,83 @@ fn element_type_name(node: &canopy_dom::Node) -> Option<&str> {
         4 => "input",
         _ => return None,
     })
+}
+
+/// Walk `node`'s subtree top-down (parent before children), folding the lite cascade into
+/// `overlay` and threading inherited properties down through `inherited`.
+///
+/// For each node, in CSS source order of weakening strength:
+/// 1. compute its **own resolved styles** = its author-inline styles ([`canopy_dom::Node::styles`])
+///    plus the matched-rule decls from [`Stylesheet::resolve_for`] it doesn't already set
+///    (author inline wins over matched rules);
+/// 2. for every prop in the incoming `inherited` map the node does **not** resolve itself, push it
+///    onto the overlay — the node inherits the parent's value (inheritance is the weakest source,
+///    so it only fills what nothing else set);
+/// 3. build the inherited map for **this** node's children: the incoming map overlaid with this
+///    node's own resolved values for inherited props (per [`canopy_paint::is_inherited`]);
+/// 4. recurse into the children with that map.
+///
+/// This runs over an immutable clone so the collected `overlay` can be applied mutably afterwards
+/// without overlapping the walk (the caller's two-phase split).
+fn collect_cascade(
+    dom: &Dom,
+    sheet: &Stylesheet,
+    hover_path: &[NodeId],
+    node: NodeId,
+    inherited: &BTreeMap<PropId, String>,
+    overlay: &mut Vec<(NodeId, PropId, String)>,
+) {
+    let Some(n) = dom.node(node) else { return };
+
+    // (1) The node's own resolved styles: author inline first, then matched-rule decls it didn't
+    // set itself. Keyed by PropId so a child can look up "did I resolve this myself?" in step (2).
+    let mut own: BTreeMap<PropId, String> = n.styles.clone();
+    // Match the full lite selector model (type / id / class / compound, with specificity) against
+    // this node's identity. Skip bare text nodes: they aren't elements, so only an element-ish node
+    // (a tag, a declared name, classes, or an id) participates in matching.
+    let id = n.attrs.get(&AttrId::ID).map(String::as_str);
+    let type_name = element_type_name(n);
+    if type_name.is_some() || id.is_some() || !n.classes.is_empty() {
+        let classes: Vec<&str> = n.classes.iter().map(String::as_str).collect();
+        let target = MatchTarget {
+            type_name,
+            id,
+            classes: &classes,
+        };
+        for (prop, value) in sheet.resolve_for(&target, hover_path.contains(&node)) {
+            // Author inline styles win over class rules (CSS specificity: inline beats a class
+            // selector), so only fold in a property the node didn't set itself. The matched-rule
+            // value is overlaid onto the live tree below; record it in `own` too so it shadows any
+            // inherited value of the same prop and propagates to this node's children.
+            if !n.styles.contains_key(&prop) {
+                overlay.push((node, prop, value.clone()));
+                own.insert(prop, value);
+            }
+        }
+    }
+
+    // (2) Inherit: for every inherited prop the node does not resolve itself, take the parent's
+    // value. Inheritance is the weakest source — it only fills what neither inline nor a matched
+    // rule set (both already live in `own`).
+    for (prop, value) in inherited {
+        if !own.contains_key(prop) {
+            overlay.push((node, *prop, value.clone()));
+        }
+    }
+
+    // (3) The inherited map to pass to THIS node's children: the incoming map overlaid with this
+    // node's own resolved values for the props that inherit (per `canopy_paint::is_inherited`).
+    let mut child_inherited = inherited.clone();
+    for (prop, value) in &own {
+        if canopy_paint::is_inherited(*prop) {
+            child_inherited.insert(*prop, value.clone());
+        }
+    }
+
+    // (4) Recurse, processing each child after this parent (top-down order).
+    for &child in &n.children {
+        collect_cascade(dom, sheet, hover_path, child, &child_inherited, overlay);
+    }
 }
 
 /// Render one node and its subtree into `out` (see [`CanopyHost::debug_snapshot`]).
@@ -1251,6 +1318,221 @@ mod tests {
         );
         // The div is NOT a button, so it never picked up the button rule.
         assert_eq!(prop(&styled, div, BG), Some("#000080"), "div bg unchanged");
+    }
+
+    #[test]
+    fn end_to_end_two_value_padding_shorthand_offsets_a_child() {
+        // Full-stack proof that the streams compose: the CSS-lite parser expands the
+        // `padding: 20 40` shorthand to per-side longhands (parser), the host folds them in
+        // (cascade), Taffy lays the child out inside the asymmetric padding box (layout), and
+        // the software rasterizer paints it (render). The child must land at (left=40, top=20).
+        let mut e = Emitter::new();
+        let outer = e.create_element(ElementTag::new(1)); // div#box
+        e.append(ROOT, outer);
+        e.set_attribute(outer, AttrId::ID, "box");
+        let inner = e.create_element(ElementTag::new(1)); // div.inner
+        e.append(outer, inner);
+        e.set_class(inner, "inner");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_viewport(100.0, 100.0);
+        host.set_stylesheet(
+            "#box { width: 100; height: 100; background: #000080; padding: 20 40 } \
+             .inner { width: 20; height: 20; background: #ff0000 }",
+        );
+
+        let buf = host.render_rgba(100, 100);
+        let at = |x: usize, y: usize| {
+            let i = (y * 100 + x) * 4;
+            (buf[i], buf[i + 1], buf[i + 2])
+        };
+        let is_red = |c: (u8, u8, u8)| c.0 > 200 && c.1 < 80 && c.2 < 80;
+        let is_navy = |c: (u8, u8, u8)| c.0 < 80 && c.1 < 80 && c.2 > 100;
+
+        // Inner box occupies x in [40,60), y in [20,40) — inside the 40px-left / 20px-top padding.
+        assert!(
+            is_red(at(50, 30)),
+            "child sits at the asymmetric padding offset"
+        );
+        // Left of the 40px left padding is still the navy container, not the child.
+        assert!(is_navy(at(20, 30)), "left padding band is the container");
+        // Above the 20px top padding is the container too.
+        assert!(is_navy(at(50, 8)), "top padding band is the container");
+    }
+
+    /// Read a node's resolved value for `p` out of a styled (cascaded) clone.
+    fn styled_prop(dom: &Dom, node: NodeId, p: PropId) -> Option<String> {
+        dom.node(node).and_then(|n| n.styles.get(&p)).cloned()
+    }
+
+    #[test]
+    fn an_inherited_prop_flows_from_parent_to_a_child_with_no_value() {
+        use canopy_paint::FG;
+        // <div color:via-rule> with a text child that has NO color of its own. After the cascade
+        // the child's resolved FG (color) equals the parent's — real CSS inheritance.
+        let mut e = Emitter::new();
+        let div = e.create_element(ElementTag::new(1));
+        e.append(ROOT, div);
+        e.set_class(div, "box");
+        let label = e.create_text("hi");
+        e.append(div, label);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".box { color: #112233 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, div, FG).as_deref(),
+            Some("#112233"),
+            "the div resolves color from its class rule"
+        );
+        assert_eq!(
+            styled_prop(&styled, label, FG).as_deref(),
+            Some("#112233"),
+            "the text child inherits the parent's color (it set none of its own)"
+        );
+    }
+
+    #[test]
+    fn inheritance_works_from_an_inline_parent_color_too() {
+        use canopy_paint::FG;
+        // The parent sets color *inline* (not via a rule). The child with no color still inherits it,
+        // proving inheritance threads a node's OWN resolved styles (inline included), not just rules.
+        let mut e = Emitter::new();
+        let div = e.create_element(ElementTag::new(1));
+        e.append(ROOT, div);
+        e.set_inline_style(div, FG, "#abcdef");
+        let inner = e.create_element(ElementTag::new(1));
+        e.append(div, inner);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        // A stylesheet must be set for styled_dom to run; an empty rule body is fine.
+        host.set_stylesheet(".noop { width: 1 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, inner, FG).as_deref(),
+            Some("#abcdef"),
+            "the child inherits the parent's inline color"
+        );
+    }
+
+    #[test]
+    fn a_child_rule_overrides_the_inherited_value() {
+        use canopy_paint::FG;
+        // Inheritance is the WEAKEST source: a matched rule on the child wins over the inherited
+        // parent color, and an author-inline color on the child wins over both.
+        let mut e = Emitter::new();
+        let div = e.create_element(ElementTag::new(1));
+        e.append(ROOT, div);
+        e.set_class(div, "parent");
+        let ruled = e.create_element(ElementTag::new(1)); // child colored by a rule
+        e.append(div, ruled);
+        e.set_class(ruled, "child");
+        let inlined = e.create_element(ElementTag::new(1)); // child colored inline
+        e.append(div, inlined);
+        e.set_inline_style(inlined, FG, "#00ff00");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".parent { color: #111111 } .child { color: #222222 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, ruled, FG).as_deref(),
+            Some("#222222"),
+            "a matched rule on the child beats the inherited parent color"
+        );
+        assert_eq!(
+            styled_prop(&styled, inlined, FG).as_deref(),
+            Some("#00ff00"),
+            "author inline on the child beats both the rule and inheritance"
+        );
+    }
+
+    #[test]
+    fn a_non_inherited_prop_does_not_leak_to_a_child() {
+        use canopy_paint::{BG, FG};
+        // background is NOT an inherited property: the child must not pick up the parent's bg, even
+        // though color (an inherited prop set on the same parent) does flow down.
+        let mut e = Emitter::new();
+        let div = e.create_element(ElementTag::new(1));
+        e.append(ROOT, div);
+        e.set_class(div, "parent");
+        let child = e.create_element(ElementTag::new(1));
+        e.append(div, child);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".parent { background: #ff0000; color: #00ff00 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, child, BG),
+            None,
+            "background does not inherit — the child has no bg of its own"
+        );
+        assert_eq!(
+            styled_prop(&styled, child, FG).as_deref(),
+            Some("#00ff00"),
+            "color does inherit, confirming the parent actually resolved styles"
+        );
+    }
+
+    #[test]
+    fn inheritance_passes_through_multiple_levels() {
+        use canopy_paint::FG;
+        // grandparent (color via rule) -> parent (no color) -> child (no color): the child inherits
+        // the grandparent's color, threaded through the intermediate node that set none of its own.
+        let mut e = Emitter::new();
+        let gp = e.create_element(ElementTag::new(1));
+        e.append(ROOT, gp);
+        e.set_class(gp, "gp");
+        let parent = e.create_element(ElementTag::new(1));
+        e.append(gp, parent);
+        let child = e.create_element(ElementTag::new(1));
+        e.append(parent, child);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".gp { color: #0a0b0c }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, parent, FG).as_deref(),
+            Some("#0a0b0c"),
+            "the middle node inherits the grandparent's color"
+        );
+        assert_eq!(
+            styled_prop(&styled, child, FG).as_deref(),
+            Some("#0a0b0c"),
+            "inheritance carries through the intermediate node to the grandchild"
+        );
+    }
+
+    #[test]
+    fn an_intermediate_override_reparents_inheritance_for_descendants() {
+        use canopy_paint::FG;
+        // grandparent color A -> parent overrides to color B -> child: the child must inherit B (the
+        // parent's own resolved value shadows the grandparent's when computing the child's inherited
+        // map), proving step (3) overlays a node's own values onto what it passes down.
+        let mut e = Emitter::new();
+        let gp = e.create_element(ElementTag::new(1));
+        e.append(ROOT, gp);
+        e.set_class(gp, "gp");
+        let parent = e.create_element(ElementTag::new(1));
+        e.append(gp, parent);
+        e.set_class(parent, "mid");
+        let child = e.create_element(ElementTag::new(1));
+        e.append(parent, child);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(".gp { color: #aaaaaa } .mid { color: #bbbbbb }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, child, FG).as_deref(),
+            Some("#bbbbbb"),
+            "the child inherits the parent's overriding color, not the grandparent's"
+        );
     }
 
     #[test]

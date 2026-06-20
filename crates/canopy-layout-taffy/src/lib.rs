@@ -44,17 +44,22 @@ use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
 use canopy_paint::{
-    ALIGN, BG, BORDER_COLOR, BORDER_WIDTH, DIRECTION, FG, FLEX_GROW, GAP, HEIGHT, JUSTIFY, MARGIN,
-    MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, PADDING, RADIUS, TEXT_ALIGN,
-    TRANSLATE_X, TRANSLATE_Y, WIDTH,
+    ALIGN, ALIGN_SELF, ASPECT_RATIO, BG, BORDER_BOTTOM_WIDTH, BORDER_COLOR, BORDER_LEFT_WIDTH,
+    BORDER_RIGHT_WIDTH, BORDER_TOP_WIDTH, BORDER_WIDTH, BOX_SIZING, COLUMN_GAP, DIRECTION, DISPLAY,
+    FG, FLEX_BASIS, FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE, GAP, HEIGHT, INSET_BOTTOM,
+    INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, MARGIN, MARGIN_BOTTOM, MARGIN_LEFT, MARGIN_RIGHT,
+    MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, PADDING, PADDING_BOTTOM,
+    PADDING_LEFT, PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TRANSLATE_X,
+    TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
 };
 use canopy_protocol::{ElementTag, NodeId, PropId};
 use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, Size};
 
 use taffy::prelude::length;
 use taffy::{
-    AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    LengthPercentageAuto, Rect as TaffyRect, Size as TaffySize, Style, TaffyTree,
+    AlignItems, AvailableSpace, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
+    JustifyContent, LengthPercentage, LengthPercentageAuto, Position, Rect as TaffyRect,
+    Size as TaffySize, Style, TaffyTree,
 };
 
 /// Default text size (px) when no [`HEIGHT`] is set.
@@ -147,6 +152,13 @@ struct NodePaint {
     fg: Color,
     /// Resolved (inherited) text-align fraction.
     align: f32,
+    /// `visibility: visible` — when `false` (`hidden`) this node emits no
+    /// background/border/text of its own, but it is still laid out and its children
+    /// still paint. Not inherited: a hidden parent does not hide a visible child.
+    visible: bool,
+    /// Paint order: a higher [`Z_INDEX`] paints later (on top). The display-list builder
+    /// stable-sorts siblings by this, so tree order breaks ties for equal z.
+    z_index: i32,
 }
 
 /// Read a sizing property (`prop` is [`WIDTH`] or [`HEIGHT`]) into a Taffy
@@ -175,6 +187,76 @@ fn style_dimension(dom: &Dom, node: NodeId, prop: PropId) -> Dimension {
         }
     }
     Dimension::auto()
+}
+
+/// Resolve one **padding** edge into a Taffy [`LengthPercentage`]. Padding is
+/// non-negative (`LengthPercentage` cannot express `auto` or a negative length), so
+/// each edge is read as: the per-side longhand (`side`, e.g. [`PADDING_TOP`]) if set,
+/// else the uniform [`PADDING`] shorthand, else `0`. A percentage (`"50%"`) resolves
+/// against the container; a length (`"Npx"`/`"N"`) is taken in px.
+fn padding_edge(dom: &Dom, id: NodeId, side: PropId) -> LengthPercentage {
+    let raw = dom.style(id, side).or_else(|| dom.style(id, PADDING));
+    if let Some(s) = raw {
+        if let Some(pct) = s.strip_suffix('%') {
+            if let Ok(n) = pct.trim().parse::<u32>() {
+                return LengthPercentage::percent(n as f32 / 100.0);
+            }
+        }
+        let num = s.strip_suffix("px").map(str::trim).unwrap_or(s);
+        if let Ok(n) = num.parse::<u32>() {
+            return LengthPercentage::length(n as f32);
+        }
+    }
+    LengthPercentage::length(0.0)
+}
+
+/// Resolve one **margin** or **inset** edge into a Taffy [`LengthPercentageAuto`].
+/// Unlike padding, margins/insets admit `auto` (`margin: 0 auto` centering,
+/// `margin-left: auto`) and **negative** lengths (a pulled-in box). Each edge is:
+/// the per-side longhand (`side`) if set, else `fallback` (the uniform shorthand for
+/// margin, or `None` for inset which has no shorthand), else `default`.
+///
+/// `default` differs by property: margin's unset edge is `length(0)` (zero spacing);
+/// inset's unset edge is `auto` (Taffy's default — use the in-flow static position, not
+/// a 0-offset that would stretch an absolute box across the container).
+///
+/// `auto` -> [`LengthPercentageAuto::auto`]; a percentage (`"50%"`) -> percent of the
+/// container; a signed length (`"-12"`, `"24px"`) -> px (parsed via [`signed_px`] so a
+/// leading `-` survives, keeping this `no_std`-clean).
+fn auto_edge(
+    dom: &Dom,
+    id: NodeId,
+    side: PropId,
+    fallback: Option<PropId>,
+    default: LengthPercentageAuto,
+) -> LengthPercentageAuto {
+    let raw = dom
+        .style(id, side)
+        .or_else(|| fallback.and_then(|f| dom.style(id, f)));
+    if let Some(s) = raw {
+        let s = s.trim();
+        if s == "auto" {
+            return LengthPercentageAuto::auto();
+        }
+        if let Some(pct) = s.strip_suffix('%') {
+            if let Ok(n) = pct.trim().parse::<u32>() {
+                return LengthPercentageAuto::percent(n as f32 / 100.0);
+            }
+        }
+        if let Some(n) = signed_px(s) {
+            return LengthPercentageAuto::length(n);
+        }
+    }
+    default
+}
+
+/// Parse a signed integer-or-decimal pixel string (`"24"`, `"-12"`, `"-12px"`, `"7.5"`)
+/// into an `f32`, or `None` when unparseable. A trailing `"px"` is tolerated. Reuses
+/// `f32::from_str` (available in `core` on Canopy's targets), so negatives and decimals
+/// — which the `u32`-only [`style_px`] rejects — parse without pulling in `std`.
+fn signed_px(s: &str) -> Option<f32> {
+    let num = s.strip_suffix("px").map(str::trim).unwrap_or(s);
+    num.parse::<f32>().ok()
 }
 
 /// Signed, fractional float value of `prop` on `node`, defaulting to `default` when
@@ -237,17 +319,31 @@ fn fade(color: Color, opacity: f32) -> Color {
     }
 }
 
-/// The container's cross-axis alignment ([`ALIGN`] / CSS `align-items`), or `None`
-/// (Taffy's default = stretch/start) when unset or unrecognized.
-fn style_align(dom: &Dom, id: NodeId) -> Option<AlignItems> {
-    // taffy 0.11 models alignment as a struct with associated-const keywords.
-    match dom.style(id, ALIGN)? {
+/// Map a CSS alignment keyword to a Taffy [`AlignItems`] (taffy 0.11 models alignment
+/// as a struct with associated-const keywords), or `None` when unrecognized. Shared by
+/// [`style_align`] (the container's `align-items`) and [`style_align_self`] (an item's
+/// `align-self`), which take the same keyword set.
+fn parse_align(value: &str) -> Option<AlignItems> {
+    match value {
         "start" | "flex-start" => Some(AlignItems::FLEX_START),
         "center" => Some(AlignItems::CENTER),
         "end" | "flex-end" => Some(AlignItems::FLEX_END),
         "stretch" => Some(AlignItems::STRETCH),
         _ => None,
     }
+}
+
+/// The container's cross-axis alignment ([`ALIGN`] / CSS `align-items`), or `None`
+/// (Taffy's default = stretch/start) when unset or unrecognized.
+fn style_align(dom: &Dom, id: NodeId) -> Option<AlignItems> {
+    dom.style(id, ALIGN).and_then(parse_align)
+}
+
+/// The item's own cross-axis alignment ([`ALIGN_SELF`] / CSS `align-self`), overriding
+/// the parent's `align-items` for this one child. `None` (Taffy's default) when unset
+/// or unrecognized, so it falls back to the container's alignment.
+fn style_align_self(dom: &Dom, id: NodeId) -> Option<AlignItems> {
+    dom.style(id, ALIGN_SELF).and_then(parse_align)
 }
 
 /// The container's main-axis distribution ([`JUSTIFY`] / CSS `justify-content`), or
@@ -265,6 +361,84 @@ fn style_justify(dom: &Dom, id: NodeId) -> Option<JustifyContent> {
     }
 }
 
+/// The node's [`DISPLAY`] mapped to a Taffy [`Display`]: `"none"` -> [`Display::None`]
+/// (Taffy zero-sizes the node and skips its subtree), `"flex"` (or any other value) ->
+/// [`Display::Flex`]. Default is `Flex` — this crate is flex-only, so an unset or
+/// unrecognized `display` keeps the existing flex behavior.
+fn style_display(dom: &Dom, id: NodeId) -> Display {
+    match dom.style(id, DISPLAY) {
+        Some("none") => Display::None,
+        _ => Display::Flex,
+    }
+}
+
+/// Whether the node is **visible** for painting ([`VISIBILITY`]). `"hidden"` -> `false`
+/// (the node is still laid out, but emits no background/border/text of its own; its
+/// children still paint). Anything else (incl. unset / `"visible"`) -> `true`.
+fn style_visible(dom: &Dom, id: NodeId) -> bool {
+    !matches!(dom.style(id, VISIBILITY), Some("hidden"))
+}
+
+/// The node's [`POSITION`] mapped to a Taffy [`Position`]: `"absolute"` ->
+/// [`Position::Absolute`], `"relative"`/`"static"`/anything else (incl. unset) ->
+/// [`Position::Relative`] (Taffy's default). Taffy has no separate `static`; both
+/// `relative` and `static` map to `Relative`, which is in-flow.
+fn style_position(dom: &Dom, id: NodeId) -> Position {
+    match dom.style(id, POSITION) {
+        Some("absolute") => Position::Absolute,
+        _ => Position::Relative,
+    }
+}
+
+/// The node's [`FLEX_WRAP`] mapped to a Taffy [`FlexWrap`]: `"wrap"` -> [`FlexWrap::Wrap`],
+/// `"wrap-reverse"` -> [`FlexWrap::WrapReverse`], `"nowrap"`/anything else (incl. unset) ->
+/// [`FlexWrap::NoWrap`] (Taffy's default).
+fn style_flex_wrap(dom: &Dom, id: NodeId) -> FlexWrap {
+    match dom.style(id, FLEX_WRAP) {
+        Some("wrap") => FlexWrap::Wrap,
+        Some("wrap-reverse") => FlexWrap::WrapReverse,
+        _ => FlexWrap::NoWrap,
+    }
+}
+
+/// The node's [`BOX_SIZING`] mapped to a Taffy [`BoxSizing`]: `"content-box"` ->
+/// [`BoxSizing::ContentBox`], `"border-box"`/anything else (incl. unset) ->
+/// [`BoxSizing::BorderBox`] (Taffy's default, which matches the box model authors get
+/// once `border`/`padding` inset content).
+fn style_box_sizing(dom: &Dom, id: NodeId) -> BoxSizing {
+    match dom.style(id, BOX_SIZING) {
+        Some("content-box") => BoxSizing::ContentBox,
+        _ => BoxSizing::BorderBox,
+    }
+}
+
+/// The node's [`ASPECT_RATIO`] as a Taffy `Option<f32>` (width / height). Accepts two
+/// CSS forms: a bare decimal (`"1.5"`) used directly, or a `"w/h"` ratio (`"16/9"`)
+/// split on `'/'` and divided. `None` when unset, unparseable, or a zero denominator
+/// (which would be a non-finite ratio).
+fn style_aspect_ratio(dom: &Dom, id: NodeId) -> Option<f32> {
+    let s = dom.style(id, ASPECT_RATIO)?.trim();
+    if let Some((w, h)) = s.split_once('/') {
+        let w = w.trim().parse::<f32>().ok()?;
+        let h = h.trim().parse::<f32>().ok()?;
+        if h == 0.0 {
+            return None;
+        }
+        return Some(w / h);
+    }
+    s.parse::<f32>().ok()
+}
+
+/// The node's [`Z_INDEX`] paint order (default `0`). Accepts a signed integer (`"-1"`,
+/// `"10"`); higher paints later (on top). Unset or unparseable -> `0`. Parsed via
+/// [`signed_px`] (which tolerates a leading `-`) then truncated to an `i32`.
+fn style_z_index(dom: &Dom, id: NodeId) -> i32 {
+    dom.style(id, Z_INDEX)
+        .and_then(signed_px)
+        .map(|n| n as i32)
+        .unwrap_or(0)
+}
+
 /// Layout size of a text leaf: its **height is the requested font size in px**
 /// (`height` style, default [`TEXT_HEIGHT`]) — NOT snapped to the 8px baked cell, so a
 /// `height: 15` run renders at a real 15px on the capable (parley) tier instead of
@@ -278,7 +452,13 @@ fn style_justify(dom: &Dom, id: NodeId) -> Option<JustifyContent> {
 /// `scale = max(1, floor(h / 8))`, advancing `8 * scale` px per glyph — mirror that here.
 /// `text-align` still absorbs any slack within the box.
 fn text_size(dom: &Dom, id: NodeId, text: &str) -> Size {
-    let h = style_px(dom, id, HEIGHT).unwrap_or(TEXT_HEIGHT) as f32;
+    // A text leaf's cell height is its `font-size` when set, decoupling glyph size from
+    // the box `height`: `font-size: 24` renders 24px text even in a shorter/auto box.
+    // Falls back to the legacy `height`-derived size (then `TEXT_HEIGHT`) so sheets with
+    // no `font-size` are byte-for-byte unchanged.
+    let h = style_px(dom, id, FONT_SIZE)
+        .or_else(|| style_px(dom, id, HEIGHT))
+        .unwrap_or(TEXT_HEIGHT) as f32;
     // The baked-font cell (canopy_text_baked CELL_W == CELL_H == 8) and the renderer's
     // integer scale; keep these in lockstep with canopy_render_soft::blit_text's advance.
     // Cast-truncation (not f32::floor, which needs std/libm) mirrors the renderer exactly.
@@ -328,17 +508,33 @@ fn resolve_root_dimension(dom: &Dom, node: NodeId, prop: PropId, extent: f32) ->
     num.parse::<u32>().ok().map(|n| n as f32)
 }
 
+/// Resolve one **border** edge into a Taffy [`LengthPercentage`] width. The border now
+/// participates in the box model (it insets content, not just paints on top), so its
+/// geometry is fed to Taffy here: the per-side longhand (`side`, e.g. [`BORDER_TOP_WIDTH`])
+/// if set, else the uniform [`BORDER_WIDTH`], else `0`. Widths are non-negative px.
+fn border_edge(dom: &Dom, id: NodeId, side: PropId) -> LengthPercentage {
+    let w = style_px(dom, id, side)
+        .or_else(|| style_px(dom, id, BORDER_WIDTH))
+        .unwrap_or(0);
+    LengthPercentage::length(w as f32)
+}
+
 /// Build the Taffy [`Style`] for one element from its inline styles.
 fn element_style(dom: &Dom, id: NodeId) -> Style {
     let dir = match dom.style(id, DIRECTION) {
         Some("row") => FlexDirection::Row,
         _ => FlexDirection::Column,
     };
-    let gap = style_px(dom, id, GAP).unwrap_or(0) as f32;
-    let pad = style_px(dom, id, PADDING).unwrap_or(0) as f32;
-    // Uniform outer `margin` (px) on all four sides — the spacing analog of `padding`,
-    // but a `LengthPercentageAuto` (margin admits `auto`; padding does not). Default 0.
-    let margin = style_px(dom, id, MARGIN).unwrap_or(0) as f32;
+    // Gap: per-axis ROW_GAP (cross/block -> `gap.height`) and COLUMN_GAP (main/inline ->
+    // `gap.width`) win when present; the uniform GAP shorthand fills whichever axis the
+    // per-axis longhand leaves unset. Default 0 on both.
+    let uniform_gap = style_px(dom, id, GAP).unwrap_or(0) as f32;
+    let row_gap = style_px(dom, id, ROW_GAP)
+        .map(|n| n as f32)
+        .unwrap_or(uniform_gap);
+    let column_gap = style_px(dom, id, COLUMN_GAP)
+        .map(|n| n as f32)
+        .unwrap_or(uniform_gap);
     // Width/height accept a percentage ("100%"/"50%"), a length ("Npx"/"N"), or are
     // auto (content-sized) when absent — see `style_dimension`.
     let width = style_dimension(dom, id, WIDTH);
@@ -349,13 +545,16 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
     let min_height = style_dimension(dom, id, MIN_HEIGHT);
     let max_width = style_dimension(dom, id, MAX_WIDTH);
     let max_height = style_dimension(dom, id, MAX_HEIGHT);
-    // `flex-grow` is unitless and may be fractional ("1", "0.5"), so it is read raw and
-    // parsed as f32 (the integer-only `style_px` would reject a fraction). Default 0.0 =
-    // does not grow, matching CSS `flex-grow`'s initial value.
+    // `flex-grow`/`flex-shrink` are unitless and may be fractional ("1", "0.5"), so they
+    // are read raw and parsed as f32. flex-grow defaults to 0.0 (does not grow); Taffy's
+    // own flex-shrink default is 1.0, which `style_f32` returns when unset.
     let flex_grow = dom
         .style(id, FLEX_GROW)
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(0.0);
+    let flex_shrink = style_f32(dom, id, FLEX_SHRINK, 1.0);
+    // `flex-basis` accepts px / % / auto exactly like width (Dimension::auto by default).
+    let flex_basis = style_dimension(dom, id, FLEX_BASIS);
     // UA-stylesheet default: a button/input centers its label on BOTH axes (the cross axis via
     // align-items, the main axis via justify-content) unless the author sets align/justify,
     // mirroring how browsers center `<button>` content. Plain containers keep Taffy's defaults
@@ -370,27 +569,81 @@ fn element_style(dom: &Dom, id: NodeId) -> Style {
     let justify_content =
         style_justify(dom, id).or(centers_content.then_some(JustifyContent::CENTER));
     Style {
+        display: style_display(dom, id),
+        position: style_position(dom, id),
+        box_sizing: style_box_sizing(dom, id),
         flex_direction: dir,
+        flex_wrap: style_flex_wrap(dom, id),
         align_items,
+        // `align-self` overrides the parent's `align-items` for this one item; `None`
+        // (unset) falls back to the container's alignment, which is Taffy's default.
+        align_self: style_align_self(dom, id),
         justify_content,
         flex_grow,
+        flex_shrink,
+        flex_basis,
+        aspect_ratio: style_aspect_ratio(dom, id),
         gap: TaffySize {
-            width: length(gap),
-            height: length(gap),
+            width: length(column_gap),
+            height: length(row_gap),
         },
+        // Per-edge padding: per-side longhand (PADDING_*) else uniform PADDING else 0.
+        // Padding is `LengthPercentage` (non-negative, no `auto`).
         padding: TaffyRect {
-            left: LengthPercentage::length(pad),
-            right: LengthPercentage::length(pad),
-            top: LengthPercentage::length(pad),
-            bottom: LengthPercentage::length(pad),
+            left: padding_edge(dom, id, PADDING_LEFT),
+            right: padding_edge(dom, id, PADDING_RIGHT),
+            top: padding_edge(dom, id, PADDING_TOP),
+            bottom: padding_edge(dom, id, PADDING_BOTTOM),
         },
-        // Margin uses `LengthPercentageAuto` (it admits `auto`, unlike padding), so the
-        // uniform px value is wrapped accordingly on all four sides.
+        // Per-edge margin: per-side longhand (MARGIN_*) else uniform MARGIN else 0.
+        // Margin is `LengthPercentageAuto` — it admits `auto` (`margin: 0 auto`
+        // centering, `margin-left: auto`) and negative px.
         margin: TaffyRect {
-            left: LengthPercentageAuto::length(margin),
-            right: LengthPercentageAuto::length(margin),
-            top: LengthPercentageAuto::length(margin),
-            bottom: LengthPercentageAuto::length(margin),
+            left: auto_edge(
+                dom,
+                id,
+                MARGIN_LEFT,
+                Some(MARGIN),
+                LengthPercentageAuto::length(0.0),
+            ),
+            right: auto_edge(
+                dom,
+                id,
+                MARGIN_RIGHT,
+                Some(MARGIN),
+                LengthPercentageAuto::length(0.0),
+            ),
+            top: auto_edge(
+                dom,
+                id,
+                MARGIN_TOP,
+                Some(MARGIN),
+                LengthPercentageAuto::length(0.0),
+            ),
+            bottom: auto_edge(
+                dom,
+                id,
+                MARGIN_BOTTOM,
+                Some(MARGIN),
+                LengthPercentageAuto::length(0.0),
+            ),
+        },
+        // Border participates in the box model: feed its width to Taffy so it insets
+        // content. Per-side longhand (BORDER_*_WIDTH) else uniform BORDER_WIDTH else 0.
+        // The frame's STYLE/color rendering stays in `push_border`, now consistent with
+        // this inset. Inset (for `position: absolute`/`relative` offset): no shorthand,
+        // so the fallback is `None` and each unset edge is `auto`.
+        border: TaffyRect {
+            left: border_edge(dom, id, BORDER_LEFT_WIDTH),
+            right: border_edge(dom, id, BORDER_RIGHT_WIDTH),
+            top: border_edge(dom, id, BORDER_TOP_WIDTH),
+            bottom: border_edge(dom, id, BORDER_BOTTOM_WIDTH),
+        },
+        inset: TaffyRect {
+            left: auto_edge(dom, id, INSET_LEFT, None, LengthPercentageAuto::auto()),
+            right: auto_edge(dom, id, INSET_RIGHT, None, LengthPercentageAuto::auto()),
+            top: auto_edge(dom, id, INSET_TOP, None, LengthPercentageAuto::auto()),
+            bottom: auto_edge(dom, id, INSET_BOTTOM, None, LengthPercentageAuto::auto()),
         },
         size: TaffySize { width, height },
         min_size: TaffySize {
@@ -500,6 +753,13 @@ fn collect_rects(
     //   parent's resolved value is taken). This is the cascade's inheritance step, done
     //   once here instead of as a per-read ancestor walk in `build_display_list`.
     let id = tree.get_node_context(key).copied();
+    // `display: none` removes the node AND its subtree from paint and hit-test: Taffy
+    // already zero-sizes it, and we prune it here so it contributes no rect (no phantom
+    // zero-area fill) and we do not descend into its children. This is the "skips subtree"
+    // half of the contract; the layout half is Taffy's zero-sizing.
+    if id.is_some_and(|id| style_display(dom, id) == Display::None) {
+        return;
+    }
     let local_translate = id
         .map(|id| style_translate(dom, id))
         .unwrap_or(Point { x: 0.0, y: 0.0 });
@@ -527,8 +787,19 @@ fn collect_rects(
         },
     };
     if let Some(id) = id {
+        // `visibility` and `z-index` are per-node (not inherited / not accumulated):
+        // a hidden node still lays out its visible children, and each node carries its
+        // own paint order.
+        let visible = style_visible(dom, id);
+        let z_index = style_z_index(dom, id);
         rects.push((id, rect));
-        paints.push(NodePaint { opacity, fg, align });
+        paints.push(NodePaint {
+            opacity,
+            fg,
+            align,
+            visible,
+            z_index,
+        });
     }
     // Children inherit the *untranslated* absolute origin (Taffy locations are relative
     // to it) plus the accumulated/inherited style.
@@ -640,21 +911,46 @@ pub fn build_scene(dom: &Dom, viewport: Size) -> DisplayList {
 /// over whatever sits behind it. At full opacity (the overwhelmingly common case)
 /// [`scale_alpha`] returns the byte unchanged, so opaque scenes are byte-for-byte
 /// what they were before.
+///
+/// Paint order is the rects' tree order **re-sorted by [`Z_INDEX`]**: a higher z-index
+/// paints later (on top), and the sort is *stable* so equal-z nodes keep tree order
+/// (parents before children, earlier siblings first). Most scenes have all-zero z, so
+/// the stable sort is a no-op and the output is byte-for-byte the old tree order.
+///
+/// A node with `visibility: hidden` ([`NodePaint::visible`] == `false`) contributes no
+/// primitives of its own — its background, border, and text are skipped — but it stays
+/// in the list position-wise so its (visible) children, processed via their own entries,
+/// still paint.
 fn build_display_list(
     dom: &Dom,
     rects: &[(NodeId, Rect)],
     paints: &[NodePaint],
 ) -> Vec<DisplayItem> {
+    // Stable paint order by z-index: collect the indices, then sort by the node's
+    // `z_index` only. A stable sort leaves equal-z entries in their original (tree) order,
+    // so tree order breaks ties — and an all-zero scene is unchanged.
+    let mut order: Vec<usize> = (0..rects.len()).collect();
+    order.sort_by_key(|&i| paints.get(i).map(|p| p.z_index).unwrap_or(0));
+
     let mut items = Vec::new();
-    for (i, &(id, rect)) in rects.iter().enumerate() {
+    for &i in &order {
+        let (id, rect) = rects[i];
         let Some(node) = dom.node(id) else { continue };
         // Parallel vecs are built together in `collect_rects`, so the index is always
-        // valid; default to opaque/inherited-light if a caller ever passes a short slice.
+        // valid; default to opaque/inherited-light/visible if a caller ever passes a
+        // short slice.
         let paint = paints.get(i).copied().unwrap_or(NodePaint {
             opacity: 1.0,
             fg: DEFAULT_FG,
             align: 0.0,
+            visible: true,
+            z_index: 0,
         });
+        // `visibility: hidden` lays out but paints nothing of its own; children still
+        // emit through their own list entries.
+        if !paint.visible {
+            continue;
+        }
         if let Some(text) = node.text.as_deref() {
             // `background` is NOT inherited (per-element), so it is read off this node;
             // the text `color` IS inherited (resolved in the tree walk -> `paint.fg`).
@@ -1673,5 +1969,610 @@ mod tests {
             })
             .expect("background rect");
         assert_eq!(color.a, 255);
+    }
+
+    #[test]
+    fn per_side_padding_insets_each_edge_independently() {
+        // padding-left/top differ from padding-right/bottom: the child's origin reflects
+        // the top-left longhands exactly, independent of the others.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "100");
+        e.set_inline_style(col, HEIGHT, "100");
+        e.set_inline_style(col, PADDING_LEFT, "7");
+        e.set_inline_style(col, PADDING_TOP, "11");
+        e.set_inline_style(col, PADDING_RIGHT, "3");
+        e.set_inline_style(col, PADDING_BOTTOM, "5");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(col, child);
+        e.set_inline_style(child, WIDTH, "20");
+        e.set_inline_style(child, HEIGHT, "10");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
+        assert_eq!(
+            child_rect.origin,
+            Point { x: 7.0, y: 11.0 },
+            "child is inset by the top/left padding longhands, not the uniform value"
+        );
+    }
+
+    #[test]
+    fn per_side_longhand_overrides_uniform_shorthand() {
+        // The uniform PADDING shorthand applies to the edges with no longhand; a longhand
+        // on one edge overrides only that edge.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "100");
+        e.set_inline_style(col, HEIGHT, "100");
+        e.set_inline_style(col, PADDING, "4"); // base for every edge
+        e.set_inline_style(col, PADDING_LEFT, "12"); // override left only
+        let child = e.create_element(ElementTag::new(2));
+        e.append(col, child);
+        e.set_inline_style(child, WIDTH, "10");
+        e.set_inline_style(child, HEIGHT, "10");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
+        // left = 12 (longhand), top = 4 (uniform fallback).
+        assert_eq!(child_rect.origin, Point { x: 12.0, y: 4.0 });
+    }
+
+    #[test]
+    fn per_side_margin_offsets_one_edge() {
+        // A single margin-left longhand insets the box from the container's left edge,
+        // without the uniform shorthand.
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(row, a);
+        e.set_inline_style(a, WIDTH, "20");
+        e.set_inline_style(a, HEIGHT, "20");
+        e.set_inline_style(a, MARGIN_LEFT, "15");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let a_rect = lay.rects.iter().find(|(id, _)| *id == a).unwrap().1;
+        assert_eq!(
+            a_rect.origin,
+            Point { x: 15.0, y: 0.0 },
+            "margin-left longhand pushes the box right; top is untouched"
+        );
+    }
+
+    #[test]
+    fn margin_auto_centers_a_box_horizontally() {
+        // `margin: 0 auto` (here margin-left:auto + margin-right:auto) on a fixed-width box
+        // in a wider container centers it: the two auto margins split the free space.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "200");
+        e.set_inline_style(col, HEIGHT, "100");
+        let box_ = e.create_element(ElementTag::new(2));
+        e.append(col, box_);
+        e.set_inline_style(box_, WIDTH, "40");
+        e.set_inline_style(box_, HEIGHT, "20");
+        e.set_inline_style(box_, MARGIN_LEFT, "auto");
+        e.set_inline_style(box_, MARGIN_RIGHT, "auto");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let box_rect = lay.rects.iter().find(|(id, _)| *id == box_).unwrap().1;
+        // (200 - 40) / 2 = 80.
+        assert_eq!(
+            box_rect.origin.x, 80.0,
+            "auto left+right margins center the box in its container"
+        );
+    }
+
+    #[test]
+    fn negative_margin_pulls_a_box_left() {
+        // A negative margin-left pulls the box outward (left), past the container origin.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, DIRECTION, "row");
+        e.set_inline_style(col, WIDTH, "200");
+        e.set_inline_style(col, HEIGHT, "40");
+        let box_ = e.create_element(ElementTag::new(2));
+        e.append(col, box_);
+        e.set_inline_style(box_, WIDTH, "20");
+        e.set_inline_style(box_, HEIGHT, "20");
+        e.set_inline_style(box_, MARGIN_LEFT, "-10");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let box_rect = lay.rects.iter().find(|(id, _)| *id == box_).unwrap().1;
+        assert_eq!(box_rect.origin.x, -10.0, "negative margin-left pulls left");
+    }
+
+    #[test]
+    fn display_none_zero_sizes_and_skips_the_subtree() {
+        // `display: none` collapses the node to a zero box AND skips its subtree: neither
+        // the node nor its child contributes a non-empty rect, and a following sibling
+        // stacks as if the none node were not there.
+        let mut e = Emitter::new();
+        let gone = e.create_element(ElementTag::new(1));
+        e.append(ROOT, gone);
+        e.set_inline_style(gone, WIDTH, "50");
+        e.set_inline_style(gone, HEIGHT, "50");
+        e.set_inline_style(gone, DISPLAY, "none");
+        e.set_inline_style(gone, BG, "#ff0000");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(gone, child);
+        e.set_inline_style(child, WIDTH, "30");
+        e.set_inline_style(child, HEIGHT, "30");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        // Taffy zero-sizes a display:none node; we then prune it AND its subtree from the
+        // rects, so neither the node nor its child appears (no paint, no hit-test target).
+        assert!(
+            lay.rects.iter().all(|(id, _)| *id != gone),
+            "display:none prunes the node from paint/hit-test"
+        );
+        assert!(
+            lay.rects.iter().all(|(id, _)| *id != child),
+            "display:none skips the subtree (the child is not laid out either)"
+        );
+        // No red fill is emitted for the none node.
+        let has_red = scene.items.iter().any(|i| {
+            matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0xff, 0x00, 0x00))
+        });
+        assert!(!has_red, "display:none emits no background");
+    }
+
+    #[test]
+    fn visibility_hidden_lays_out_but_paints_nothing_itself() {
+        // `visibility: hidden` keeps the node in layout (its box still reserves space and
+        // its child still paints) but suppresses the node's own background.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "100");
+        e.set_inline_style(col, HEIGHT, "100");
+        let hidden = e.create_element(ElementTag::new(2));
+        e.append(col, hidden);
+        e.set_inline_style(hidden, WIDTH, "40");
+        e.set_inline_style(hidden, HEIGHT, "40");
+        e.set_inline_style(hidden, VISIBILITY, "hidden");
+        e.set_inline_style(hidden, BG, "#ff0000"); // would-be parent fill, suppressed
+        let kid = e.create_element(ElementTag::new(3));
+        e.append(hidden, kid);
+        e.set_inline_style(kid, WIDTH, "10");
+        e.set_inline_style(kid, HEIGHT, "10");
+        e.set_inline_style(kid, BG, "#00ff00"); // visible child fill, still painted
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        // The hidden node is still laid out at its full size.
+        let hidden_rect = lay.rects.iter().find(|(id, _)| *id == hidden).unwrap().1;
+        assert_eq!(
+            hidden_rect.size,
+            Size { w: 40.0, h: 40.0 },
+            "visibility:hidden still lays the node out"
+        );
+        // Its own red fill is suppressed...
+        let has_red = scene.items.iter().any(|i| {
+            matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0xff, 0x00, 0x00))
+        });
+        assert!(!has_red, "the hidden node's own background is not emitted");
+        // ...but the visible child still paints its green fill.
+        let has_green = scene.items.iter().any(|i| {
+            matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0x00, 0xff, 0x00))
+        });
+        assert!(has_green, "children of a hidden node still paint");
+    }
+
+    #[test]
+    fn position_absolute_with_inset_offsets_from_the_container() {
+        // An absolutely-positioned child with top/left insets is placed at those offsets
+        // relative to its (relatively-positioned) container, out of the normal flow.
+        let mut e = Emitter::new();
+        let container = e.create_element(ElementTag::new(1));
+        e.append(ROOT, container);
+        e.set_inline_style(container, WIDTH, "200");
+        e.set_inline_style(container, HEIGHT, "200");
+        e.set_inline_style(container, POSITION, "relative");
+        let abs = e.create_element(ElementTag::new(2));
+        e.append(container, abs);
+        e.set_inline_style(abs, WIDTH, "30");
+        e.set_inline_style(abs, HEIGHT, "30");
+        e.set_inline_style(abs, POSITION, "absolute");
+        e.set_inline_style(abs, INSET_LEFT, "25");
+        e.set_inline_style(abs, INSET_TOP, "40");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 400.0, h: 400.0 });
+        let abs_rect = lay.rects.iter().find(|(id, _)| *id == abs).unwrap().1;
+        assert_eq!(
+            abs_rect.origin,
+            Point { x: 25.0, y: 40.0 },
+            "absolute + inset places the box at top/left within the container"
+        );
+        assert_eq!(abs_rect.size, Size { w: 30.0, h: 30.0 });
+    }
+
+    #[test]
+    fn flex_wrap_pushes_overflowing_items_to_a_second_line() {
+        // A 100-wide wrapping row with three 40-wide items: two fit on line one (0, 40),
+        // and the third wraps to a second line (back to x=0, below the first row).
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        e.set_inline_style(row, FLEX_WRAP, "wrap");
+        e.set_inline_style(row, WIDTH, "100");
+        e.set_inline_style(row, HEIGHT, "100");
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let b = e.create_element(ElementTag::new(2));
+            e.append(row, b);
+            e.set_inline_style(b, WIDTH, "40");
+            e.set_inline_style(b, HEIGHT, "20");
+            ids.push(b);
+        }
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        let r0 = lay.rects.iter().find(|(id, _)| *id == ids[0]).unwrap().1;
+        let r1 = lay.rects.iter().find(|(id, _)| *id == ids[1]).unwrap().1;
+        let r2 = lay.rects.iter().find(|(id, _)| *id == ids[2]).unwrap().1;
+        assert_eq!(r0.origin.x, 0.0);
+        assert_eq!(r1.origin.x, 40.0);
+        // Third item wraps: back to the left edge, on a new (lower) line.
+        assert_eq!(r2.origin.x, 0.0, "the third item wraps to the next line");
+        assert!(
+            r2.origin.y > r0.origin.y,
+            "the wrapped item is below the first row"
+        );
+    }
+
+    #[test]
+    fn flex_basis_sets_the_main_axis_size() {
+        // In a row, a child with `flex-basis: 70` and no explicit width takes 70px on the
+        // main axis (flex-basis is the initial main size).
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        e.set_inline_style(row, WIDTH, "200");
+        e.set_inline_style(row, HEIGHT, "40");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(row, a);
+        e.set_inline_style(a, HEIGHT, "20");
+        e.set_inline_style(a, FLEX_BASIS, "70");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 400.0, h: 100.0 });
+        let a_rect = lay.rects.iter().find(|(id, _)| *id == a).unwrap().1;
+        assert_eq!(
+            a_rect.size.w, 70.0,
+            "flex-basis sets the item's main-axis size"
+        );
+    }
+
+    #[test]
+    fn align_self_overrides_the_containers_align_items() {
+        // A column with `align-items: flex-start` and a child that sets `align-self:
+        // flex-end`: the child aligns to the cross-axis (right) end, overriding the
+        // container default. The 40-wide child in a 200-wide column lands at x=160.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "200");
+        e.set_inline_style(col, HEIGHT, "100");
+        e.set_inline_style(col, ALIGN, "flex-start");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(col, child);
+        e.set_inline_style(child, WIDTH, "40");
+        e.set_inline_style(child, HEIGHT, "20");
+        e.set_inline_style(child, ALIGN_SELF, "flex-end");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 400.0, h: 200.0 });
+        let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
+        assert_eq!(
+            child_rect.origin.x, 160.0,
+            "align-self: flex-end pushes the child to the cross-axis end (200 - 40)"
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_derives_height_from_width() {
+        // A box with width 60 and `aspect-ratio: 2` (or "2/1") resolves height to 30
+        // (width / ratio). Both the decimal and the w/h forms must agree.
+        for value in ["2", "2/1"] {
+            let mut e = Emitter::new();
+            let col = e.create_element(ElementTag::new(1));
+            e.append(ROOT, col);
+            let box_ = e.create_element(ElementTag::new(2));
+            e.append(col, box_);
+            e.set_inline_style(box_, WIDTH, "60");
+            e.set_inline_style(box_, ASPECT_RATIO, value);
+
+            let dom = dom_from(e);
+            let (_, lay) = layout(&dom, Size { w: 400.0, h: 400.0 });
+            let box_rect = lay.rects.iter().find(|(id, _)| *id == box_).unwrap().1;
+            assert_eq!(
+                box_rect.size,
+                Size { w: 60.0, h: 30.0 },
+                "aspect-ratio {value:?} -> height = width / 2"
+            );
+        }
+    }
+
+    #[test]
+    fn column_gap_spaces_items_on_the_main_axis() {
+        // column-gap (the main/inline axis in a row) goes onto `gap.width`: the second item
+        // starts at the first item's width PLUS the column-gap.
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        e.set_inline_style(row, COLUMN_GAP, "8");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(row, a);
+        e.set_inline_style(a, WIDTH, "40");
+        e.set_inline_style(a, HEIGHT, "20");
+        let b = e.create_element(ElementTag::new(2));
+        e.append(row, b);
+        e.set_inline_style(b, WIDTH, "20");
+        e.set_inline_style(b, HEIGHT, "20");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let b_rect = lay.rects.iter().find(|(id, _)| *id == b).unwrap().1;
+        assert_eq!(
+            b_rect.origin.x, 48.0,
+            "column-gap (40 width + 8 gap) spaces items on the main axis"
+        );
+    }
+
+    #[test]
+    fn row_gap_spaces_wrapped_lines_on_the_cross_axis() {
+        // row-gap (the cross/block axis in a row) goes onto `gap.height`: it widens the
+        // space between WRAPPED LINES. The row is given a constrained width (to force the
+        // wrap) but NO explicit height, so it content-sizes on the cross axis and the
+        // lines do not stretch — the wrapped line then sits exactly first-line-height +
+        // row-gap below the top.
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        e.set_inline_style(row, FLEX_WRAP, "wrap");
+        e.set_inline_style(row, WIDTH, "100");
+        e.set_inline_style(row, ROW_GAP, "12");
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let b = e.create_element(ElementTag::new(2));
+            e.append(row, b);
+            e.set_inline_style(b, WIDTH, "40");
+            e.set_inline_style(b, HEIGHT, "20");
+            ids.push(b);
+        }
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 300.0 });
+        let r0 = lay.rects.iter().find(|(id, _)| *id == ids[0]).unwrap().1;
+        let r2 = lay.rects.iter().find(|(id, _)| *id == ids[2]).unwrap().1;
+        assert_eq!(
+            r2.origin.x, 0.0,
+            "the third item wraps back to the left edge"
+        );
+        // First line height (20) + row-gap (12) = 32.
+        assert_eq!(
+            r2.origin.y - r0.origin.y,
+            32.0,
+            "row-gap (12) plus the first line height (20) places the wrapped line"
+        );
+    }
+
+    #[test]
+    fn uniform_gap_still_fills_both_axes_when_no_per_axis_set() {
+        // With only the uniform GAP shorthand (no row/column-gap), both axes use it — the
+        // existing single-value behavior is preserved.
+        let mut e = Emitter::new();
+        let row = e.create_element(ElementTag::new(1));
+        e.append(ROOT, row);
+        e.set_inline_style(row, DIRECTION, "row");
+        e.set_inline_style(row, GAP, "10");
+        let a = e.create_element(ElementTag::new(2));
+        e.append(row, a);
+        e.set_inline_style(a, WIDTH, "20");
+        e.set_inline_style(a, HEIGHT, "20");
+        let b = e.create_element(ElementTag::new(2));
+        e.append(row, b);
+        e.set_inline_style(b, WIDTH, "20");
+        e.set_inline_style(b, HEIGHT, "20");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let b_rect = lay.rects.iter().find(|(id, _)| *id == b).unwrap().1;
+        assert_eq!(
+            b_rect.origin.x, 30.0,
+            "uniform gap (20 width + 10 gap) still applies"
+        );
+    }
+
+    #[test]
+    fn font_size_sizes_a_text_cell_independent_of_height() {
+        // A text leaf with `font-size: 24` and no `height` sizes its cell from font-size:
+        // height = 24, and width matches the renderer's baked advance at that size
+        // (scale = floor(24/8) = 3, advance = 24px/glyph, 2 chars -> 48).
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let t = e.create_text("ab"); // 2 chars
+        e.append(col, t);
+        e.set_inline_style(t, FONT_SIZE, "24");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let t_rect = lay.rects.iter().find(|(id, _)| *id == t).unwrap().1;
+        assert_eq!(
+            t_rect.size,
+            Size { w: 48.0, h: 24.0 },
+            "font-size drives the text cell size when height is absent"
+        );
+        let size = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { size, .. } => Some(*size),
+                _ => None,
+            })
+            .expect("text run");
+        assert_eq!(size, 24.0, "the run's size is the font-size");
+    }
+
+    #[test]
+    fn font_size_wins_over_height_for_text_cell() {
+        // When both are present, font-size determines the text cell (height is no longer
+        // the glyph size): font-size 16 over height 40 -> a 16px run.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let t = e.create_text("x");
+        e.append(col, t);
+        e.set_inline_style(t, HEIGHT, "40");
+        e.set_inline_style(t, FONT_SIZE, "16");
+
+        let dom = dom_from(e);
+        let (_, lay) = layout(&dom, Size { w: 200.0, h: 100.0 });
+        let t_rect = lay.rects.iter().find(|(id, _)| *id == t).unwrap().1;
+        assert_eq!(
+            t_rect.size.h, 16.0,
+            "font-size, not height, drives the text cell height"
+        );
+    }
+
+    #[test]
+    fn border_insets_content_via_the_box_model() {
+        // The border now participates in the box model (it is fed to Taffy), so a bordered
+        // container insets its child by the border width — not just paints a frame on top.
+        // A 100x100 column with a 6px border places its child at (6, 6).
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        e.set_inline_style(col, WIDTH, "100");
+        e.set_inline_style(col, HEIGHT, "100");
+        e.set_inline_style(col, BORDER_WIDTH, "6");
+        e.set_inline_style(col, BORDER_COLOR, "#89b4fa");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(col, child);
+        e.set_inline_style(child, WIDTH, "20");
+        e.set_inline_style(child, HEIGHT, "20");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        let child_rect = lay.rects.iter().find(|(id, _)| *id == child).unwrap().1;
+        assert_eq!(
+            child_rect.origin,
+            Point { x: 6.0, y: 6.0 },
+            "the border width insets content, like padding"
+        );
+        // The frame is still emitted (push_border unchanged), now consistent with the inset.
+        let has_border = scene
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Border { width, .. } if *width == 6.0));
+        assert!(has_border, "the border frame is still painted");
+    }
+
+    #[test]
+    fn z_index_orders_sibling_paint() {
+        // Two overlapping siblings: the one with the LOWER z-index paints first (behind),
+        // the higher one later (on top), even though the higher one comes first in tree
+        // order — so z-index, not tree order, decides.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        // `high` is first in tree order but has the greater z-index -> must paint LAST.
+        let high = e.create_element(ElementTag::new(2));
+        e.append(col, high);
+        e.set_inline_style(high, WIDTH, "20");
+        e.set_inline_style(high, HEIGHT, "20");
+        e.set_inline_style(high, BG, "#ff0000");
+        e.set_inline_style(high, Z_INDEX, "5");
+        let low = e.create_element(ElementTag::new(2));
+        e.append(col, low);
+        e.set_inline_style(low, WIDTH, "20");
+        e.set_inline_style(low, HEIGHT, "20");
+        e.set_inline_style(low, BG, "#0000ff");
+        e.set_inline_style(low, Z_INDEX, "1");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let red_idx = scene
+            .items
+            .iter()
+            .position(|i| {
+                matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0xff, 0x00, 0x00))
+            })
+            .expect("red rect");
+        let blue_idx = scene
+            .items
+            .iter()
+            .position(|i| {
+                matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0x00, 0x00, 0xff))
+            })
+            .expect("blue rect");
+        assert!(
+            blue_idx < red_idx,
+            "lower z-index (blue, z=1) paints before higher (red, z=5), regardless of tree order"
+        );
+    }
+
+    #[test]
+    fn equal_z_index_keeps_tree_order() {
+        // Equal z-index (the common all-default case) preserves tree order: the first
+        // sibling still paints first. This proves the z-sort is stable.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let first = e.create_element(ElementTag::new(2));
+        e.append(col, first);
+        e.set_inline_style(first, WIDTH, "20");
+        e.set_inline_style(first, HEIGHT, "20");
+        e.set_inline_style(first, BG, "#ff0000");
+        let second = e.create_element(ElementTag::new(2));
+        e.append(col, second);
+        e.set_inline_style(second, WIDTH, "20");
+        e.set_inline_style(second, HEIGHT, "20");
+        e.set_inline_style(second, BG, "#0000ff");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let red_idx = scene
+            .items
+            .iter()
+            .position(|i| {
+                matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0xff, 0x00, 0x00))
+            })
+            .expect("red rect");
+        let blue_idx = scene
+            .items
+            .iter()
+            .position(|i| {
+                matches!(i, DisplayItem::Rect { color, .. }
+                if (color.r, color.g, color.b) == (0x00, 0x00, 0xff))
+            })
+            .expect("blue rect");
+        assert!(
+            red_idx < blue_idx,
+            "equal z-index keeps tree order (stable sort): first sibling paints first"
+        );
     }
 }

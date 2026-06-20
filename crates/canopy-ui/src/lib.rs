@@ -50,6 +50,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -65,6 +66,45 @@ use canopy_view::{App, CLICK};
 /// A class list as the macro and hand-written code supply it: `'static` so it can be
 /// retained in the styled registry and replayed on hover/reload without allocating.
 pub type Classes = &'static [&'static str];
+
+/// The lite-tier element identity `Ui` records per styled node so it can resolve the
+/// **full** selector model (type / id / class / compound) author-side — the same triple
+/// the C-ABI host builds from its retained `Dom` before calling
+/// [`Stylesheet::resolve_for`](canopy_style_css::Stylesheet::resolve_for). Keeping it
+/// here lets the in-process Rust/`rsx!` path honor `button { … }` / `#id { … }` /
+/// `button.primary { … }` rules exactly as the freestanding render path does.
+#[derive(Clone, Default)]
+struct Identity {
+    /// The well-known [`ElementTag`] the node was created with (COLUMN/ROW/BUTTON/INPUT or
+    /// an `el(TAG)` escape hatch), used to derive a canonical CSS type name when no explicit
+    /// tag-name was declared. `None` for a text leaf.
+    tag: Option<ElementTag>,
+    /// An explicit CSS local name declared via [`Ui::tag`] (wins over the derived name).
+    tag_name: Option<String>,
+    /// The CSS id declared via [`Ui::set_id`].
+    id: Option<String>,
+}
+
+impl Identity {
+    /// The CSS type/tag name this node matches against, mirroring `canopy-abi`'s
+    /// `element_type_name`: a guest-declared name wins; otherwise the canonical name of the
+    /// well-known [`ElementTag`] (COLUMN→`div`, ROW→`row`, BUTTON→`button`, INPUT→`input`).
+    /// Text leaves (no tag, no name) → `None`, so the two paths agree on what participates.
+    fn type_name(&self) -> Option<&str> {
+        if let Some(name) = self.tag_name.as_deref() {
+            return Some(name);
+        }
+        // The reference-host ElementTag ids (canopy-view): COLUMN=1, ROW=2, BUTTON=3, INPUT=4.
+        // COLUMN is the generic flex/block container, so its CSS name is the familiar `div`.
+        Some(match self.tag?.raw() {
+            1 => "div",
+            2 => "row",
+            3 => "button",
+            4 => "input",
+            _ => return None,
+        })
+    }
+}
 
 /// The Canopy authoring context: an [`App`], its stylesheet, and the registry of
 /// styled nodes — the single value the [`rsx!`](canopy_rsx::rsx) macro lowers onto and
@@ -107,6 +147,12 @@ pub struct Ui {
     /// Every `(node, classes)` styled through [`class`](Ui::class), in styling order —
     /// the registry that both `:hover` and hot-reload replay from.
     styled: RefCell<Vec<(NodeId, Classes)>>,
+    /// Per-node element identity (well-known tag, explicit tag-name, id) recorded as nodes
+    /// are created and as [`tag`](Ui::tag)/[`set_id`](Ui::set_id) run, so the lite tier can
+    /// resolve the full selector model author-side via
+    /// [`resolve_for`](canopy_style_css::Stylesheet::resolve_for) — the same identity the
+    /// C-ABI host builds, so both paths style an identical sheet identically.
+    identity: RefCell<BTreeMap<NodeId, Identity>>,
 }
 
 impl Ui {
@@ -120,6 +166,7 @@ impl Ui {
             css_src: String::new(),
             css: RefCell::new(Stylesheet::new()),
             styled: RefCell::new(Vec::new()),
+            identity: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -135,6 +182,7 @@ impl Ui {
             css_src: src.to_string(),
             css: RefCell::new(canopy_style_css::parse(src)),
             styled: RefCell::new(Vec::new()),
+            identity: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -151,6 +199,7 @@ impl Ui {
             css_src: src.to_string(),
             css: RefCell::new(Stylesheet::new()),
             styled: RefCell::new(Vec::new()),
+            identity: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -191,20 +240,32 @@ impl Ui {
 
     // ---- Node builders (the surface `rsx!` lowers onto) -------------------------
 
+    /// Record the well-known [`ElementTag`] `node` was created with, so the lite tier can
+    /// later derive its canonical CSS type name for `resolve_for` (see [`Identity`]).
+    fn record_tag(&self, node: NodeId, tag: ElementTag) {
+        self.identity.borrow_mut().entry(node).or_default().tag = Some(tag);
+    }
+
     /// Create a column (flex, vertical) element and return its handle.
     pub fn column(&self) -> NodeId {
-        self.app.el(canopy_view::COLUMN)
+        let node = self.app.el(canopy_view::COLUMN);
+        self.record_tag(node, canopy_view::COLUMN);
+        node
     }
 
     /// Create a row (flex, horizontal) element and return its handle.
     pub fn row(&self) -> NodeId {
-        self.app.el(canopy_view::ROW)
+        let node = self.app.el(canopy_view::ROW);
+        self.record_tag(node, canopy_view::ROW);
+        node
     }
 
     /// Create an element of an arbitrary host-defined `tag` (the `El(TAG)` escape
     /// hatch).
     pub fn el(&self, tag: ElementTag) -> NodeId {
-        self.app.el(tag)
+        let node = self.app.el(tag);
+        self.record_tag(node, tag);
+        node
     }
 
     /// Create a text leaf with static `value`.
@@ -222,13 +283,16 @@ impl Ui {
 
     /// Create a button element with a static text child, returning the **button** node.
     pub fn button(&self, text: &str) -> NodeId {
-        self.app.button(text)
+        let node = self.app.button(text);
+        self.record_tag(node, canopy_view::BUTTON);
+        node
     }
 
     /// Create a button whose text child is **bound** to `f` (the reactive counterpart
     /// of [`button`](Ui::button)); returns the button node.
     pub fn button_bound(&self, f: impl Fn() -> String + 'static) -> NodeId {
         let button = self.app.el(canopy_view::BUTTON);
+        self.record_tag(button, canopy_view::BUTTON);
         let label = self.label_bound(f);
         self.app.mount(button, label);
         button
@@ -236,7 +300,9 @@ impl Ui {
 
     /// Create a single-line text input seeded with `initial`, returning the input node.
     pub fn input(&self, initial: &str) -> NodeId {
-        self.app.text_input(initial)
+        let node = self.app.text_input(initial);
+        self.record_tag(node, canopy_view::INPUT);
+        node
     }
 
     /// Append `child` under `parent` (source-order, so the op-stream matches the tree).
@@ -252,10 +318,17 @@ impl Ui {
     /// Resolve `classes` onto `node` through the stylesheet **and record** the pair so
     /// hover and hot-reload can replay it. This is the only styling path `rsx!` emits,
     /// which is what keeps the reload registry exactly equal to the set of styled nodes.
+    ///
+    /// On the [`Lite`](Cascade::Lite) tier the rules are resolved author-side through the
+    /// **full** selector model ([`resolve_for`](canopy_style_css::Stylesheet::resolve_for)):
+    /// the node's recorded type-name/id (from its creating tag, [`tag`](Ui::tag), and
+    /// [`set_id`](Ui::set_id)) join `classes` in a [`MatchTarget`], so `button { … }`,
+    /// `#id { … }`, and compound `button.primary { … }` rules style the in-process tree
+    /// exactly as they style the freestanding/C-ABI render path.
     pub fn class(&self, node: NodeId, classes: Classes) {
         match self.cascade {
             // Constrained tier: resolve the rules to inline styles author-side.
-            Cascade::Lite => self.css.borrow().apply(&self.app, node, classes),
+            Cascade::Lite => self.apply_node(node, classes, false),
             // Capable tier: carry the class NAMES to the host for a real cascade.
             Cascade::Capable => {
                 let em = self.app.emitter();
@@ -268,21 +341,54 @@ impl Ui {
         self.styled.borrow_mut().push((node, classes));
     }
 
-    /// Declare `node`'s CSS local name (e.g. `"div"`, `"button"`) for a host-side
-    /// cascade. No-op on the lite tier (which has no host cascade to use it).
-    pub fn tag(&self, node: NodeId, name: &str) {
-        if self.cascade == Cascade::Capable {
-            self.app.emitter().borrow_mut().set_tag_name(node, name);
+    /// Resolve `classes` (with the node's recorded identity) at the given `hovered` state
+    /// through the lite [`Stylesheet`] and replay the resulting inline-style ops onto
+    /// `node`. The identity (type-name + id) is what makes type/id/compound selectors take
+    /// effect on the in-process tier; for a purely class-based sheet it folds back to the
+    /// legacy class-only result (type/id are simply unmatched).
+    fn apply_node(&self, node: NodeId, classes: &[&str], hovered: bool) {
+        let ident = self
+            .identity
+            .borrow()
+            .get(&node)
+            .cloned()
+            .unwrap_or_default();
+        let type_name = ident.type_name();
+        let id = ident.id.as_deref();
+        let target = canopy_style_css::MatchTarget {
+            type_name,
+            id,
+            classes,
+        };
+        for (prop, value) in self.css.borrow().resolve_for(&target, hovered) {
+            self.app.style(node, prop, &value);
         }
     }
 
-    /// Set `node`'s CSS id for a host-side cascade. No-op on the lite tier.
+    /// Declare `node`'s CSS local name (e.g. `"div"`, `"button"`). On the
+    /// [`Capable`](Cascade::Capable) tier this carries the name to the host for its real
+    /// cascade; on the [`Lite`](Cascade::Lite) tier it is **recorded locally** so the
+    /// author-side `resolve_for` matches `type` and compound selectors against it (a
+    /// declared name wins over the canonical name derived from the creating tag).
+    pub fn tag(&self, node: NodeId, name: &str) {
+        if self.cascade == Cascade::Capable {
+            self.app.emitter().borrow_mut().set_tag_name(node, name);
+        } else {
+            self.identity.borrow_mut().entry(node).or_default().tag_name = Some(name.to_string());
+        }
+    }
+
+    /// Set `node`'s CSS id. On the [`Capable`](Cascade::Capable) tier this carries the id to
+    /// the host for its real cascade; on the [`Lite`](Cascade::Lite) tier it is **recorded
+    /// locally** so the author-side `resolve_for` matches `#id` and compound selectors.
     pub fn set_id(&self, node: NodeId, id: &str) {
         if self.cascade == Cascade::Capable {
             self.app
                 .emitter()
                 .borrow_mut()
                 .set_attribute(node, canopy_protocol::AttrId::ID, id);
+        } else {
+            self.identity.borrow_mut().entry(node).or_default().id = Some(id.to_string());
         }
     }
 
@@ -401,13 +507,19 @@ impl Ui {
         }
     }
 
-    /// Re-resolve `node`'s classes with the given `hovered` state and emit the
+    /// Re-resolve `node`'s identity + classes with the given `hovered` state and emit the
     /// resulting inline-style ops (the host applies the batch and redraws). Does
-    /// nothing if `node` was not styled through this `Ui`.
+    /// nothing if `node` was not styled through this `Ui`. Resolves through the full
+    /// selector model so a `:hover` rule on a type/id/compound selector restyles too.
     pub fn set_hover(&self, node: NodeId, hovered: bool) {
-        let css = self.css.borrow();
-        if let Some((_, classes)) = self.styled.borrow().iter().find(|(id, _)| *id == node) {
-            css.apply_state(&self.app, node, classes, hovered);
+        let classes = self
+            .styled
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == node)
+            .map(|(_, classes)| *classes);
+        if let Some(classes) = classes {
+            self.apply_node(node, classes, hovered);
         }
     }
 
@@ -420,15 +532,15 @@ impl Ui {
     /// and applies it to its [`Dom`], so a malformed reload is rejected at the
     /// capability boundary rather than corrupting the tree.
     pub fn reload_css(&self, src: &str, hovered: Option<NodeId>) -> usize {
-        let css = canopy_style_css::parse(src);
-        let styled = self.styled.borrow();
-        for (node, classes) in styled.iter() {
-            css.apply_state(&self.app, *node, classes, hovered == Some(*node));
+        // Swap the freshly parsed sheet in first, then replay every styled node through the
+        // full selector model (`apply_node` borrows `self.css`), so type/id/compound rules in
+        // the edited sheet take effect on reload exactly as they did on the initial apply.
+        *self.css.borrow_mut() = canopy_style_css::parse(src);
+        let nodes: Vec<(NodeId, Classes)> = self.styled.borrow().clone();
+        for (node, classes) in &nodes {
+            self.apply_node(*node, classes, hovered == Some(*node));
         }
-        let n = styled.len();
-        drop(styled);
-        *self.css.borrow_mut() = css;
-        n
+        nodes.len()
     }
 }
 
@@ -570,6 +682,143 @@ mod tests {
                 b: 0x30,
                 a: 255
             }
+        );
+    }
+
+    /// A sheet driven entirely by the NEW selector model (type / id / compound), with no
+    /// pure-class rule — proving the in-process lite path now honors it via `resolve_for`.
+    const SELECTORS: &str = "
+        button       { background: #111111 }
+        #submit      { color: #222222 }
+        button.primary { padding: 4px }
+        div          { background: #333333 }
+    ";
+
+    #[test]
+    fn lite_type_selector_styles_in_process() {
+        // A `button { … }` TYPE rule. Before routing through resolve_for the lite tier
+        // matched class-only, so a button authored from Rust got no `button {}` styling.
+        let ui = Ui::with_css(SELECTORS);
+        let btn = ui.button("ok");
+        ui.class(btn, &[]); // styled with NO classes — only the type selector can match
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#111111"),
+            "button{{}} type rule styles the in-process button"
+        );
+    }
+
+    #[test]
+    fn lite_column_type_name_is_div() {
+        // COLUMN's canonical CSS type name is `div` (mirrors canopy-abi), so `div { … }`
+        // must match a `ui.column()` even though no class or tag-name was set.
+        let ui = Ui::with_css(SELECTORS);
+        let col = ui.column();
+        ui.class(col, &[]);
+        ui.mount_root(col);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(col, BG),
+            Some("#333333"),
+            "COLUMN derives the `div` type name, so `div{{}}` matches"
+        );
+    }
+
+    #[test]
+    fn lite_id_selector_styles_in_process() {
+        // An `#submit { … }` ID rule applied via set_id on the lite tier (previously a no-op).
+        let ui = Ui::with_css(SELECTORS);
+        let btn = ui.button("ok");
+        ui.set_id(btn, "submit");
+        ui.class(btn, &[]);
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, FG),
+            Some("#222222"),
+            "#submit id rule styles the in-process node"
+        );
+    }
+
+    #[test]
+    fn lite_compound_selector_styles_in_process() {
+        // A compound `button.primary { … }` — needs BOTH the type and the class to match.
+        const PAD: PropId = canopy_paint::PADDING;
+        let ui = Ui::with_css(SELECTORS);
+
+        let primary = ui.button("ok");
+        ui.class(primary, &["primary"]);
+        ui.mount_root(primary);
+
+        // A non-button with `.primary` must NOT pick up the compound rule.
+        let div = ui.column();
+        ui.class(div, &["primary"]);
+        ui.mount_root(div);
+
+        let dom = mount(&ui);
+        // The lite parser normalizes `4px` length values to the bare number `4`.
+        assert_eq!(
+            dom.style(primary, PAD),
+            Some("4"),
+            "button.primary compound rule matches the button"
+        );
+        assert_eq!(
+            dom.style(div, PAD),
+            None,
+            "compound rule does not match a non-button with the same class"
+        );
+        // The button also still gets the bare `button {}` rule (cascade across selectors).
+        assert_eq!(dom.style(primary, BG), Some("#111111"));
+    }
+
+    #[test]
+    fn lite_explicit_tag_overrides_derived_name() {
+        // ui.tag() on the lite tier records an explicit CSS local name that wins over the
+        // tag-derived one, so a COLUMN tagged "button" matches `button {}` not `div {}`.
+        let ui = Ui::with_css(SELECTORS);
+        let node = ui.column();
+        ui.tag(node, "button");
+        ui.class(node, &[]);
+        ui.mount_root(node);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(node, BG),
+            Some("#111111"),
+            "declared tag-name `button` wins over the COLUMN-derived `div`"
+        );
+    }
+
+    #[test]
+    fn lite_selectors_survive_reload_and_hover() {
+        // reload_css and set_hover both go through resolve_for, so a type/id/compound `:hover`
+        // rule restyles the in-process tree too (not just class-based ones).
+        const SHEET: &str = "button { background: #111111 } button:hover { background: #999999 }";
+        let ui = Ui::with_css(SHEET);
+        let btn = ui.button("ok");
+        ui.class(btn, &[]);
+        ui.mount_root(btn);
+        let mut dom = mount(&ui);
+        assert_eq!(dom.style(btn, BG), Some("#111111"));
+
+        // Type-selector :hover restyles the button.
+        ui.set_hover(btn, true);
+        dom.apply(&ui.take_batch(1)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#999999"),
+            "button:hover type rule restyles on hover"
+        );
+
+        // A reload replays identity through the new sheet.
+        let n = ui.reload_css("button { background: #abcdef }", None);
+        assert_eq!(n, 1);
+        dom.apply(&ui.take_batch(2)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#abcdef"),
+            "reload re-resolves the type selector against the edited sheet"
         );
     }
 

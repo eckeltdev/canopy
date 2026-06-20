@@ -33,6 +33,9 @@ canopy-render-soft = { path = "../canopy-render-soft" }
 # The CSS-lite class engine: parse a stylesheet of `.class { prop: value }` rules and resolve a
 # node's classes to (PropId, value) decls — the host-side cascade behind canopy_host_set_stylesheet.
 canopy-style-css = { path = "../canopy-style-css" }
+# The PropId registry + `is_inherited`: the single source of truth for which properties inherit
+# down the element tree, which the host-side cascade threads through `styled_dom`.
+canopy-paint = { path = "../canopy-paint" }
 
 [dev-dependencies]
 # The guest-side op-builder, used by the tests to produce real op batches.
@@ -41,7 +44,6 @@ canopy-core = { path = "../canopy-core" }
 # machine-check include/canopy_protocol.h against the live constants (ElementTag/EventKind
 # in canopy-view, PropId in canopy-paint) and catch any header drift.
 canopy-view = { path = "../canopy-view" }
-canopy-paint = { path = "../canopy-paint" }
 
 [lints]
 workspace = true
