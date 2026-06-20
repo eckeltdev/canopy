@@ -433,6 +433,34 @@ pub enum DisplayItem {
         /// Offset of the shadow from the box (positive `x` = right, `y` = down).
         offset: Point,
     },
+    /// Push a **clip region** onto the renderer's clip stack.
+    ///
+    /// Every primitive painted after this item — up to the matching [`PopClip`](Self::PopClip)
+    /// — is masked to `rect`, with its corners rounded by `radius` logical px (`0.0` = sharp),
+    /// **intersected** with any clip already on the stack. This is how the display-list analog
+    /// of CSS `overflow: hidden` / `overflow: clip` masks a node's descendants to its box:
+    /// the producer emits `PushClip { rect: <the clipping box>, radius: <its border-radius> }`,
+    /// then the descendants' items, then a `PopClip`. A child overflowing the (rounded) box is
+    /// carved away at the boundary.
+    ///
+    /// A renderer that does not implement clipping skips this item (and its [`PopClip`]) via the
+    /// `#[non_exhaustive]` catch-all, so the descendants simply paint unclipped — a faithful,
+    /// never-panicking degradation. The CPU tier ([`canopy_render_soft`](https://docs.rs/canopy-render-soft))
+    /// honors it.
+    PushClip {
+        /// The clip box in absolute logical coords. Pixels outside it are rejected.
+        rect: Rect,
+        /// Corner radius in logical px (clamped to half the shorter side); `0.0` = sharp
+        /// corners. A positive radius masks the four rounded corners as well as the edges.
+        radius: f32,
+    },
+    /// Pop the most recent clip region pushed by [`PushClip`](Self::PushClip).
+    ///
+    /// Restores the enclosing clip (or no clip, if the stack is now empty). Producers emit one
+    /// `PopClip` for every `PushClip`, after the clipped descendants. A renderer that ignores
+    /// `PushClip` ignores this too (the catch-all), keeping the pair a no-op on tiers without
+    /// clipping.
+    PopClip,
 }
 
 /// A flat, back-to-front list of primitives handed to a [`Renderer`].
@@ -733,5 +761,36 @@ mod tests {
             }
             _ => panic!("third item is a Shadow"),
         }
+    }
+
+    /// The clip primitives are plain-data: a `PushClip`/`PopClip` pair can be built and
+    /// pushed into a `DisplayList`, and `PushClip` round-trips its `rect`/`radius`. This is
+    /// the compile + smoke proof for the WAVE-4a clip variants.
+    #[test]
+    fn clip_display_items_carry_their_data() {
+        let rect = Rect {
+            origin: Point { x: 4.0, y: 5.0 },
+            size: Size { w: 20.0, h: 12.0 },
+        };
+        let list = DisplayList {
+            items: alloc::vec![
+                DisplayItem::PushClip { rect, radius: 6.0 },
+                DisplayItem::Rect {
+                    rect,
+                    color: Color::default(),
+                    radius: 0.0,
+                },
+                DisplayItem::PopClip,
+            ],
+        };
+        assert_eq!(list.items.len(), 3);
+        match &list.items[0] {
+            DisplayItem::PushClip { rect, radius } => {
+                assert_eq!(rect.size.w, 20.0);
+                assert_eq!(*radius, 6.0);
+            }
+            _ => panic!("first item is a PushClip"),
+        }
+        assert!(matches!(list.items[2], DisplayItem::PopClip));
     }
 }

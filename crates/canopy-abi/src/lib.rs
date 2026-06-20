@@ -1391,6 +1391,36 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_overflow_hidden_masks_an_overflowing_child() {
+        // A 40x40 `overflow: hidden` box with a 100x100 red child: the child paints inside the box
+        // but is clipped to it. Proves the full chain — overflow parsed (style-css), a PushClip/
+        // PopClip emitted around the child (layout-taffy), and the clip stack masks pixels outside
+        // the box (render-soft).
+        let mut e = Emitter::new();
+        let clip = e.create_element(ElementTag::new(1));
+        e.append(ROOT, clip);
+        e.set_attribute(clip, AttrId::ID, "clip");
+        let child = e.create_element(ElementTag::new(1));
+        e.append(clip, child);
+        e.set_class(child, "big");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_viewport(100.0, 100.0);
+        host.set_stylesheet(
+            "#clip { width: 40; height: 40; overflow: hidden } \
+             .big  { width: 100; height: 100; background: #ff0000 }",
+        );
+
+        let buf = host.render_rgba(100, 100);
+        let is_red = |x: usize, y: usize| {
+            let i = (y * 100 + x) * 4;
+            buf[i] > 200 && buf[i + 1] < 80 && buf[i + 2] < 80
+        };
+        assert!(is_red(20, 20), "child paints inside the 40x40 clip box");
+        assert!(!is_red(60, 60), "child is masked outside the clip box");
+    }
+
+    #[test]
     fn hover_restyles_the_node_under_the_pointer() {
         // A button styled by class: `.btn` is blue, `.btn:hover` is red. Moving the pointer over
         // it must apply `:hover` (red); moving away reverts (blue).

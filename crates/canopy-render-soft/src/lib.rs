@@ -281,6 +281,18 @@ pub struct Buffer {
     width: usize,
     height: usize,
     data: Vec<u8>,
+    /// The active clip stack: each entry is a `(rect, radius)` region. A pixel is painted
+    /// only if it lies inside **every** region on the stack (each tested as a rounded rect).
+    /// An empty stack = no clipping, so every existing call path is unchanged.
+    ///
+    /// Maintained by [`push_clip`](Buffer::push_clip) / [`pop_clip`](Buffer::pop_clip), which
+    /// the [`Renderer`] drives from [`DisplayItem::PushClip`] / [`DisplayItem::PopClip`].
+    clips: Vec<(Rect, f32)>,
+    /// The running intersection of every axis-aligned rect on `clips`, as integer pixel bounds
+    /// `(x0, y0, x1, y1)` (half-open: `x0..x1`, `y0..y1`), or `None` when the stack is empty
+    /// (no clip). This is the cheap fast-rejection box: a pixel outside it is rejected without
+    /// any per-region rounded-corner math. Recomputed whenever the stack changes.
+    clip_bounds: Option<(usize, usize, usize, usize)>,
 }
 
 impl Buffer {
@@ -290,7 +302,76 @@ impl Buffer {
             width,
             height,
             data: vec![0; width * height * 4],
+            clips: Vec::new(),
+            clip_bounds: None,
         }
+    }
+
+    /// Push a clip region (`rect` rounded by `radius`) onto the clip stack. Subsequent pixel
+    /// writes are masked to this region intersected with any region already on the stack, until
+    /// the matching [`pop_clip`](Buffer::pop_clip). Drives [`DisplayItem::PushClip`].
+    pub fn push_clip(&mut self, rect: Rect, radius: f32) {
+        self.clips.push((rect, radius));
+        self.recompute_clip_bounds();
+    }
+
+    /// Pop the most recently pushed clip region (no-op on an empty stack). Drives
+    /// [`DisplayItem::PopClip`].
+    pub fn pop_clip(&mut self) {
+        self.clips.pop();
+        self.recompute_clip_bounds();
+    }
+
+    /// Clear the entire clip stack (back to "no clipping"). Used at the start of every
+    /// [`Renderer::render`] pass so an unbalanced `PushClip`/`PopClip` list from a prior frame
+    /// cannot leak a stale clip forward.
+    pub fn reset_clips(&mut self) {
+        self.clips.clear();
+        self.clip_bounds = None;
+    }
+
+    /// Recompute [`clip_bounds`](Buffer::clip_bounds) — the integer-pixel intersection of every
+    /// rect on the stack — after a push or pop. With no clips the bound is `None` (paint
+    /// everything). Each rect contributes its floor/ceil pixel span; the intersection is the
+    /// running max of the lows and min of the highs, so an empty intersection yields `x0 >= x1`
+    /// (everything rejected).
+    fn recompute_clip_bounds(&mut self) {
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        for &(rect, _) in &self.clips {
+            let rx0 = rect.origin.x.max(0.0) as usize;
+            let ry0 = rect.origin.y.max(0.0) as usize;
+            let rx1 = ceil_to_usize(rect.origin.x + rect.size.w);
+            let ry1 = ceil_to_usize(rect.origin.y + rect.size.h);
+            bounds = Some(match bounds {
+                None => (rx0, ry0, rx1, ry1),
+                Some((x0, y0, x1, y1)) => (x0.max(rx0), y0.max(ry0), x1.min(rx1), y1.min(ry1)),
+            });
+        }
+        self.clip_bounds = bounds;
+    }
+
+    /// Whether pixel `(x, y)` passes the current clip stack — i.e. it lies inside **every**
+    /// region on the stack. An empty stack passes everything (the common, unclipped case, so
+    /// this is a single `is_none` check). Otherwise the fast-rejection [`clip_bounds`] box is
+    /// tested first (a plain integer compare), and only if that passes are the regions with a
+    /// positive radius re-tested for their rounded-corner cutout (sampling the pixel center).
+    /// Square clips need no per-region test — the intersection box already captures them.
+    fn clip_allows(&self, x: usize, y: usize) -> bool {
+        let Some((x0, y0, x1, y1)) = self.clip_bounds else {
+            return true; // no clip
+        };
+        if x < x0 || y < y0 || x >= x1 || y >= y1 {
+            return false; // outside the intersected axis-aligned box
+        }
+        // Inside the box: only rounded regions can still carve this pixel away.
+        let cx = x as f32 + 0.5;
+        let cy = y as f32 + 0.5;
+        for &(rect, radius) in &self.clips {
+            if radius > 0.0 && !point_in_round_rect(cx, cy, rect, radius) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Width in pixels.
@@ -384,6 +465,10 @@ impl Buffer {
                 if cov <= 0.0 {
                     continue;
                 }
+                // Reject any pixel outside the active clip stack (no-op when unclipped).
+                if !self.clip_allows(x, y) {
+                    continue;
+                }
                 let i = (y * self.width + x) * 4;
                 let px = &mut self.data[i..i + 4];
                 if cov >= 1.0 {
@@ -475,6 +560,10 @@ impl Buffer {
                 if cov == 0 {
                     continue;
                 }
+                // Reject any pixel outside the active clip stack (no-op when unclipped).
+                if !self.clip_allows(x, y) {
+                    continue;
+                }
                 let i = (y * self.width + x) * 4;
                 let px = &mut self.data[i..i + 4];
                 if cov == 255 {
@@ -561,6 +650,10 @@ impl Buffer {
                 if cov == 0 {
                     continue;
                 }
+                // Reject any pixel outside the active clip stack (no-op when unclipped).
+                if !self.clip_allows(x, y) {
+                    continue;
+                }
                 let idx = (y * self.width + x) * 4;
                 let px = &mut self.data[idx..idx + 4];
                 if cov == 255 {
@@ -625,6 +718,10 @@ impl Buffer {
                 None
             };
             for x in x0..x1 {
+                // Reject any pixel outside the active clip stack (no-op when unclipped).
+                if !self.clip_allows(x, y) {
+                    continue;
+                }
                 let color = match row_color {
                     Some(c) => c,
                     None => {
@@ -701,6 +798,10 @@ impl Buffer {
                 if a == 0 {
                     continue;
                 }
+                // Reject any pixel outside the active clip stack (no-op when unclipped).
+                if !self.clip_allows(x, y) {
+                    continue;
+                }
                 let i = (y * self.width + x) * 4;
                 blend_over(
                     &mut self.data[i..i + 4],
@@ -715,9 +816,17 @@ impl Buffer {
         }
     }
 
-    /// Paint one opaque pixel, clipped to the buffer.
+    /// Paint one opaque pixel, clipped to the buffer **and** the active clip stack.
+    ///
+    /// This is the single write path for the baked-font text blit, so gating it here clips
+    /// glyph ink to any enclosing `PushClip` region exactly like the fills — a text run
+    /// overflowing a clipped box is masked at the boundary. `clip_allows` is a single
+    /// `is_none` check when unclipped, so the common path is unaffected.
     fn put_pixel(&mut self, x: usize, y: usize, c: Color) {
         if x >= self.width || y >= self.height {
+            return;
+        }
+        if !self.clip_allows(x, y) {
             return;
         }
         let i = (y * self.width + x) * 4;
@@ -861,6 +970,9 @@ impl Renderer for SoftwareRenderer {
 
     fn render(&mut self, scene: &DisplayList) -> Result<(), HostError> {
         self.buffer.clear(self.clear);
+        // Start each frame with an empty clip stack so an unbalanced list from a previous
+        // frame can never leak a stale clip into this one.
+        self.buffer.reset_clips();
         for item in &scene.items {
             match item {
                 DisplayItem::Rect {
@@ -933,6 +1045,16 @@ impl Renderer for SoftwareRenderer {
                     // Soft outset drop shadow: a feathered offset box, blended under the
                     // element (the shadow item is emitted before the box).
                     self.buffer.fill_shadow(*rect, *color, *blur, *offset);
+                }
+                DisplayItem::PushClip { rect, radius } => {
+                    // Begin a clip region: every subsequent write is masked to `rect`
+                    // (rounded by `radius`) intersected with any enclosing clip, until the
+                    // matching PopClip.
+                    self.buffer.push_clip(*rect, *radius);
+                }
+                DisplayItem::PopClip => {
+                    // End the most recent clip region.
+                    self.buffer.pop_clip();
                 }
                 // Shaped-glyph rasterization arrives with the capable-tier text backend.
                 DisplayItem::Glyphs { .. } => {}
@@ -1816,5 +1938,240 @@ mod tests {
             [0, 0, 0, 255],
             "past the edge stays background"
         );
+    }
+
+    /// THE clip proof: a `PushClip`/`PopClip` around a fill that extends well beyond the clip
+    /// rect leaves every pixel **outside** the clip untouched (the clear color) while pixels
+    /// **inside** it are filled — the rasterizer rejects writes outside the clip region.
+    #[test]
+    fn push_clip_masks_a_fill_to_the_clip_rect() {
+        let clear = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let fill = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(20, 20, clear);
+        // Clip to a 8x8 box at (4,4); fill the WHOLE buffer. Only the clipped window is painted.
+        let scene = DisplayList {
+            items: vec![
+                DisplayItem::PushClip {
+                    rect: Rect {
+                        origin: Point { x: 4.0, y: 4.0 },
+                        size: Size { w: 8.0, h: 8.0 },
+                    },
+                    radius: 0.0,
+                },
+                DisplayItem::Rect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 20.0, h: 20.0 },
+                    },
+                    color: fill,
+                    radius: 0.0,
+                },
+                DisplayItem::PopClip,
+            ],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let clear_px = [clear.r, clear.g, clear.b, clear.a];
+        let fill_px = [fill.r, fill.g, fill.b, fill.a];
+
+        // Inside the clip window: filled.
+        assert_eq!(buf.pixel(4, 4), fill_px, "clip top-left corner is filled");
+        assert_eq!(buf.pixel(11, 11), fill_px, "clip window interior is filled");
+        // Just outside the clip window on every side: untouched clear.
+        assert_eq!(buf.pixel(3, 4), clear_px, "left of the clip is untouched");
+        assert_eq!(buf.pixel(12, 4), clear_px, "right of the clip is untouched");
+        assert_eq!(buf.pixel(4, 3), clear_px, "above the clip is untouched");
+        assert_eq!(buf.pixel(4, 12), clear_px, "below the clip is untouched");
+        // Far corner of the buffer: untouched.
+        assert_eq!(buf.pixel(19, 19), clear_px, "far corner is untouched");
+    }
+
+    /// After a `PopClip` the clip is lifted: a second fill paints everywhere again, proving the
+    /// stack pops (the mask does not persist past the matching pop).
+    #[test]
+    fn pop_clip_lifts_the_mask() {
+        let clear = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(16, 16, clear);
+        let scene = DisplayList {
+            items: vec![
+                // A clip nobody paints into, immediately popped.
+                DisplayItem::PushClip {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 4.0, h: 4.0 },
+                    },
+                    radius: 0.0,
+                },
+                DisplayItem::PopClip,
+                // Now unclipped: fill the whole buffer.
+                DisplayItem::Rect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 16.0, h: 16.0 },
+                    },
+                    color: red,
+                    radius: 0.0,
+                },
+            ],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let red_px = [red.r, red.g, red.b, red.a];
+        // A pixel far from the popped clip is painted: the mask was lifted.
+        assert_eq!(
+            buf.pixel(15, 15),
+            red_px,
+            "after pop, painting is unclipped"
+        );
+        assert_eq!(buf.pixel(0, 0), red_px, "the whole buffer is painted");
+    }
+
+    /// A **rounded** clip masks the corners: a `PushClip` with a positive radius around a
+    /// full-box fill carves the four corners away (they keep the clear color) while the center
+    /// is filled — the rounded-rect cutout is honored, not just the axis-aligned box.
+    #[test]
+    fn rounded_clip_masks_the_corners() {
+        let clear = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let fill = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(40, 40, clear);
+        let scene = DisplayList {
+            items: vec![
+                DisplayItem::PushClip {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 40.0, h: 40.0 },
+                    },
+                    radius: 12.0,
+                },
+                DisplayItem::Rect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 40.0, h: 40.0 },
+                    },
+                    color: fill,
+                    radius: 0.0,
+                },
+                DisplayItem::PopClip,
+            ],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let clear_px = [clear.r, clear.g, clear.b, clear.a];
+        let fill_px = [fill.r, fill.g, fill.b, fill.a];
+        // Extreme corners lie outside the radius arc -> carved away (clear).
+        assert_eq!(buf.pixel(0, 0), clear_px, "rounded clip carves the corner");
+        assert_eq!(buf.pixel(39, 0), clear_px, "rounded clip carves the corner");
+        assert_eq!(buf.pixel(0, 39), clear_px, "rounded clip carves the corner");
+        assert_eq!(
+            buf.pixel(39, 39),
+            clear_px,
+            "rounded clip carves the corner"
+        );
+        // The center and the straight mid-edges are inside the rounded clip -> filled.
+        assert_eq!(buf.pixel(20, 20), fill_px, "center is inside the clip");
+        assert_eq!(buf.pixel(20, 0), fill_px, "top mid-edge is inside the clip");
+        assert_eq!(
+            buf.pixel(0, 20),
+            fill_px,
+            "left mid-edge is inside the clip"
+        );
+    }
+
+    /// Nested clips **intersect**: a pixel is painted only if it is inside BOTH clips. Two
+    /// overlapping clip rects admit only their overlap; pixels inside one but not the other —
+    /// and pixels inside neither — stay the clear color.
+    #[test]
+    fn nested_clips_intersect() {
+        let clear = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let fill = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        let mut r = SoftwareRenderer::new(24, 24, clear);
+        // Outer clip: x∈[0,16), y∈[0,16). Inner clip: x∈[8,24), y∈[8,24).
+        // Overlap (paintable): x∈[8,16), y∈[8,16).
+        let scene = DisplayList {
+            items: vec![
+                DisplayItem::PushClip {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 16.0, h: 16.0 },
+                    },
+                    radius: 0.0,
+                },
+                DisplayItem::PushClip {
+                    rect: Rect {
+                        origin: Point { x: 8.0, y: 8.0 },
+                        size: Size { w: 16.0, h: 16.0 },
+                    },
+                    radius: 0.0,
+                },
+                DisplayItem::Rect {
+                    rect: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size { w: 24.0, h: 24.0 },
+                    },
+                    color: fill,
+                    radius: 0.0,
+                },
+                DisplayItem::PopClip,
+                DisplayItem::PopClip,
+            ],
+        };
+        r.render(&scene).unwrap();
+        let buf = r.buffer();
+        let clear_px = [clear.r, clear.g, clear.b, clear.a];
+        let fill_px = [fill.r, fill.g, fill.b, fill.a];
+        // In the intersection: filled.
+        assert_eq!(buf.pixel(8, 8), fill_px, "intersection corner is filled");
+        assert_eq!(
+            buf.pixel(15, 15),
+            fill_px,
+            "intersection interior is filled"
+        );
+        // In the outer clip only (not the inner): rejected.
+        assert_eq!(buf.pixel(2, 2), clear_px, "outer-only region is rejected");
+        // In the inner clip only (not the outer): rejected.
+        assert_eq!(buf.pixel(20, 20), clear_px, "inner-only region is rejected");
+        // In neither: rejected.
+        assert_eq!(buf.pixel(23, 0), clear_px, "outside both is rejected");
     }
 }

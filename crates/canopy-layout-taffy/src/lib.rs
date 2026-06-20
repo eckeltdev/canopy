@@ -49,7 +49,7 @@ use canopy_paint::{
     COLUMN_GAP, DIRECTION, DISPLAY, FG, FLEX_BASIS, FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE,
     GAP, HEIGHT, INSET_BOTTOM, INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, MARGIN, MARGIN_BOTTOM,
     MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY,
-    OUTLINE_COLOR, OUTLINE_OFFSET, OUTLINE_WIDTH, PADDING, PADDING_BOTTOM, PADDING_LEFT,
+    OUTLINE_COLOR, OUTLINE_OFFSET, OUTLINE_WIDTH, OVERFLOW, PADDING, PADDING_BOTTOM, PADDING_LEFT,
     PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TEXT_DECORATION,
     TRANSLATE_X, TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
 };
@@ -253,6 +253,15 @@ struct NodePaint {
     /// Paint order: a higher [`Z_INDEX`] paints later (on top). The display-list builder
     /// stable-sorts siblings by this, so tree order breaks ties for equal z.
     z_index: i32,
+    /// Index of this node's parent entry in the parallel `rects`/`paints` vecs, or `None`
+    /// for a top-level (root-child) node. This recovers the tree structure from the flat
+    /// vecs so [`build_display_list`] can resolve each node's chain of **clip ancestors**
+    /// (the `overflow: hidden`/`clip` nodes above it) and wrap its painting in the right
+    /// `PushClip`/`PopClip` pairs — correct even after the z-index re-sort reorders entries.
+    parent: Option<usize>,
+    /// Whether this node clips its descendants ([`style_clips`]): it establishes a clip
+    /// region (its border-box rounded by [`RADIUS`]) that masks every descendant's paint.
+    clips: bool,
 }
 
 /// Read a sizing property (`prop` is [`WIDTH`] or [`HEIGHT`]) into a Taffy
@@ -471,6 +480,18 @@ fn style_display(dom: &Dom, id: NodeId) -> Display {
 /// children still paint). Anything else (incl. unset / `"visible"`) -> `true`.
 fn style_visible(dom: &Dom, id: NodeId) -> bool {
     !matches!(dom.style(id, VISIBILITY), Some("hidden"))
+}
+
+/// Whether the node **clips its descendants** to its box ([`OVERFLOW`]). `"hidden"` or
+/// `"clip"` -> `true` (descendants are masked to this node's border-box, corners rounded by
+/// its [`RADIUS`]); `"visible"`/`"scroll"`/`"auto"`/unset/anything else -> `false` (no clip).
+///
+/// `scroll`/`auto` would also clip in a browser, but the lite tier has no scroll machinery
+/// yet, so they are treated as non-clipping (overflow paints) until scrolling lands; only the
+/// unconditional `hidden`/`clip` mask is emitted here. This drives the
+/// [`DisplayItem::PushClip`]/[`DisplayItem::PopClip`] pair wrapped around the node's children.
+fn style_clips(dom: &Dom, id: NodeId) -> bool {
+    matches!(dom.style(id, OVERFLOW), Some("hidden") | Some("clip"))
 }
 
 /// The node's [`POSITION`] mapped to a Taffy [`Position`]: `"absolute"` ->
@@ -822,12 +843,14 @@ fn build_node(dom: &Dom, id: NodeId, tree: &mut TaffyTree<NodeId>, depth: usize)
 ///   step, performed once here so [`build_display_list`] can read the resolved value by
 ///   index instead of walking ancestors per text node. `background` is intentionally NOT
 ///   inherited (it stays a per-element read in `build_display_list`).
+#[allow(clippy::too_many_arguments)] // a single recursive walk threading layout + cascade state
 fn collect_rects(
     dom: &Dom,
     tree: &TaffyTree<NodeId>,
     key: taffy::NodeId,
     parent_origin: Point,
     inherited: Inherited,
+    parent: Option<usize>,
     rects: &mut Vec<(NodeId, Rect)>,
     paints: &mut Vec<NodePaint>,
 ) {
@@ -880,12 +903,18 @@ fn collect_rects(
             h: layout.size.height,
         },
     };
+    // The index this node will occupy in `rects`/`paints` (if it pushes an entry); its
+    // children record it as their `parent` so the tree is recoverable from the flat vecs.
+    // A context-less key pushes nothing and forwards the parent index unchanged.
+    let mut child_parent = parent;
     if let Some(id) = id {
         // `visibility` and `z-index` are per-node (not inherited / not accumulated):
         // a hidden node still lays out its visible children, and each node carries its
         // own paint order.
         let visible = style_visible(dom, id);
         let z_index = style_z_index(dom, id);
+        let clips = style_clips(dom, id);
+        let index = rects.len();
         rects.push((id, rect));
         paints.push(NodePaint {
             opacity,
@@ -893,7 +922,10 @@ fn collect_rects(
             align,
             visible,
             z_index,
+            parent,
+            clips,
         });
+        child_parent = Some(index);
     }
     // Children inherit the *untranslated* absolute origin (Taffy locations are relative
     // to it) plus the accumulated/inherited style.
@@ -904,7 +936,16 @@ fn collect_rects(
         align,
     };
     for child in tree.children(key).unwrap() {
-        collect_rects(dom, tree, child, origin, child_inherited, rects, paints);
+        collect_rects(
+            dom,
+            tree,
+            child,
+            origin,
+            child_inherited,
+            child_parent,
+            rects,
+            paints,
+        );
     }
 }
 
@@ -970,6 +1011,8 @@ pub fn layout(dom: &Dom, viewport: Size) -> (DisplayList, LayoutResult) {
                 fg: DEFAULT_FG,
                 align: 0.0,
             },
+            // Top-level nodes have no parent entry, so no enclosing clip.
+            None,
             &mut rects,
             &mut paints,
         );
@@ -1015,6 +1058,19 @@ pub fn build_scene(dom: &Dom, viewport: Size) -> DisplayList {
 /// primitives of its own — its background, border, and text are skipped — but it stays
 /// in the list position-wise so its (visible) children, processed via their own entries,
 /// still paint.
+///
+/// ## Clipping (`overflow: hidden`/`clip`)
+///
+/// A node that clips its descendants ([`NodePaint::clips`]) establishes a clip region — its
+/// border-box rounded by its [`RADIUS`] — that masks every descendant's paint. Because the
+/// list is a flat z-sorted order (not a tree walk), the wrapping is done with a *clip stack*
+/// keyed off each entry's chain of clip ancestors ([`clip_ancestors`], recovered from the
+/// `parent` links): before painting each node, any clip whose subtree we've left is closed
+/// with a [`DisplayItem::PopClip`] and any newly-entered clip is opened with a
+/// [`DisplayItem::PushClip`]. A clip node's OWN background/border paints *unclipped* (the clip
+/// only opens when its first descendant paints), matching CSS where `overflow` clips the
+/// content box's contents, not the element's own box. A scene with no clipping nodes emits
+/// zero clip items, so its output is byte-for-byte the pre-clip list.
 fn build_display_list(
     dom: &Dom,
     rects: &[(NodeId, Rect)],
@@ -1027,6 +1083,10 @@ fn build_display_list(
     order.sort_by_key(|&i| paints.get(i).map(|p| p.z_index).unwrap_or(0));
 
     let mut items = Vec::new();
+    // The currently-open clip regions, as node indices (outermost first). Reconciled against
+    // each painted node's clip-ancestor chain so the right `PushClip`/`PopClip` pairs wrap it,
+    // independent of the z-sorted iteration order. Empty in the no-overflow common case.
+    let mut clip_stack: Vec<usize> = Vec::new();
     for &i in &order {
         let (id, rect) = rects[i];
         let Some(node) = dom.node(id) else { continue };
@@ -1039,12 +1099,17 @@ fn build_display_list(
             align: 0.0,
             visible: true,
             z_index: 0,
+            parent: None,
+            clips: false,
         });
         // `visibility: hidden` lays out but paints nothing of its own; children still
         // emit through their own list entries.
         if !paint.visible {
             continue;
         }
+        // Bring the open clip stack in line with this node's chain of clip ancestors before
+        // painting it (close clips we've left, open clips we've entered).
+        reconcile_clips(dom, rects, paints, i, &mut clip_stack, &mut items);
         // Per-node paint order, back to front: box-shadow (behind the box), the background
         // fill (`Rect`), the background gradient (over the solid fill), the border frame,
         // then — for a text leaf — the text run and its decoration. The outline lands last
@@ -1083,7 +1148,67 @@ fn build_display_list(
         // Outline is paint-only and on top of everything this node drew.
         push_outline(dom, id, rect, paint.opacity, &mut items);
     }
+    // Close any clips still open after the last node (the deepest first), so every PushClip is
+    // balanced by a PopClip.
+    while clip_stack.pop().is_some() {
+        items.push(DisplayItem::PopClip);
+    }
     items
+}
+
+/// The chain of **clip ancestors** of entry `i`, outermost first: the indices of `i`'s
+/// ancestors (walking the `parent` links, excluding `i` itself) whose [`NodePaint::clips`] is
+/// set. These are the `overflow: hidden`/`clip` boxes whose clip regions enclose `i`'s paint;
+/// they nest root→leaf, so the returned order is a valid clip-stack prefix.
+fn clip_ancestors(paints: &[NodePaint], i: usize) -> Vec<usize> {
+    let mut chain: Vec<usize> = Vec::new();
+    let mut cur = paints.get(i).and_then(|p| p.parent);
+    while let Some(a) = cur {
+        if paints.get(a).is_some_and(|p| p.clips) {
+            chain.push(a);
+        }
+        cur = paints.get(a).and_then(|p| p.parent);
+    }
+    // Collected leaf→root; reverse to outermost-first so it nests like the clip stack.
+    chain.reverse();
+    chain
+}
+
+/// Reconcile the open `clip_stack` with the clip-ancestor chain that should enclose entry `i`,
+/// emitting a [`DisplayItem::PopClip`] for each clip we've left and a [`DisplayItem::PushClip`]
+/// (the clip node's border-box rounded by its [`RADIUS`]) for each we've newly entered.
+///
+/// The two chains nest, so they share a common prefix: pop the open stack down to that prefix,
+/// then push the remaining wanted clips. In the all-`overflow: visible` common case both chains
+/// are empty and this is a no-op (no clip items are emitted at all).
+fn reconcile_clips(
+    dom: &Dom,
+    rects: &[(NodeId, Rect)],
+    paints: &[NodePaint],
+    i: usize,
+    clip_stack: &mut Vec<usize>,
+    items: &mut Vec<DisplayItem>,
+) {
+    let want = clip_ancestors(paints, i);
+    // Find how much of the open stack still matches the wanted chain (the shared prefix).
+    let mut common = 0;
+    while common < clip_stack.len() && common < want.len() && clip_stack[common] == want[common] {
+        common += 1;
+    }
+    // Close every open clip past the shared prefix (deepest first).
+    while clip_stack.len() > common {
+        clip_stack.pop();
+        items.push(DisplayItem::PopClip);
+    }
+    // Open every wanted clip past the shared prefix, using the clip node's border-box + radius.
+    for &c in &want[common..] {
+        let (cid, crect) = rects[c];
+        items.push(DisplayItem::PushClip {
+            rect: crect,
+            radius: style_radius(dom, cid),
+        });
+        clip_stack.push(c);
+    }
 }
 
 /// Emit a [`DisplayItem::Border`] frame for `id` over `rect` when the node sets a positive
@@ -3344,5 +3469,214 @@ mod tests {
             Size { w: 32.0, h: 32.0 },
             "deflated by 4 on each side"
         );
+    }
+
+    /// THE clip-emission proof: a node with `overflow: hidden` wraps its children with a
+    /// `PushClip(its border-box, its radius)` … child items … `PopClip`. The PushClip carries
+    /// the clipping node's own rect and `border-radius`, and lands *before* the child's
+    /// background fill, with the PopClip after it — so the child paints inside the clip.
+    #[test]
+    fn overflow_hidden_emits_a_clip_around_its_children() {
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, RADIUS, "8");
+        e.set_inline_style(card, OVERFLOW, "hidden");
+        // A child big enough to overflow the card; it gets its own background fill so we can
+        // locate "the child's paint" in the list between the Push and Pop.
+        let child = e.create_element(ElementTag::new(2));
+        e.append(card, child);
+        e.set_inline_style(child, WIDTH, "80");
+        e.set_inline_style(child, HEIGHT, "80");
+        e.set_inline_style(child, BG, "#ff0000");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        let card_rect = lay.rects.iter().find(|(id, _)| *id == card).unwrap().1;
+
+        // Exactly one PushClip and one PopClip.
+        let push_count = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::PushClip { .. }))
+            .count();
+        let pop_count = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::PopClip))
+            .count();
+        assert_eq!(push_count, 1, "one PushClip for the overflow node");
+        assert_eq!(pop_count, 1, "one matching PopClip");
+
+        // The PushClip carries the card's border-box and its border-radius.
+        let (clip_rect, clip_radius) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::PushClip { rect, radius } => Some((*rect, *radius)),
+                _ => None,
+            })
+            .expect("a PushClip");
+        assert_eq!(clip_rect, card_rect, "clip rect is the card's border-box");
+        assert_eq!(clip_radius, 8.0, "clip radius is the card's border-radius");
+
+        // Order: PushClip ... the child's red background fill ... PopClip.
+        let push_at = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PushClip { .. }))
+            .unwrap();
+        let pop_at = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PopClip))
+            .unwrap();
+        let child_fill_at = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { color, .. } if color.r == 0xff && color.g == 0 && color.b == 0))
+            .expect("the child's red fill");
+        assert!(
+            push_at < child_fill_at && child_fill_at < pop_at,
+            "the child paints between PushClip ({push_at}) and PopClip ({pop_at}), at {child_fill_at}"
+        );
+    }
+
+    /// `overflow: clip` clips identically to `hidden` (both mask descendants to the box).
+    #[test]
+    fn overflow_clip_also_emits_a_clip() {
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, OVERFLOW, "clip");
+        let child = e.create_element(ElementTag::new(2));
+        e.append(card, child);
+        e.set_inline_style(child, WIDTH, "80");
+        e.set_inline_style(child, HEIGHT, "80");
+        e.set_inline_style(child, BG, "#00ff00");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        assert!(
+            scene
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::PushClip { .. })),
+            "overflow: clip emits a PushClip"
+        );
+        assert!(
+            scene
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::PopClip)),
+            "overflow: clip emits a PopClip"
+        );
+    }
+
+    /// A node WITHOUT `overflow` (the default `visible`) emits **neither** a PushClip nor a
+    /// PopClip — clipping is opt-in, so unrelated scenes are byte-for-byte unchanged.
+    #[test]
+    fn no_overflow_emits_no_clip() {
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        // No OVERFLOW set.
+        let child = e.create_element(ElementTag::new(2));
+        e.append(card, child);
+        e.set_inline_style(child, WIDTH, "80");
+        e.set_inline_style(child, HEIGHT, "80");
+        e.set_inline_style(child, BG, "#0000ff");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        assert!(
+            !scene
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::PushClip { .. } | DisplayItem::PopClip)),
+            "no overflow -> no clip items"
+        );
+    }
+
+    /// `overflow: visible` (explicit) and `overflow: scroll`/`auto` (no lite scroll machinery
+    /// yet) do NOT clip — only `hidden`/`clip` emit a mask.
+    #[test]
+    fn overflow_visible_and_scroll_do_not_clip() {
+        for value in ["visible", "scroll", "auto"] {
+            let mut e = Emitter::new();
+            let card = e.create_element(ElementTag::new(1));
+            e.append(ROOT, card);
+            e.set_inline_style(card, WIDTH, "40");
+            e.set_inline_style(card, HEIGHT, "40");
+            e.set_inline_style(card, OVERFLOW, value);
+            let child = e.create_element(ElementTag::new(2));
+            e.append(card, child);
+            e.set_inline_style(child, BG, "#ffffff");
+            let dom = dom_from(e);
+            let (scene, _) = layout(&dom, Size { w: 200.0, h: 200.0 });
+            assert!(
+                !scene
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, DisplayItem::PushClip { .. } | DisplayItem::PopClip)),
+                "overflow: {value} must not clip"
+            );
+        }
+    }
+
+    /// Nested clips: an inner `overflow: hidden` inside an outer one emits **two** PushClips
+    /// (outer then inner, both enclosing the deepest child) balanced by two PopClips — proof the
+    /// clip stack nests correctly through the flat list.
+    #[test]
+    fn nested_overflow_hidden_nests_two_clips() {
+        let mut e = Emitter::new();
+        let outer = e.create_element(ElementTag::new(1));
+        e.append(ROOT, outer);
+        e.set_inline_style(outer, WIDTH, "60");
+        e.set_inline_style(outer, HEIGHT, "60");
+        e.set_inline_style(outer, OVERFLOW, "hidden");
+        let inner = e.create_element(ElementTag::new(2));
+        e.append(outer, inner);
+        e.set_inline_style(inner, WIDTH, "40");
+        e.set_inline_style(inner, HEIGHT, "40");
+        e.set_inline_style(inner, OVERFLOW, "hidden");
+        let leaf = e.create_element(ElementTag::new(3));
+        e.append(inner, leaf);
+        e.set_inline_style(leaf, WIDTH, "80");
+        e.set_inline_style(leaf, HEIGHT, "80");
+        e.set_inline_style(leaf, BG, "#abcdef");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 200.0, h: 200.0 });
+        let pushes = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::PushClip { .. }))
+            .count();
+        let pops = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::PopClip))
+            .count();
+        assert_eq!(pushes, 2, "outer + inner each push a clip");
+        assert_eq!(pops, 2, "both clips are popped");
+
+        // The leaf's fill paints inside BOTH clips: two PushClips before it, two PopClips after.
+        let leaf_at = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { color, .. } if color.r == 0xab))
+            .expect("the leaf fill");
+        let pushes_before = scene.items[..leaf_at]
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::PushClip { .. }))
+            .count();
+        assert_eq!(pushes_before, 2, "both clips are open when the leaf paints");
     }
 }
