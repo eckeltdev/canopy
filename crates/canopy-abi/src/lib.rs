@@ -176,13 +176,19 @@ impl CanopyHost {
         let mut overlay: Vec<(NodeId, PropId, String)> = Vec::new();
         // Ordered top-down traversal (parent before its children) carrying the inherited-property
         // map down the tree, so a child can take its parent's resolved value for any inherited prop.
-        // The root's children start from an empty map (no Dom-root defaults to seed).
-        for &child in dom.children(ROOT) {
+        // The root's children start from an empty map (no Dom-root defaults to seed). The root's
+        // children are siblings of each other, so each carries its index + the sibling count so
+        // structural pseudo-classes (`:first-child`, `:nth-child`, …) resolve on the host path.
+        let root_children = dom.children(ROOT);
+        let root_count = root_children.len() as u32;
+        for (idx, &child) in root_children.iter().enumerate() {
             collect_cascade(
                 &dom,
                 sheet,
                 &hover_path,
                 child,
+                idx as u32,
+                root_count,
                 &BTreeMap::new(),
                 &[],
                 &mut overlay,
@@ -399,7 +405,10 @@ fn element_type_name(node: &canopy_dom::Node) -> Option<&str> {
 /// Walk `node`'s subtree top-down (parent before children), folding the lite cascade into
 /// `overlay`, threading inherited properties down through `inherited`, and threading the
 /// **ancestor stack** (`ancestors`, root-first) down so descendant/child combinators and the
-/// node's attribute pairs join its [`MatchTarget`].
+/// node's attribute pairs join its [`MatchTarget`]. `sibling_index` (0-based) and `sibling_count`
+/// give the node's position among its siblings; together with its own child count they are threaded
+/// via [`MatchTarget::with_structure`] so the structural pseudo-classes (`:first-child`,
+/// `:nth-child`, `:empty`, …) resolve on the host path.
 ///
 /// For each node, in CSS source order of weakening strength:
 /// 1. compute its **own resolved styles** = its author-inline styles ([`canopy_dom::Node::styles`])
@@ -414,11 +423,14 @@ fn element_type_name(node: &canopy_dom::Node) -> Option<&str> {
 ///
 /// This runs over an immutable clone so the collected `overlay` can be applied mutably afterwards
 /// without overlapping the walk (the caller's two-phase split).
+#[allow(clippy::too_many_arguments)]
 fn collect_cascade(
     dom: &Dom,
     sheet: &Stylesheet,
     hover_path: &[NodeId],
     node: NodeId,
+    sibling_index: u32,
+    sibling_count: u32,
     inherited: &BTreeMap<PropId, String>,
     ancestors: &[NodeIdentity<'_>],
     overlay: &mut Vec<(NodeId, PropId, String)>,
@@ -444,10 +456,13 @@ fn collect_cascade(
         // The matcher wants ancestors nearest-first (index 0 = parent); our `ancestors` stack is
         // root-first, so reverse it into borrowed `ElementIdentity`s for this resolve call.
         let chain: Vec<ElementIdentity> = ancestors.iter().rev().map(|a| a.as_element()).collect();
+        // Thread this node's structural context so `:first-child`/`:nth-child`/`:empty`/… resolve:
+        // its 0-based index among its siblings, the total sibling count, and its own child count.
         let target = identity
             .as_match_target()
             .with_attrs(&identity.attrs)
-            .with_ancestors(&chain);
+            .with_ancestors(&chain)
+            .with_structure(sibling_index, sibling_count, n.children.len() as u32);
         for (prop, value) in sheet.resolve_for(&target, hover_path.contains(&node)) {
             // Author inline styles win over class rules (CSS specificity: inline beats a class
             // selector), so only fold in a property the node didn't set itself. The matched-rule
@@ -484,12 +499,17 @@ fn collect_cascade(
     // (it simply never matches a compound).
     let mut child_ancestors: Vec<NodeIdentity> = ancestors.to_vec();
     child_ancestors.push(identity);
-    for &child in &n.children {
+    // Each child knows its 0-based index among its siblings and the total sibling count, so its own
+    // structural pseudo-classes resolve when it is visited.
+    let child_count = n.children.len() as u32;
+    for (idx, &child) in n.children.iter().enumerate() {
         collect_cascade(
             dom,
             sheet,
             hover_path,
             child,
+            idx as u32,
+            child_count,
             &child_inherited,
             &child_ancestors,
             overlay,
@@ -532,13 +552,16 @@ impl<'a> NodeIdentity<'a> {
         MatchTarget::new(self.type_name, self.id, &self.classes)
     }
 
-    /// Borrow this identity as an [`ElementIdentity`] (for an ancestor in another node's chain).
+    /// Borrow this identity as an [`ElementIdentity`] (for an ancestor in another node's chain). An
+    /// ancestor's structural context is not threaded (structural pseudos resolve only on the
+    /// subject node here), so it carries the default [`canopy_style_css::StructInfo::UNKNOWN`].
     fn as_element(&self) -> ElementIdentity<'_> {
         ElementIdentity {
             type_name: self.type_name,
             id: self.id,
             classes: &self.classes,
             attrs: &self.attrs,
+            structure: canopy_style_css::StructInfo::UNKNOWN,
         }
     }
 }
@@ -2081,5 +2104,136 @@ mod tests {
                 CANOPY_ERR_NULL_HOST
             );
         }
+    }
+
+    // --- Wave 3b: structural + functional pseudo-classes via styled_dom ----
+    // (reuses the `styled_prop` helper defined earlier in this test module)
+
+    /// Build a host whose root holds `n` `li` children inside a `ul`, returning the host plus the
+    /// child node ids in order. Each `li` is a real sibling, so structural pseudos resolve.
+    fn host_with_list(n: usize, css: &str) -> (CanopyHost, Vec<NodeId>) {
+        let mut e = Emitter::new();
+        let ul = e.create_element(ElementTag::new(1));
+        e.append(ROOT, ul);
+        e.set_tag_name(ul, "ul");
+        let mut items = Vec::new();
+        for _ in 0..n {
+            let li = e.create_element(ElementTag::new(1));
+            e.append(ul, li);
+            e.set_tag_name(li, "li");
+            items.push(li);
+        }
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(css);
+        (host, items)
+    }
+
+    #[test]
+    fn first_child_styles_only_the_first_sibling() {
+        use canopy_paint::BG;
+        let (host, items) = host_with_list(3, "li:first-child { background: #abcdef }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, items[0], BG).as_deref(),
+            Some("#abcdef"),
+            "the first li is styled by :first-child"
+        );
+        for &later in &items[1..] {
+            assert_eq!(
+                styled_prop(&styled, later, BG),
+                None,
+                ":first-child does not style a non-first sibling"
+            );
+        }
+    }
+
+    #[test]
+    fn nth_child_2n_styles_the_even_siblings() {
+        use canopy_paint::BG;
+        // 5 items, 1-based positions 1..=5; 2n matches the 2nd and 4th (0-based index 1 and 3).
+        let (host, items) = host_with_list(5, "li:nth-child(2n) { background: #020202 }");
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        let styled_indices: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, &li)| styled_prop(&styled, li, BG).is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            styled_indices,
+            vec![1, 3],
+            ":nth-child(2n) styles the 2nd and 4th siblings"
+        );
+    }
+
+    #[test]
+    fn not_excludes_the_right_node() {
+        use canopy_paint::BG;
+        // `li:not(.skip)` styles every li except the one carrying `.skip`.
+        let mut e = Emitter::new();
+        let ul = e.create_element(ElementTag::new(1));
+        e.append(ROOT, ul);
+        e.set_tag_name(ul, "ul");
+        let a = e.create_element(ElementTag::new(1));
+        e.append(ul, a);
+        e.set_tag_name(a, "li");
+        let b = e.create_element(ElementTag::new(1));
+        e.append(ul, b);
+        e.set_tag_name(b, "li");
+        e.set_class(b, "skip");
+        let c = e.create_element(ElementTag::new(1));
+        e.append(ul, c);
+        e.set_tag_name(c, "li");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet("li:not(.skip) { background: #777777 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, a, BG).as_deref(),
+            Some("#777777"),
+            "li without .skip is styled"
+        );
+        assert_eq!(
+            styled_prop(&styled, b, BG),
+            None,
+            ":not(.skip) excludes the .skip li"
+        );
+        assert_eq!(
+            styled_prop(&styled, c, BG).as_deref(),
+            Some("#777777"),
+            "the other plain li is styled"
+        );
+    }
+
+    #[test]
+    fn empty_styles_a_childless_node_end_to_end() {
+        use canopy_paint::BG;
+        // A `div:empty` rule styles the leaf li (no children) but not the ul (which has children).
+        let mut e = Emitter::new();
+        let ul = e.create_element(ElementTag::new(1));
+        e.append(ROOT, ul);
+        e.set_tag_name(ul, "ul");
+        let leaf = e.create_element(ElementTag::new(1));
+        e.append(ul, leaf);
+        e.set_tag_name(leaf, "li");
+
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet("li:empty { background: #0c0c0c } ul:empty { background: #ffffff }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, leaf, BG).as_deref(),
+            Some("#0c0c0c"),
+            "the childless li matches :empty"
+        );
+        assert_eq!(
+            styled_prop(&styled, ul, BG),
+            None,
+            "the ul has a child, so ul:empty does not match"
+        );
     }
 }

@@ -352,8 +352,14 @@ impl Ui {
     /// `apply_node` has **no ancestor context** and passes an empty ancestor chain. Descendant
     /// (` `) and child (`>`) combinators therefore do not yet take effect in the in-process Rust DX
     /// path; they DO work in the freestanding/C-ABI host path (`canopy-abi`), which walks the full
-    /// retained tree. Wiring `Ui` to retain the tree so these combinators resolve author-side is a
-    /// follow-up. Attribute selectors are limited to `[id…]` (the only recorded attribute).
+    /// retained tree. For the same reason there is **no sibling-position context**, so the
+    /// structural pseudo-classes (`:first-child`, `:nth-child`, `:empty`, …) are a documented no-op
+    /// here (the [`MatchTarget`] carries the default `StructInfo::UNKNOWN`, against which they never
+    /// match) — they too resolve only on the host path. Wiring `Ui` to retain the tree so the
+    /// combinators and structural pseudos resolve author-side is a follow-up. The **functional**
+    /// pseudo-classes (`:not`/`:is`/`:where`) over type/id/class/`[id…]` DO work in-process, since
+    /// they only inspect the node's own identity. Attribute selectors are limited to `[id…]` (the
+    /// only recorded attribute).
     fn apply_node(&self, node: NodeId, classes: &[&str], hovered: bool) {
         let ident = self
             .identity
@@ -365,6 +371,9 @@ impl Ui {
         let id = ident.id.as_deref();
         // Expose the recorded id under its CSS attribute name so `[id="x"]` / `[id^="…"]` match.
         let attrs: Vec<(&str, &str)> = id.map(|v| ("id", v)).into_iter().collect();
+        // No sibling-position context is retained in-process, so the target keeps the default
+        // `StructInfo::UNKNOWN`: structural pseudos are a no-op here (see the doc above), while
+        // type/id/class/attr and the functional `:not`/`:is`/`:where` pseudos resolve normally.
         let target = canopy_style_css::MatchTarget::new(type_name, id, classes).with_attrs(&attrs);
         for (prop, value) in self.css.borrow().resolve_for(&target, hovered) {
             self.app.style(node, prop, &value);
@@ -823,6 +832,96 @@ mod tests {
             dom.style(title, BG),
             None,
             "descendant combinators are not yet resolved author-side (no ancestor context in Ui)"
+        );
+    }
+
+    #[test]
+    fn lite_structural_pseudo_is_a_documented_in_process_no_op() {
+        // KNOWN LIMITATION: `Ui` does not retain tree edges, so `apply_node` has no sibling-position
+        // context and the target carries `StructInfo::UNKNOWN`. A structural pseudo therefore never
+        // matches in-process (it DOES work on the freestanding/C-ABI host path). This test pins that
+        // documented behavior; flip it when `Ui` is wired to retain the tree.
+        const SHEET: &str = "button:first-child { background: #abcdef } \
+                             button:nth-child(2n) { background: #fedcba } \
+                             button:empty { color: #102030 }";
+        let ui = Ui::with_css(SHEET);
+        let btn = ui.button("ok");
+        ui.class(btn, &[]);
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, BG),
+            None,
+            "structural pseudos are a no-op in-process (no sibling-position context in Ui)"
+        );
+        assert_eq!(
+            dom.style(btn, FG),
+            None,
+            ":empty is likewise a no-op in-process"
+        );
+    }
+
+    #[test]
+    fn lite_not_over_class_works_in_process() {
+        // The functional `:not(.x)` over a CLASS needs only the node's own identity, so it resolves
+        // author-side. A button WITHOUT `.disabled` is styled; one WITH it is excluded.
+        const SHEET: &str = "button:not(.disabled) { background: #abcdef }";
+        let ui = Ui::with_css(SHEET);
+        let btn = ui.button("ok");
+        ui.class(btn, &[]);
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#abcdef"),
+            "button:not(.disabled) styles a plain button in-process"
+        );
+
+        let ui = Ui::with_css(SHEET);
+        let btn = ui.button("ok");
+        ui.class(btn, &["disabled"]);
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, BG),
+            None,
+            ":not(.disabled) excludes a .disabled button in-process"
+        );
+    }
+
+    #[test]
+    fn lite_is_over_type_and_class_works_in_process() {
+        // `:is(button, .tag)` matches either a button TYPE or a `.tag` class — both resolvable from
+        // the node's own identity, so it works author-side.
+        const SHEET: &str = ":is(button, .tag) { background: #224466 }";
+        // A button (type arm) matches.
+        let ui = Ui::with_css(SHEET);
+        let btn = ui.button("ok");
+        ui.class(btn, &[]);
+        ui.mount_root(btn);
+        assert_eq!(
+            mount(&ui).style(btn, BG),
+            Some("#224466"),
+            ":is matches the button via its type arm"
+        );
+        // A column carrying `.tag` (class arm) matches; one without it does not.
+        let ui = Ui::with_css(SHEET);
+        let tagged = ui.column();
+        ui.class(tagged, &["tag"]);
+        ui.mount_root(tagged);
+        let plain = ui.column();
+        ui.class(plain, &[]);
+        ui.mount(tagged, plain);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(tagged, BG),
+            Some("#224466"),
+            ":is matches the .tag column via its class arm"
+        );
+        assert_eq!(
+            dom.style(plain, BG),
+            None,
+            ":is does not match a column with neither the type nor the class"
         );
     }
 

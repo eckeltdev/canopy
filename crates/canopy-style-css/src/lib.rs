@@ -18,9 +18,9 @@
 //!
 //! A selector is a **complex** selector: a sequence of **compounds** joined by
 //! combinators. A compound is an optional leading type/tag name followed by any run of
-//! `.class`, `#id`, and `[attr]` parts, plus an optional `:hover` pseudo-class on the
-//! subject (rightmost) compound. `*` is the universal (matches anything). A descendant
-//! combinator is whitespace; a child combinator is `>`. Commas group several selectors
+//! `.class`, `#id`, `[attr]`, and pseudo-class parts (`:hover` only on the subject; the structural
+//! and functional pseudo-classes on any compound). `*` is the universal (matches anything). A
+//! descendant combinator is whitespace; a child combinator is `>`. Commas group several selectors
 //! onto one declaration block.
 //!
 //! ```text
@@ -33,11 +33,30 @@
 //! nav > .item           /* child: a direct .item child of nav */
 //! [data-role="nav"]     /* attribute (exact) */
 //! a[href^="https"]      /* type + attribute (prefix) */
+//! li:first-child        /* structural: first sibling */
+//! li:nth-child(2n)      /* structural: every even sibling */
+//! div:empty             /* structural: no children */
+//! a:not(.disabled)      /* functional: anything but a .disabled */
+//! :is(h1, h2, .title)   /* functional: any of the listed compounds */
+//! :where(.theme) .card  /* functional: matches, but adds zero specificity */
 //! *                     /* universal       */
 //! ```
 //!
 //! Attribute selectors support `[name]` (present), `[name="v"]` (exact), and the substring
 //! operators `[name^="v"]` (prefix), `[name$="v"]` (suffix), `[name*="v"]` (contains).
+//!
+//! **Structural pseudo-classes** (`:first-child`, `:last-child`, `:only-child`, `:empty`,
+//! `:nth-child(An+B)`, `:nth-last-child(An+B)`) match against the element's position among its
+//! siblings (and, for `:empty`, its child count), supplied via [`MatchTarget::with_structure`]. A
+//! caller that does not thread that structure (the in-process `canopy-ui` path) leaves them as a
+//! documented no-op. The `An+B` argument accepts `odd`/`even`/`<n>`/`An`/`An±B`/`-An+B`. Each
+//! structural pseudo counts at the class/pseudo level of specificity (like `:hover`).
+//!
+//! **Functional pseudo-classes** take a parenthesized selector LIST of single compounds:
+//! `:not(...)` matches when NONE of the inner compounds match; `:is(...)`/`:where(...)` match when
+//! ANY does. `:is(...)`/`:not(...)` contribute the specificity of their most-specific argument;
+//! `:where(...)` contributes ZERO (a real CSS rule). A combinator inside the argument
+//! (`:is(.a > .b)`) drops just that entry (the single-compound scope limitation).
 //!
 //! Matching is resolved against a [`MatchTarget`] (the element's own [`ElementIdentity`] —
 //! type name, id, classes, attributes — plus its ancestor chain). Complex selectors match
@@ -83,11 +102,14 @@
 //!
 //! This is a deliberate subset, not a full CSS engine:
 //!
-//! - Selectors support the **descendant** (` `) and **child** (`>`) combinators and
-//!   **attribute selectors** (`[name]`, `[name="v"]`, `^=`/`$=`/`*=`), but not the
-//!   sibling combinators (`+`, `~`), the `~=`/`|=` attribute operators, or any
-//!   pseudo-class beyond `:hover`; no media queries. Box shorthands *are* expanded, but
-//!   `!important` is only stripped (its precedence is not yet honored).
+//! - Selectors support the **descendant** (` `) and **child** (`>`) combinators,
+//!   **attribute selectors** (`[name]`, `[name="v"]`, `^=`/`$=`/`*=`), the **structural**
+//!   pseudo-classes (`:first-child`/`:last-child`/`:only-child`/`:empty`/`:nth-child`/
+//!   `:nth-last-child`), and the **functional** pseudo-classes (`:not`/`:is`/`:where`, scoped to a
+//!   single compound per argument), but not the sibling combinators (`+`, `~`), the `~=`/`|=`
+//!   attribute operators, or other pseudo-classes (`:focus`, `:nth-of-type`, …); no media queries.
+//!   Box shorthands *are* expanded, but `!important` is only stripped (its precedence is not yet
+//!   honored).
 //! - The cascade matches each node against its own identity; there is no inheritance
 //!   here (the host folds matched rules in as inline styles, and author inline styles
 //!   win, mirroring CSS specificity where inline beats a selector).
@@ -153,6 +175,77 @@ enum Simple {
     /// An attribute selector (`[name]`, `[name="v"]`, `[name^="v"]`, …) — matches against
     /// the element's attribute pairs per [`AttrMatch`].
     Attr(AttrSelector),
+    /// A **structural** pseudo-class (`:first-child`, `:nth-child(An+B)`, `:empty`, …) — matches
+    /// against the element's position among its siblings (and its child count, for `:empty`). See
+    /// [`Structural`]. Counts at the class/pseudo level of specificity (like `:hover`).
+    Structural(Structural),
+    /// A **functional** pseudo-class (`:not(...)`, `:is(...)`, `:where(...)`) — matches against the
+    /// element's own identity using an inner selector LIST of single compounds. See [`Functional`].
+    Functional(Functional),
+}
+
+/// A **structural** pseudo-class: a test on the element's position among its siblings (and, for
+/// [`Structural::Empty`], on whether it has any children of its own).
+///
+/// These are resolved against the [`StructInfo`] a [`MatchTarget`] carries. With **no** structural
+/// info (the backward-compatible default — see [`StructInfo::UNKNOWN`]), a structural pseudo simply
+/// does **not** match, so existing class/type/id sheets resolve exactly as before this wave.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Structural {
+    /// `:first-child` — the element is the first of its siblings (index 0).
+    FirstChild,
+    /// `:last-child` — the element is the last of its siblings (index == count − 1).
+    LastChild,
+    /// `:only-child` — the element is the sole child (exactly one sibling, itself).
+    OnlyChild,
+    /// `:empty` — the element has no children of its own.
+    Empty,
+    /// `:nth-child(An+B)` — the element's 1-based index `i` satisfies `i = A·n + B` for some
+    /// integer `n ≥ 0` (counting from the **first** sibling).
+    NthChild(Nth),
+    /// `:nth-last-child(An+B)` — like [`Structural::NthChild`] but counting from the **last**
+    /// sibling.
+    NthLastChild(Nth),
+}
+
+/// The `An+B` coefficients of an `:nth-child(...)` / `:nth-last-child(...)` argument. An index `i`
+/// (1-based) matches when there is some integer `n ≥ 0` with `i = a·n + b`.
+///
+/// `odd` parses to `(2, 1)`, `even` to `(2, 0)`, a bare `B` to `(0, B)`, `An` to `(A, 0)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Nth {
+    /// The step `A` (may be negative or zero).
+    a: i32,
+    /// The offset `B`.
+    b: i32,
+}
+
+/// A **functional** pseudo-class: `:not(...)`, `:is(...)`, or `:where(...)`, each carrying an inner
+/// selector **list** whose entries are single compounds (no combinators — a combinator inside the
+/// argument drops just that one entry, see [`parse_functional`]).
+///
+/// - `:not(L)` matches when **none** of `L`'s compounds match the element.
+/// - `:is(L)` / `:where(L)` match when **any** of `L`'s compounds matches the element.
+#[derive(Clone, PartialEq, Eq)]
+struct Functional {
+    /// Which functional pseudo this is (governs the any/none match and the specificity rule).
+    kind: FunctionalKind,
+    /// The inner selector list: each entry is one compound's simple parts (an AND). An empty list
+    /// (`:is()` / `:not()` with no parseable argument) matches nothing for `:is`/`:where` and
+    /// everything for `:not` (vacuously — none of zero match).
+    list: Vec<Vec<Simple>>,
+}
+
+/// Which functional pseudo-class a [`Functional`] is — selects both the match polarity and the
+/// specificity rule (`:where` contributes **zero**; the others take their most-specific argument).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FunctionalKind {
+    /// `:not(...)` — matches when none of the inner compounds match.
+    Not,
+    /// `:is(...)` — matches when any inner compound matches.
+    Is,
+    /// `:where(...)` — matches when any inner compound matches, but contributes zero specificity.
+    Where,
 }
 
 /// One attribute selector: the attribute name plus the test applied to its value.
@@ -250,11 +343,15 @@ pub struct ElementIdentity<'a> {
     /// The element's attribute `(name, value)` pairs (for attribute selectors). Empty when no
     /// attribute context is available — attribute selectors then simply do not match.
     pub attrs: &'a [(&'a str, &'a str)],
+    /// The element's sibling position + child count, for structural pseudo-classes
+    /// (`:first-child`, `:nth-child`, `:empty`, …). Defaults to [`StructInfo::UNKNOWN`] — with no
+    /// structural context every structural pseudo simply does not match.
+    pub structure: StructInfo,
 }
 
 impl<'a> ElementIdentity<'a> {
-    /// An identity with the given type/id/classes and **no** attributes — the common case for a
-    /// caller that has no attribute context.
+    /// An identity with the given type/id/classes, **no** attributes, and **no** structural info —
+    /// the common case for a caller that has no attribute or sibling-position context.
     #[must_use]
     pub fn new(type_name: Option<&'a str>, id: Option<&'a str>, classes: &'a [&'a str]) -> Self {
         Self {
@@ -262,8 +359,40 @@ impl<'a> ElementIdentity<'a> {
             id,
             classes,
             attrs: &[],
+            structure: StructInfo::UNKNOWN,
         }
     }
+}
+
+/// An element's position among its siblings (0-based `index` of `count` total) and its own
+/// `child_count`, for resolving structural pseudo-classes.
+///
+/// A caller that does not retain tree edges (the in-process `canopy-ui` path) leaves this at
+/// [`StructInfo::UNKNOWN`] (`known == false`): every structural pseudo then **does not match**, so a
+/// sheet with structural selectors is a documented no-op there, exactly like the descendant/child
+/// combinators. A caller that walks the retained tree (the `canopy-abi` host cascade) fills it in
+/// via [`MatchTarget::with_structure`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct StructInfo {
+    /// Whether this info is populated. When `false` no structural pseudo matches (the back-compat
+    /// default); the other fields are meaningless.
+    known: bool,
+    /// The element's 0-based index among its siblings.
+    index: u32,
+    /// The total number of siblings (including this element); always `>= 1` when `known`.
+    count: u32,
+    /// The number of children this element has (for `:empty`).
+    child_count: u32,
+}
+
+impl StructInfo {
+    /// The back-compatible "no structural context" state: structural pseudo-classes do not match.
+    pub const UNKNOWN: StructInfo = StructInfo {
+        known: false,
+        index: 0,
+        count: 0,
+        child_count: 0,
+    };
 }
 
 /// The element a stylesheet is resolved against: its own [`ElementIdentity`] (type/tag name,
@@ -305,6 +434,22 @@ impl<'a> MatchTarget<'a> {
     #[must_use]
     pub fn with_ancestors(mut self, ancestors: &'a [ElementIdentity<'a>]) -> Self {
         self.ancestors = ancestors;
+        self
+    }
+
+    /// Attach the element's structural context — its 0-based sibling `index`, the total sibling
+    /// `count` (≥ 1), and its own `child_count` — enabling the structural pseudo-classes
+    /// (`:first-child`, `:last-child`, `:only-child`, `:empty`, `:nth-child`, `:nth-last-child`) on
+    /// this element. Without this builder a target carries [`StructInfo::UNKNOWN`] and every
+    /// structural pseudo simply does not match (the backward-compatible default).
+    #[must_use]
+    pub fn with_structure(mut self, index: u32, count: u32, child_count: u32) -> Self {
+        self.own.structure = StructInfo {
+            known: true,
+            index,
+            count,
+            child_count,
+        };
         self
     }
 }
@@ -491,7 +636,9 @@ pub fn parse(css: &str) -> Stylesheet {
             continue; // a rule with no known declarations contributes nothing
         }
         // Selector grouping: `.a, button#b { … }` expands to one Rule per selector, sharing decls.
-        for sel in selector_list.split(',') {
+        // Split on TOP-LEVEL commas only, so a functional pseudo's own comma-separated argument
+        // list (`:is(.a, .b)`) is not mistaken for a grouping separator.
+        for sel in split_top_level_commas(selector_list) {
             if let Some(selector) = parse_selector(sel.trim()) {
                 rules.push(Rule {
                     selector,
@@ -505,10 +652,16 @@ pub fn parse(css: &str) -> Stylesheet {
 }
 
 /// Parse one selector — a **complex** selector (`.card > button.primary#go`, descendant/child
-/// combinators between compounds) plus an optional `:hover` on the subject — into a [`Selector`]
-/// with its specificity. Returns `None` for an empty selector, an empty compound, or one carrying
-/// an unsupported pseudo-class (`:focus`, `::before`, …), so it is dropped (not mistaken for a
-/// base). Specificity is the sum over every compound's simples (plus the `:hover` pseudo).
+/// combinators between compounds), an optional `:hover` on the subject, and any structural /
+/// functional pseudo-classes (`:first-child`, `:nth-child(2n)`, `:not(.x)`, `:is(.a, .b)`, …) on any
+/// compound — into a [`Selector`] with its specificity. Returns `None` for an empty selector, an
+/// empty compound, or one carrying an unsupported pseudo-class (`:focus`, `::before`, …), so it is
+/// dropped (not mistaken for a base).
+///
+/// Specificity sums over every compound: each `id` adds to `a`; each class / attribute / structural
+/// pseudo / `:hover` adds to `b`; each type adds to `c`. A functional `:is(...)` / `:not(...)` adds
+/// the specificity of its **most-specific** argument; `:where(...)` adds **zero** (see
+/// [`functional_specificity`]).
 fn parse_selector(sel: &str) -> Option<Selector> {
     let sel = sel.trim();
     if sel.is_empty() {
@@ -521,35 +674,24 @@ fn parse_selector(sel: &str) -> Option<Selector> {
     }
 
     let mut parts: Vec<ComplexPart> = Vec::with_capacity(tokens.len());
-    let (mut ids, mut classes, mut types) = (0u32, 0u32, 0u32);
+    let mut spec: Spec = (0, 0, 0);
     let last = tokens.len() - 1;
     let mut state = State::Base;
 
     for (idx, (combinator, compound_text)) in tokens.into_iter().enumerate() {
-        // `:hover` is only honored on the subject (rightmost) compound; on an ancestor compound an
-        // unsupported pseudo drops the selector (handled by the `Some(_) => return None` arm).
-        let compound_text = if idx == last {
-            match compound_text.split_once(':') {
-                Some((head, pseudo)) if pseudo.eq_ignore_ascii_case("hover") => {
-                    state = State::Hover;
-                    head
-                }
-                Some(_) => return None, // unsupported pseudo-class -> drop this selector
-                None => compound_text,
-            }
-        } else if compound_text.contains(':') {
-            return None; // a pseudo on a non-subject compound is unsupported -> drop
-        } else {
-            compound_text
-        };
-
-        let simples = parse_compound(compound_text)?;
+        // `:hover` is the one pseudo that lifts to the rule's interaction State, and it is only
+        // honored on the subject (rightmost) compound. On any compound, structural/functional
+        // pseudos parse into Simples; an unsupported pseudo drops the whole selector.
+        let (simples, has_hover) = parse_compound(compound_text)?;
+        if has_hover && idx != last {
+            return None; // `:hover` on a non-subject compound is unsupported -> drop the selector
+        }
+        if has_hover {
+            state = State::Hover;
+            spec.1 += 1; // a pseudo-class counts at the class/pseudo level of specificity
+        }
         for simple in &simples {
-            match simple {
-                Simple::Id(_) => ids += 1,
-                Simple::Class(_) | Simple::Attr(_) => classes += 1,
-                Simple::Type(_) => types += 1,
-            }
+            add_simple_specificity(&mut spec, simple);
         }
         parts.push(ComplexPart {
             combinator,
@@ -557,14 +699,50 @@ fn parse_selector(sel: &str) -> Option<Selector> {
         });
     }
 
-    if state == State::Hover {
-        classes += 1; // a pseudo-class counts at the class level of specificity
-    }
     Some(Selector {
         parts,
         state,
-        specificity: (ids, classes, types),
+        specificity: spec,
     })
+}
+
+/// Fold one simple selector's specificity into the running `(a, b, c)` tuple: an id adds to `a`; a
+/// class, attribute, or structural pseudo-class adds to `b`; a type adds to `c`. A functional
+/// `:is`/`:not`/`:where` contributes per [`functional_specificity`].
+fn add_simple_specificity(spec: &mut Spec, simple: &Simple) {
+    match simple {
+        Simple::Id(_) => spec.0 += 1,
+        Simple::Class(_) | Simple::Attr(_) | Simple::Structural(_) => spec.1 += 1,
+        Simple::Type(_) => spec.2 += 1,
+        Simple::Functional(f) => {
+            let (a, b, c) = functional_specificity(f);
+            spec.0 += a;
+            spec.1 += b;
+            spec.2 += c;
+        }
+    }
+}
+
+/// The specificity a functional pseudo-class contributes:
+/// - `:is(...)` / `:not(...)` take the specificity of their **most-specific** argument compound
+///   (the standard CSS rule); an empty argument list contributes nothing.
+/// - `:where(...)` always contributes **zero** — it filters but adds no weight (a real CSS rule).
+fn functional_specificity(f: &Functional) -> Spec {
+    if f.kind == FunctionalKind::Where {
+        return (0, 0, 0);
+    }
+    // The max over each argument's own compound specificity, compared lexicographically.
+    let mut best: Spec = (0, 0, 0);
+    for compound in &f.list {
+        let mut s: Spec = (0, 0, 0);
+        for simple in compound {
+            add_simple_specificity(&mut s, simple);
+        }
+        if s > best {
+            best = s;
+        }
+    }
+    best
 }
 
 /// Tokenize a complex selector into a left-to-right `Vec` of `(combinator-relating-this-compound-
@@ -584,6 +762,8 @@ fn tokenize_complex(sel: &str) -> Option<Vec<(Combinator, &str)>> {
     let mut start = 0;
     let mut have_open = false; // a compound's bytes are accumulating from `start`
     let mut pending_child = false; // a `>` was seen since the last compound was closed
+    let mut depth = 0i32; // parenthesis nesting: a `>`/whitespace inside `(...)` is part of a
+                          // functional pseudo's argument (`:is(.a > .b)`), not a real combinator.
 
     /// Close the open compound (if any), recording the combinator that precedes it.
     fn close<'s>(
@@ -612,6 +792,32 @@ fn tokenize_complex(sel: &str) -> Option<Vec<(Combinator, &str)>> {
 
     while i < bytes.len() {
         let b = bytes[i];
+        // Track parenthesis depth so a functional pseudo's argument is treated as opaque text: its
+        // own `>` / whitespace / commas never split the outer complex selector.
+        if b == b'(' {
+            if !have_open {
+                start = i;
+                have_open = true;
+            }
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if depth > 0 {
+            // Inside a functional argument: accumulate verbatim (a stray `(` already opened the
+            // compound above; ensure one is open in case the arg itself started this token).
+            if !have_open {
+                start = i;
+                have_open = true;
+            }
+            i += 1;
+            continue;
+        }
         if b == b'>' {
             if have_open {
                 close(
@@ -661,6 +867,9 @@ fn tokenize_complex(sel: &str) -> Option<Vec<(Combinator, &str)>> {
     if pending_child {
         return None; // trailing `>` with no following compound
     }
+    if depth != 0 {
+        return None; // unbalanced parentheses (a malformed functional pseudo) -> drop the selector
+    }
     if compounds.is_empty() {
         return None;
     }
@@ -676,20 +885,28 @@ fn tokenize_complex(sel: &str) -> Option<Vec<(Combinator, &str)>> {
     Some(out)
 }
 
-/// Parse a compound selector into its simple parts: an optional leading **type** name, then a run
-/// of `.class` / `#id` / `[attr]` parts (in any order after the type). A bare `*` (universal)
-/// yields an empty list (matches every element). Returns `None` on a malformed identifier or
-/// attribute selector, or an empty compound.
-fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
+/// A byte that terminates a simple-selector token within a compound: the start of the next
+/// `.class` / `#id` / `[attr]` / `:pseudo` part.
+fn is_simple_boundary(b: u8) -> bool {
+    b == b'.' || b == b'#' || b == b'[' || b == b':'
+}
+
+/// Parse a compound selector into its simple parts plus whether it carried `:hover` (which the
+/// caller lifts to the rule's interaction [`State`]). A compound is an optional leading **type**
+/// name, then a run of `.class` / `#id` / `[attr]` / `:pseudo` parts in any order. A bare `*`
+/// (universal) yields an empty (always-matching) list. Returns `None` on a malformed identifier,
+/// attribute selector, or unsupported pseudo-class, or an empty compound.
+fn parse_compound(compound: &str) -> Option<(Vec<Simple>, bool)> {
     let compound = compound.trim();
     if compound.is_empty() {
         return None;
     }
     let mut simples = Vec::new();
+    let mut has_hover = false;
     let bytes = compound.as_bytes();
     let mut i = 0;
-    // Optional leading type/tag name (anything before the first `.`/`#`/`[`).
-    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' && bytes[i] != b'[' {
+    // Optional leading type/tag name (anything before the first `.`/`#`/`[`/`:`).
+    while i < bytes.len() && !is_simple_boundary(bytes[i]) {
         i += 1;
     }
     let head = &compound[..i];
@@ -699,7 +916,7 @@ fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
         }
         simples.push(Simple::Type(head.to_string()));
     }
-    // Then a run of `.class` / `#id` / `[attr...]` parts.
+    // Then a run of `.class` / `#id` / `[attr...]` / `:pseudo` parts.
     while i < bytes.len() {
         let kind = bytes[i];
         if kind == b'[' {
@@ -710,9 +927,32 @@ fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
             i = close + 1;
             continue;
         }
+        if kind == b':' {
+            // A pseudo-class: read its name, then (for a functional pseudo) a balanced `(...)` arg.
+            i += 1;
+            let name_start = i;
+            while i < bytes.len() && !is_simple_boundary(bytes[i]) && bytes[i] != b'(' {
+                i += 1;
+            }
+            let name = &compound[name_start..i];
+            // A functional pseudo (`:not(`, `:is(`, …) is followed by a parenthesized argument that
+            // we read by balancing the parens (its argument may itself contain `()`).
+            let arg = if i < bytes.len() && bytes[i] == b'(' {
+                let (inner, after) = read_balanced_parens(compound, i)?;
+                i = after;
+                Some(inner)
+            } else {
+                None
+            };
+            match parse_pseudo(name, arg)? {
+                Pseudo::Hover => has_hover = true,
+                Pseudo::Simple(s) => simples.push(s),
+            }
+            continue;
+        }
         i += 1;
         let name_start = i;
-        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' && bytes[i] != b'[' {
+        while i < bytes.len() && !is_simple_boundary(bytes[i]) {
             i += 1;
         }
         let name = &compound[name_start..i];
@@ -725,7 +965,172 @@ fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
             _ => return None,
         }
     }
-    Some(simples)
+    Some((simples, has_hover))
+}
+
+/// The outcome of parsing one pseudo-class: `:hover` lifts to the rule's [`State`]; every other
+/// supported pseudo becomes a [`Simple`] AND-ed into the compound.
+enum Pseudo {
+    /// `:hover` — handled at the [`Selector`] level (not a per-compound simple).
+    Hover,
+    /// A structural or functional pseudo, matched as part of the compound.
+    Simple(Simple),
+}
+
+/// Read a balanced `(...)` group starting at `open` (which must index a `(`), returning the **inner**
+/// text (between the parens) and the index **just past** the closing `)`. Tracks nesting so an
+/// argument containing its own parens (`:not(:is(.x))`, a `(` in an attribute value) is read whole.
+/// Returns `None` if the parens are unbalanced.
+fn read_balanced_parens(s: &str, open: usize) -> Option<(&str, usize)> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes[open], b'(');
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[open + 1..i], i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None // never closed
+}
+
+/// Parse one pseudo-class `name` (lowercased) and its optional functional `arg` into a [`Pseudo`].
+///
+/// Supported: `:hover` (lifts to State); the structural pseudos `:first-child`, `:last-child`,
+/// `:only-child`, `:empty`, `:nth-child(An+B)`, `:nth-last-child(An+B)`; and the functional pseudos
+/// `:not(...)`, `:is(...)`, `:where(...)`. Any other name (`:focus`, a `::`-element, a structural
+/// pseudo given an unexpected argument, a malformed `An+B`) returns `None`, dropping the selector.
+fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Pseudo> {
+    // ASCII-lowercase the pseudo name without allocating beyond a small buffer.
+    let lname = name.to_ascii_lowercase();
+    match (lname.as_str(), arg) {
+        ("hover", None) => Some(Pseudo::Hover),
+        ("first-child", None) => Some(Pseudo::Simple(Simple::Structural(Structural::FirstChild))),
+        ("last-child", None) => Some(Pseudo::Simple(Simple::Structural(Structural::LastChild))),
+        ("only-child", None) => Some(Pseudo::Simple(Simple::Structural(Structural::OnlyChild))),
+        ("empty", None) => Some(Pseudo::Simple(Simple::Structural(Structural::Empty))),
+        ("nth-child", Some(a)) => Some(Pseudo::Simple(Simple::Structural(Structural::NthChild(
+            parse_nth(a)?,
+        )))),
+        ("nth-last-child", Some(a)) => Some(Pseudo::Simple(Simple::Structural(
+            Structural::NthLastChild(parse_nth(a)?),
+        ))),
+        ("not", Some(a)) => Some(Pseudo::Simple(Simple::Functional(parse_functional(
+            FunctionalKind::Not,
+            a,
+        )))),
+        ("is", Some(a)) => Some(Pseudo::Simple(Simple::Functional(parse_functional(
+            FunctionalKind::Is,
+            a,
+        )))),
+        ("where", Some(a)) => Some(Pseudo::Simple(Simple::Functional(parse_functional(
+            FunctionalKind::Where,
+            a,
+        )))),
+        _ => None, // unsupported pseudo-class (or a structural pseudo given a bad/missing arg)
+    }
+}
+
+/// Parse a functional pseudo's parenthesized argument — a selector **list** of single compounds — into
+/// a [`Functional`]. Each comma-separated entry is parsed as one compound; an entry that is empty,
+/// malformed, carries `:hover`, or contains a combinator (a space/`>` — i.e. tokenizes to more than
+/// one compound) is **dropped gracefully** (a documented limitation: functional args are scoped to a
+/// single compound each). The remaining entries form the list.
+fn parse_functional(kind: FunctionalKind, arg: &str) -> Functional {
+    let mut list: Vec<Vec<Simple>> = Vec::new();
+    for entry in split_top_level_commas(arg) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // Reject a combinator inside the arg: if the entry tokenizes to more than one compound (a
+        // descendant/child relation), drop just this entry (the single-compound scope limitation).
+        match tokenize_complex(entry) {
+            Some(tokens) if tokens.len() == 1 => {
+                // A single compound — parse it; drop the entry if it is malformed or carries :hover.
+                if let Some((simples, has_hover)) = parse_compound(tokens[0].1) {
+                    if !has_hover {
+                        list.push(simples);
+                    }
+                }
+            }
+            _ => { /* a combinator (or malformed) inside the functional arg: drop this entry */ }
+        }
+    }
+    Functional { kind, list }
+}
+
+/// Parse an `An+B` micro-grammar (the `:nth-child(...)` / `:nth-last-child(...)` argument) into an
+/// [`Nth`]. Accepts `odd` (`2n+1`), `even` (`2n`), a bare integer `B` (`(0, B)`), `An` (`(A, 0)`),
+/// `An+B`, `An-B`, `-An+B`, `n` (`(1, 0)`), `-n` (`(-1, 0)`), and a leading-sign `+`/`-`. Whitespace
+/// around the `n`, the sign, and `B` is tolerated. Returns `None` on anything malformed.
+fn parse_nth(arg: &str) -> Option<Nth> {
+    let s = arg.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if s == "odd" {
+        return Some(Nth { a: 2, b: 1 });
+    }
+    if s == "even" {
+        return Some(Nth { a: 2, b: 0 });
+    }
+    // Split on the `n`: everything before it is the `A` coefficient, everything after is `+B`/`-B`.
+    if let Some(n_pos) = s.find('n') {
+        let a_str = s[..n_pos].trim();
+        let b_str = s[n_pos + 1..].trim();
+        // The coefficient before `n`: empty -> 1, `-` -> -1, `+` -> 1, else parse the integer.
+        let a = match a_str {
+            "" | "+" => 1,
+            "-" => -1,
+            other => parse_signed_int(other)?,
+        };
+        // The offset after `n`: empty -> 0; otherwise a signed `+B` / `-B` (the sign is required, as
+        // CSS writes `2n + 1`, and whitespace around it is allowed).
+        let b = if b_str.is_empty() {
+            0
+        } else {
+            // Must start with an explicit sign (CSS `An±B`), then an integer.
+            let sign_byte = b_str.as_bytes()[0];
+            if sign_byte != b'+' && sign_byte != b'-' {
+                return None;
+            }
+            let neg = sign_byte == b'-';
+            let mag: i32 = b_str[1..].trim().parse().ok()?;
+            if neg {
+                -mag
+            } else {
+                mag
+            }
+        };
+        Some(Nth { a, b })
+    } else {
+        // No `n`: a plain integer `B` (matches exactly the `B`-th element), e.g. `:nth-child(3)`.
+        Some(Nth {
+            a: 0,
+            b: parse_signed_int(&s)?,
+        })
+    }
+}
+
+/// Parse an optionally `+`/`-`-signed base-10 integer (`"3"`, `"+3"`, `"-3"`), trimming whitespace.
+/// Returns `None` on anything that is not a clean signed integer.
+fn parse_signed_int(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mag: i32 = digits.trim().parse().ok()?;
+    Some(if neg { -mag } else { mag })
 }
 
 /// Parse the inside of an attribute selector (the text between `[` and `]`): `name`, `name="v"`,
@@ -843,14 +1248,81 @@ fn complex_matches(parts: &[ComplexPart], target: &MatchTarget) -> bool {
 /// case-insensitive tag names. Classes, ids, and attribute names/values stay case-**sensitive**,
 /// per CSS.
 fn compound_matches(simples: &[Simple], identity: &ElementIdentity) -> bool {
-    simples.iter().all(|simple| match simple {
+    simples
+        .iter()
+        .all(|simple| simple_matches(simple, identity))
+}
+
+/// Whether a single simple selector matches `identity`. Factored out of [`compound_matches`] so the
+/// functional pseudos (`:not`/`:is`/`:where`) can re-use it against their inner compounds.
+fn simple_matches(simple: &Simple, identity: &ElementIdentity) -> bool {
+    match simple {
         Simple::Type(t) => identity
             .type_name
             .is_some_and(|name| name.eq_ignore_ascii_case(t)),
         Simple::Id(id) => identity.id == Some(id.as_str()),
         Simple::Class(c) => identity.classes.contains(&c.as_str()),
         Simple::Attr(attr) => attr_matches(attr, identity.attrs),
-    })
+        Simple::Structural(s) => structural_matches(*s, identity.structure),
+        Simple::Functional(f) => functional_matches(f, identity),
+    }
+}
+
+/// Whether a structural pseudo-class matches given the element's [`StructInfo`].
+///
+/// **Default:** with no structural context (`info.known == false`, the back-compat
+/// [`StructInfo::UNKNOWN`]) every structural pseudo returns `false` — a sheet that uses them is a
+/// no-op against a target that carries no sibling-position info (the in-process `canopy-ui` path),
+/// exactly like the unsupported combinators there. Only a caller that threads real structure (the
+/// `canopy-abi` host cascade) makes these match.
+fn structural_matches(s: Structural, info: StructInfo) -> bool {
+    if !info.known {
+        return false;
+    }
+    match s {
+        Structural::FirstChild => info.index == 0,
+        Structural::LastChild => info.count > 0 && info.index == info.count - 1,
+        Structural::OnlyChild => info.count == 1,
+        Structural::Empty => info.child_count == 0,
+        // `:nth-child(An+B)` counts from the FIRST sibling: the 1-based index is `index + 1`.
+        Structural::NthChild(nth) => nth_matches(nth, info.index + 1),
+        // `:nth-last-child(An+B)` counts from the LAST sibling: the 1-based index from the end is
+        // `count - index`.
+        Structural::NthLastChild(nth) => {
+            info.count > 0 && nth_matches(nth, info.count - info.index)
+        }
+    }
+}
+
+/// Whether a 1-based sibling index `i` (≥ 1) satisfies the `An+B` test: there is some integer
+/// `n ≥ 0` with `i = a·n + b`.
+///
+/// - `a == 0`: matches iff `i == b` (a single element).
+/// - `a != 0`: `i - b` must be divisible by `a` with a **non-negative** quotient `n`.
+fn nth_matches(nth: Nth, i: u32) -> bool {
+    let i = i as i32;
+    let Nth { a, b } = nth;
+    if a == 0 {
+        return i == b;
+    }
+    let diff = i - b;
+    // `n = diff / a` must be an integer (`diff % a == 0`) and `n >= 0`.
+    diff % a == 0 && diff / a >= 0
+}
+
+/// Whether a functional pseudo (`:not`/`:is`/`:where`) matches `identity`: `:not` matches when NONE
+/// of its inner compounds match; `:is`/`:where` match when ANY does. Each inner compound is matched
+/// against the element's own identity (the functional arg is scoped to a single compound — no tree
+/// walk needed).
+fn functional_matches(f: &Functional, identity: &ElementIdentity) -> bool {
+    let any = f
+        .list
+        .iter()
+        .any(|compound| compound.iter().all(|s| simple_matches(s, identity)));
+    match f.kind {
+        FunctionalKind::Not => !any,
+        FunctionalKind::Is | FunctionalKind::Where => any,
+    }
 }
 
 /// Whether `attr` matches some `(name, value)` pair in `attrs` per its [`AttrMatch`] test. The
@@ -3143,5 +3615,354 @@ mod tests {
         let dom = Dom::new();
         let mut engine = LiteEngine::from_dom(&dom, ".x { color: #fff }");
         assert!(engine.resolve(NodeId::new(999), None).is_err());
+    }
+
+    // --- Wave 3b: structural + functional pseudo-classes -------------------
+
+    #[test]
+    fn first_last_only_child_match_by_position() {
+        let sheet = parse(
+            "li:first-child { color:#111111 } \
+             li:last-child  { color:#222222 } \
+             li:only-child  { color:#333333 }",
+        );
+        let resolve = |index: u32, count: u32| {
+            sheet.resolve_for(
+                &MatchTarget::new(Some("li"), None, &[]).with_structure(index, count, 0),
+                false,
+            )
+        };
+        // First of three -> :first-child.
+        assert_eq!(resolve(0, 3), vec![(FG, "#111111".to_string())]);
+        // Last of three -> :last-child.
+        assert_eq!(resolve(2, 3), vec![(FG, "#222222".to_string())]);
+        // A middle child matches none of the three.
+        assert!(resolve(1, 3).is_empty());
+        // Sole child -> :only-child (and also :first/:last; :only-child is last in source so wins).
+        assert_eq!(resolve(0, 1), vec![(FG, "#333333".to_string())]);
+    }
+
+    #[test]
+    fn nth_child_even_odd_and_an_plus_b() {
+        // :nth-child(2n) = evens (2nd, 4th, …); odd = 1st,3rd,…; 3n+1 = 1st,4th,7th,…
+        let even = parse("li:nth-child(2n) { color:#0a0a0a }");
+        let odd = parse("li:nth-child(odd) { color:#0b0b0b }");
+        let three_n1 = parse("li:nth-child(3n+1) { color:#0c0c0c }");
+        let count = 7u32;
+        let matches = |sheet: &Stylesheet, index: u32| {
+            !sheet
+                .resolve_for(
+                    &MatchTarget::new(Some("li"), None, &[]).with_structure(index, count, 0),
+                    false,
+                )
+                .is_empty()
+        };
+        // 1-based positions: even matches 2,4,6 (0-based index 1,3,5).
+        let even_hits: Vec<u32> = (0..count).filter(|&i| matches(&even, i)).collect();
+        assert_eq!(even_hits, vec![1, 3, 5], "2n -> 2nd,4th,6th");
+        // odd matches 1,3,5,7 (0-based index 0,2,4,6).
+        let odd_hits: Vec<u32> = (0..count).filter(|&i| matches(&odd, i)).collect();
+        assert_eq!(odd_hits, vec![0, 2, 4, 6], "odd -> 1st,3rd,5th,7th");
+        // 3n+1 matches 1,4,7 (0-based index 0,3,6).
+        let tn1_hits: Vec<u32> = (0..count).filter(|&i| matches(&three_n1, i)).collect();
+        assert_eq!(tn1_hits, vec![0, 3, 6], "3n+1 -> 1st,4th,7th");
+    }
+
+    #[test]
+    fn nth_last_child_counts_from_the_end() {
+        // :nth-last-child(1) is the LAST element; (2) the second-to-last.
+        let last = parse("li:nth-last-child(1) { color:#aa0000 }");
+        let second_last = parse("li:nth-last-child(2) { color:#00aa00 }");
+        let count = 4u32;
+        let hits = |sheet: &Stylesheet| -> Vec<u32> {
+            (0..count)
+                .filter(|&i| {
+                    !sheet
+                        .resolve_for(
+                            &MatchTarget::new(Some("li"), None, &[]).with_structure(i, count, 0),
+                            false,
+                        )
+                        .is_empty()
+                })
+                .collect()
+        };
+        assert_eq!(
+            hits(&last),
+            vec![3],
+            "nth-last-child(1) is the last (index 3)"
+        );
+        assert_eq!(
+            hits(&second_last),
+            vec![2],
+            "nth-last-child(2) is the second-to-last (index 2)"
+        );
+    }
+
+    #[test]
+    fn empty_matches_a_childless_element() {
+        let sheet = parse("div:empty { color:#445566 }");
+        // A div with no children matches :empty.
+        let empty = MatchTarget::new(Some("div"), None, &[]).with_structure(0, 1, 0);
+        assert_eq!(
+            sheet.resolve_for(&empty, false),
+            vec![(FG, "#445566".to_string())]
+        );
+        // A div WITH children does not.
+        let parent = MatchTarget::new(Some("div"), None, &[]).with_structure(0, 1, 2);
+        assert!(sheet.resolve_for(&parent, false).is_empty());
+    }
+
+    #[test]
+    fn structural_pseudo_is_a_no_op_without_structure_info() {
+        // The default StructInfo::UNKNOWN: structural pseudos simply do not match (the back-compat
+        // contract for callers that don't thread sibling position, e.g. canopy-ui).
+        let sheet = parse("li:first-child { color:#111111 } li:nth-child(2n) { color:#222222 }");
+        let no_info = MatchTarget::new(Some("li"), None, &[]); // no .with_structure
+        assert!(
+            sheet.resolve_for(&no_info, false).is_empty(),
+            "no structural info -> structural pseudos do not match"
+        );
+    }
+
+    #[test]
+    fn not_excludes_the_matching_compound() {
+        // `a:not(.disabled)` styles every `a` EXCEPT one carrying `.disabled`.
+        let sheet = parse("a:not(.disabled) { color:#123456 }");
+        let plain = MatchTarget::new(Some("a"), None, &[]);
+        assert_eq!(
+            sheet.resolve_for(&plain, false),
+            vec![(FG, "#123456".to_string())],
+            "a without .disabled is styled"
+        );
+        let disabled = MatchTarget::new(Some("a"), None, &["disabled"]);
+        assert!(
+            sheet.resolve_for(&disabled, false).is_empty(),
+            ":not(.disabled) excludes the .disabled anchor"
+        );
+    }
+
+    #[test]
+    fn is_matches_any_of_the_listed_compounds() {
+        // `:is(.a, .b)` matches an element carrying EITHER class.
+        let sheet = parse(":is(.a, .b) { color:#0099ff }");
+        let a = MatchTarget::new(None, None, &["a"]);
+        let b = MatchTarget::new(None, None, &["b"]);
+        let c = MatchTarget::new(None, None, &["c"]);
+        assert_eq!(
+            sheet.resolve_for(&a, false),
+            vec![(FG, "#0099ff".to_string())],
+            ":is matches .a"
+        );
+        assert_eq!(
+            sheet.resolve_for(&b, false),
+            vec![(FG, "#0099ff".to_string())],
+            ":is matches .b"
+        );
+        assert!(
+            sheet.resolve_for(&c, false).is_empty(),
+            ":is does not match an element with neither class"
+        );
+    }
+
+    #[test]
+    fn where_matches_but_contributes_zero_specificity() {
+        // A `:where(.high)` rule and a plain `.low` class rule both set `color` on an element
+        // carrying BOTH classes. `:where` adds ZERO specificity, so it is (0,0,0)+nothing while
+        // `.low` is (0,1,0); the plain class rule WINS even though the :where rule comes later in
+        // source order (specificity dominates source order).
+        let sheet = parse(":where(.high) { color:#ffffff } .low { color:#000000 }");
+        let both = MatchTarget::new(None, None, &["high", "low"]);
+        assert_eq!(
+            sheet.resolve_for(&both, false),
+            vec![(FG, "#000000".to_string())],
+            ":where adds 0 specificity, so the plain .low class rule wins"
+        );
+        // Sanity: :where still FILTERS — an element without .high is not matched by the :where rule.
+        let only_low = MatchTarget::new(None, None, &["low"]);
+        assert_eq!(
+            sheet.resolve_for(&only_low, false),
+            vec![(FG, "#000000".to_string())]
+        );
+        let only_high = MatchTarget::new(None, None, &["high"]);
+        assert_eq!(
+            sheet.resolve_for(&only_high, false),
+            vec![(FG, "#ffffff".to_string())],
+            ":where(.high) still matches when .high is present"
+        );
+    }
+
+    #[test]
+    fn is_takes_its_most_specific_argument_for_specificity() {
+        // `:is(#id, .cls)` takes the #id arm's specificity (1,0,0). Against an element matching the
+        // class arm, the :is rule still outranks a plain `.cls` (0,1,0) rule on the same property —
+        // because :is's specificity is fixed to its MOST-specific argument regardless of which arm
+        // actually matched.
+        let sheet = parse(":is(#hero, .cls) { color:#111111 } .cls { color:#222222 }");
+        let target = MatchTarget::new(None, None, &["cls"]);
+        assert_eq!(
+            sheet.resolve_for(&target, false),
+            vec![(FG, "#111111".to_string())],
+            ":is(#id, .cls) carries the #id specificity and beats a plain .cls rule"
+        );
+    }
+
+    #[test]
+    fn not_takes_its_argument_specificity() {
+        // `:not(.x)` contributes its argument's specificity (a class = (0,1,0)). So `a:not(.x)`
+        // ((0,1,1)) beats a bare `a` ((0,0,1)) rule on the same property.
+        let sheet = parse("a { color:#111111 } a:not(.x) { color:#222222 }");
+        let plain_a = MatchTarget::new(Some("a"), None, &[]);
+        assert_eq!(
+            sheet.resolve_for(&plain_a, false),
+            vec![(FG, "#222222".to_string())],
+            "a:not(.x) outranks a bare a by the :not argument's class specificity"
+        );
+    }
+
+    #[test]
+    fn functional_arg_with_a_combinator_drops_that_entry() {
+        // A combinator inside the functional arg is unsupported (single-compound scope). `:is(.a,
+        // .b > .c)` keeps `.a` but DROPS the `.b > .c` entry. So `.b > .c` never matches via :is,
+        // but `.a` still does.
+        let sheet = parse(":is(.a, .b > .c) { color:#334455 }");
+        let a = MatchTarget::new(None, None, &["a"]);
+        assert_eq!(
+            sheet.resolve_for(&a, false),
+            vec![(FG, "#334455".to_string())],
+            "the valid single-compound `.a` entry is kept"
+        );
+        // An element carrying .c (the subject of the dropped combinator entry) is NOT matched —
+        // the whole `.b > .c` entry was dropped.
+        let c = MatchTarget::new(None, None, &["c"]);
+        assert!(
+            sheet.resolve_for(&c, false).is_empty(),
+            "the combinator entry was dropped, so .c does not match via :is"
+        );
+    }
+
+    #[test]
+    fn nth_parsing_edge_cases() {
+        // Direct unit tests for the An+B micro-parser.
+        assert_eq!(parse_nth("odd"), Some(Nth { a: 2, b: 1 }));
+        assert_eq!(parse_nth("even"), Some(Nth { a: 2, b: 0 }));
+        assert_eq!(parse_nth("2n"), Some(Nth { a: 2, b: 0 }));
+        assert_eq!(parse_nth("2n+1"), Some(Nth { a: 2, b: 1 }));
+        assert_eq!(parse_nth("2n-1"), Some(Nth { a: 2, b: -1 }));
+        assert_eq!(parse_nth("-n+3"), Some(Nth { a: -1, b: 3 }));
+        assert_eq!(parse_nth("-2n+3"), Some(Nth { a: -2, b: 3 }));
+        assert_eq!(parse_nth("n"), Some(Nth { a: 1, b: 0 }));
+        assert_eq!(parse_nth("3"), Some(Nth { a: 0, b: 3 }));
+        assert_eq!(parse_nth("  2n + 1 "), Some(Nth { a: 2, b: 1 }));
+        assert_eq!(parse_nth("+3"), Some(Nth { a: 0, b: 3 }));
+        // Malformed forms return None.
+        assert_eq!(parse_nth(""), None);
+        assert_eq!(parse_nth("2x"), None);
+        assert_eq!(parse_nth("2n+"), None);
+        assert_eq!(parse_nth("2n 1"), None, "missing sign before B");
+        assert_eq!(parse_nth("abc"), None);
+    }
+
+    #[test]
+    fn nth_match_semantics_for_negative_and_zero_step() {
+        // a == 0: matches exactly position b.
+        assert!(nth_matches(Nth { a: 0, b: 3 }, 3));
+        assert!(!nth_matches(Nth { a: 0, b: 3 }, 4));
+        // -n+3 matches the first three (1,2,3) and nothing past.
+        for i in 1..=3 {
+            assert!(nth_matches(Nth { a: -1, b: 3 }, i), "-n+3 matches {i}");
+        }
+        assert!(!nth_matches(Nth { a: -1, b: 3 }, 4), "-n+3 stops after 3");
+        // 2n+1 (odd) matches 1,3,5 but not 2,4.
+        assert!(nth_matches(Nth { a: 2, b: 1 }, 1));
+        assert!(!nth_matches(Nth { a: 2, b: 1 }, 2));
+        assert!(nth_matches(Nth { a: 2, b: 1 }, 3));
+    }
+
+    #[test]
+    fn plain_sheet_unaffected_by_pseudo_engine() {
+        // A sheet with NO structural/functional pseudos, resolved against a target carrying full
+        // structure info, must resolve exactly as a plain class/type sheet always did.
+        let sheet = parse(".a { color:#445566 } button { background:#111111 }");
+        let with_struct = MatchTarget::new(Some("button"), None, &["a"]).with_structure(2, 5, 1);
+        // Decls are returned in first-appearance order across matched rules (lowest specificity
+        // applied first): `button` (BG) folds before `.a` (FG).
+        assert_eq!(
+            sheet.resolve_for(&with_struct, false),
+            vec![(BG, "#111111".to_string()), (FG, "#445566".to_string())],
+            "structure info present but unused by a plain sheet -> same result"
+        );
+    }
+
+    #[test]
+    fn structural_pseudo_adds_class_level_specificity() {
+        // `li:first-child` ((0,1,1)) beats a bare `li` ((0,0,1)) on the same property.
+        let sheet = parse("li { color:#111111 } li:first-child { color:#222222 }");
+        let first = MatchTarget::new(Some("li"), None, &[]).with_structure(0, 3, 0);
+        assert_eq!(
+            sheet.resolve_for(&first, false),
+            vec![(FG, "#222222".to_string())],
+            "li:first-child outranks bare li by the pseudo's class-level specificity"
+        );
+    }
+
+    #[test]
+    fn malformed_pseudo_rules_are_dropped_not_mistaken_for_a_base() {
+        // A `::before` pseudo-ELEMENT (double colon -> empty pseudo name), an unbalanced `:not(`,
+        // and a bogus `:nth-child(2x)` all drop their selector cleanly. The companion plain rule
+        // still parses, proving the bad selector did not poison the sheet.
+        for bad in [
+            "p::before { color:#000000 } p { color:#abcdef }",
+            "p:not(.x { color:#000000 } p { color:#abcdef }",
+            "p:nth-child(2x) { color:#000000 } p { color:#abcdef }",
+            "p:focus { color:#000000 } p { color:#abcdef }",
+        ] {
+            let sheet = parse(bad);
+            let p = MatchTarget::new(Some("p"), None, &[]).with_structure(0, 1, 0);
+            assert_eq!(
+                sheet.resolve_for(&p, false),
+                vec![(FG, "#abcdef".to_string())],
+                "the bad selector in `{bad}` was dropped; the plain `p` rule still applies"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_pseudo_combines_with_a_complex_combinator() {
+        // `.card :is(.a, .b)` — a functional subject under a descendant combinator. The paren-aware
+        // tokenizer must keep `:is(.a, .b)` as ONE compound (its inner comma/space are opaque), so
+        // the selector is `.card` (descendant) `:is(.a,.b)`.
+        let sheet = parse(".card :is(.a, .b) { color:#123456 }");
+        let parent_card = [ElementIdentity::new(None, None, &["card"])];
+        // A `.a` nested under a `.card` matches.
+        let inside = MatchTarget::new(None, None, &["a"]).with_ancestors(&parent_card);
+        assert_eq!(
+            sheet.resolve_for(&inside, false),
+            vec![(FG, "#123456".to_string())],
+            ":is(.a,.b) under a .card matches via the descendant combinator"
+        );
+        // A `.b` with no `.card` ancestor does NOT match (the combinator is unsatisfied).
+        let no_card = MatchTarget::new(None, None, &["b"]);
+        assert!(
+            sheet.resolve_for(&no_card, false).is_empty(),
+            ":is(.a,.b) with no .card ancestor does not match"
+        );
+    }
+
+    #[test]
+    fn empty_functional_arg_matches_nothing_for_is_and_everything_for_not() {
+        // `:is()` (no parseable argument) matches nothing; `:not()` matches everything (vacuously —
+        // none of zero inner compounds match).
+        let is_sheet = parse("p:is() { color:#111111 }");
+        let not_sheet = parse("p:not() { color:#222222 }");
+        let p = MatchTarget::new(Some("p"), None, &[]);
+        assert!(
+            is_sheet.resolve_for(&p, false).is_empty(),
+            ":is() matches nothing"
+        );
+        assert_eq!(
+            not_sheet.resolve_for(&p, false),
+            vec![(FG, "#222222".to_string())],
+            ":not() matches everything (no inner compound to exclude)"
+        );
     }
 }
