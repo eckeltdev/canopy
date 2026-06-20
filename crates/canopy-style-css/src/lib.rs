@@ -556,8 +556,11 @@ fn is_css_wide_keyword(value: &str) -> bool {
 /// `PADDING`, `GAP`); a multi-value form expands to the per-side / per-axis longhands following
 /// the CSS 1/2/3/4-value box rules. `inset` always expands to the four `INSET_*` sides. `border`,
 /// `flex`, and `outline` split their space-separated parts by shape (length / keyword / color).
-/// Any longhand whose name maps to a known [`PropId`] is normalized through [`normalize_value`];
-/// unknown names are silently skipped, mirroring the longhand path.
+/// The two complex-value props `background-image` (a `linear-gradient`) and `box-shadow` are
+/// reduced to a canonical form by [`normalize_background_image`] / [`normalize_box_shadow`], and a
+/// value that doesn't parse drops its declaration cleanly. Any other longhand whose name maps to a
+/// known [`PropId`] is normalized through [`normalize_value`]; unknown names are silently skipped,
+/// mirroring the longhand path.
 fn expand_shorthand(name: &str, value: &str, decls: &mut Vec<Decl>) {
     // Split the value into whitespace-separated tokens (shorthands are space-delimited).
     let parts: Vec<&str> = value.split_ascii_whitespace().collect();
@@ -610,6 +613,22 @@ fn expand_shorthand(name: &str, value: &str, decls: &mut Vec<Decl>) {
         },
         // `outline: <width> <style> <color>`: width + color are kept, style ignored for now.
         "outline" => expand_outline(decls, &parts),
+        // `background-image: linear-gradient(...)`: normalize to the canonical
+        // `linear-gradient(<deg>, <#hex>[, <#hex>...])`. A value the parser can't make sense of
+        // (unsupported function, bad colors) is DROPPED cleanly rather than emitted half-baked.
+        "background-image" => {
+            if let Some(canon) = normalize_background_image(value) {
+                decls.push((BACKGROUND_IMAGE, canon));
+            }
+        }
+        // `box-shadow: <dx> <dy> [<blur> [<spread>]] <color> [inset]` in either color-first or
+        // color-last order: normalize to the canonical `<dx> <dy> <blur> <#hex>` (spread + inset
+        // dropped). A value that doesn't parse is DROPPED cleanly.
+        "box-shadow" => {
+            if let Some(canon) = normalize_box_shadow(value) {
+                decls.push((BOX_SHADOW, canon));
+            }
+        }
         // Not a shorthand: map the single property name directly.
         _ => {
             if let Some(prop) = map_property(name) {
@@ -781,7 +800,9 @@ fn map_property(name: &str) -> Option<PropId> {
         "outline-width" => Some(OUTLINE_WIDTH),
         "outline-color" => Some(OUTLINE_COLOR),
         "outline-offset" => Some(OUTLINE_OFFSET),
-        // Effects passed through verbatim (rendered in a later wave).
+        // Effects with complex values: normalized to a canonical form in `expand_shorthand`
+        // (`box-shadow` -> `<dx> <dy> <blur> <#hex>`; `background-image` -> the canonical
+        // `linear-gradient(<deg>, <#hex>...)`), not through the `normalize_value` path below.
         "box-shadow" => Some(BOX_SHADOW),
         "background-image" => Some(BACKGROUND_IMAGE),
         _ => None,
@@ -833,8 +854,9 @@ fn normalize_value(prop: PropId, value: &str) -> String {
             return num.trim().to_string();
         }
     }
-    // Keywords and the verbatim-passthrough props (z-index, flex-shrink, aspect-ratio, box-shadow,
-    // background-image, display:flex|none, position, overflow, …): unchanged.
+    // Keywords and the verbatim-passthrough props (z-index, flex-shrink, aspect-ratio,
+    // display:flex|none, position, overflow, …): unchanged. (`box-shadow` / `background-image`
+    // never reach here — their complex values are normalized in `expand_shorthand`.)
     value.to_string()
 }
 
@@ -1058,6 +1080,219 @@ fn named_color(name: &str) -> Option<&'static str> {
         ("transparent", "#00000000"),
     ];
     table.iter().find(|(kw, _)| eq(kw)).map(|(_, hex)| *hex)
+}
+
+// ---------------------------------------------------------------------------------
+// Complex value normalizers: `background-image` linear-gradient + `box-shadow`.
+//
+// These two values are reduced to a tiny canonical grammar the (no_std) layout
+// consumer can split on whitespace/commas without a real CSS value parser:
+//   background-image: linear-gradient(<deg>, <#hex>[, <#hex>...])   (1..=8 stops)
+//   box-shadow:       <dx> <dy> <blur> <#hex>                       (four tokens)
+// Either returns `None` on anything it can't faithfully reduce, so the caller drops
+// the whole declaration rather than emitting a half-formed value.
+// ---------------------------------------------------------------------------------
+
+/// The maximum number of gradient color stops the canonical form carries; matches the
+/// consumer's inline `GradientStops` capacity (`canopy_traits::MAX_GRADIENT_STOPS`). Extra
+/// stops past this are dropped (truncated to the first eight).
+const MAX_GRADIENT_STOPS: usize = 8;
+
+/// Normalize a CSS `background-image: linear-gradient(...)` into the canonical
+/// `linear-gradient(<deg>, <#hex>[, <#hex>...])`:
+/// - the direction folds to an integer degree (`to top`->0, `to right`->90, `to bottom`->180,
+///   `to left`->270; a bare `<n>deg` or `<n>` keeps `n` mod 360); when no direction is given the
+///   default is `180` (`to bottom`, CSS's default).
+/// - each color stop is normalized through [`normalize_color`] to `#rrggbb`/`#rrggbbaa`; a per-stop
+///   position percentage (`#fff 20%`) is dropped (only the color is kept).
+/// - at most [`MAX_GRADIENT_STOPS`] stops are kept (the consumer's inline cap); extra stops are
+///   truncated away.
+///
+/// Returns `None` (the caller then drops the declaration) when the value is not a
+/// `linear-gradient(...)`, has no color stops, or a stop doesn't normalize to a `#hex` color.
+fn normalize_background_image(value: &str) -> Option<String> {
+    let inner = value
+        .trim()
+        .strip_prefix("linear-gradient(")
+        .and_then(|s| s.strip_suffix(')'))?;
+    // Split the function arguments on top-level commas. A `rgb(...)`/`rgba(...)` stop carries its
+    // own commas, so track parenthesis depth and only split at depth 0.
+    let args = split_top_level_commas(inner);
+    let mut args = args.iter().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let first = args.next()?;
+
+    // Decide whether the first argument is a direction or already the first color stop.
+    let (deg, first_stop) = match parse_gradient_direction(first) {
+        Some(deg) => (deg, None),
+        None => (180, Some(first)), // no direction: default `to bottom` (180deg)
+    };
+
+    let mut out = String::new();
+    out.push_str("linear-gradient(");
+    push_int(&mut out, deg);
+
+    let mut stops = 0usize;
+    let push_stop = |out: &mut String, raw: &str, stops: &mut usize| -> Option<()> {
+        if *stops >= MAX_GRADIENT_STOPS {
+            return Some(()); // cap reached: silently drop further stops
+        }
+        // Drop a trailing per-stop position (`#fff 20%` / `red 0%`): keep only the color token.
+        let color_tok = raw.split_ascii_whitespace().next()?;
+        let hex = normalize_color(color_tok);
+        if !is_hex_color(&hex) {
+            return None; // a stop that doesn't resolve to a color invalidates the gradient
+        }
+        out.push_str(", ");
+        out.push_str(&hex);
+        *stops += 1;
+        Some(())
+    };
+
+    if let Some(raw) = first_stop {
+        push_stop(&mut out, raw, &mut stops)?;
+    }
+    for raw in args {
+        push_stop(&mut out, raw, &mut stops)?;
+    }
+    if stops == 0 {
+        return None; // a gradient with a direction but no color stops is malformed
+    }
+    out.push(')');
+    Some(out)
+}
+
+/// Parse a `linear-gradient` direction argument into an integer degree, or `None` if the argument
+/// is not a direction (so the caller treats it as the first color stop). Recognizes the four
+/// orthogonal `to <side>` keywords (`to top`->0, `to right`->90, `to bottom`->180, `to left`->270),
+/// a `<n>deg` angle, and a bare `<n>` integer; the angle is taken mod 360 (normalized to `0..360`).
+fn parse_gradient_direction(arg: &str) -> Option<i32> {
+    let arg = arg.trim();
+    // `to <side>` (case-insensitive prefix), e.g. `to right`.
+    if arg.len() >= 3 && arg[..3].eq_ignore_ascii_case("to ") {
+        return match arg[3..].trim().to_ascii_lowercase().as_str() {
+            "top" => Some(0),
+            "right" => Some(90),
+            "bottom" => Some(180),
+            "left" => Some(270),
+            _ => None, // diagonal "to top right" etc. unsupported -> not a recognized direction
+        };
+    }
+    let num = arg.strip_suffix("deg").unwrap_or(arg).trim();
+    // A bare number or `<n>deg`: parse as a (possibly signed) integer and normalize to `0..360`.
+    // A non-integer (e.g. a color keyword `red`) returns `None` so it is treated as a color stop.
+    let n: i32 = num.parse().ok()?;
+    Some(n.rem_euclid(360))
+}
+
+/// Normalize a CSS `box-shadow` into the canonical four-token `<dx> <dy> <blur> <#hex>`.
+///
+/// Parses `[<dx> <dy> [<blur> [<spread>]]] <color> [inset]` with the color appearing **before or
+/// after** the lengths: each token is classified as a length (px integer) or a color. `dx`/`dy`/
+/// `blur` are px integers (a `px` suffix is stripped); a missing `blur` defaults to `0`. The
+/// `spread` length (a 4th length) and the `inset` keyword are **dropped**. Returns `None` (caller
+/// drops the declaration) when there is no color, fewer than two lengths, or a token is neither a
+/// length nor a color.
+fn normalize_box_shadow(value: &str) -> Option<String> {
+    let mut color: Option<String> = None;
+    let mut lengths: Vec<i32> = Vec::new();
+    for tok in value.split_ascii_whitespace() {
+        if tok.eq_ignore_ascii_case("inset") {
+            continue; // inset dropped for now
+        }
+        if let Some(n) = parse_px_int(tok) {
+            lengths.push(n);
+            continue;
+        }
+        // Not a length: must be the (single) color. A second color is malformed.
+        let hex = normalize_color(tok);
+        if is_hex_color(&hex) && color.is_none() {
+            color = Some(hex);
+        } else {
+            return None;
+        }
+    }
+    let color = color?;
+    // Need at least dx + dy; blur defaults to 0, spread (a 4th length) is dropped.
+    let (dx, dy) = match lengths.as_slice() {
+        [dx, dy, ..] => (*dx, *dy),
+        _ => return None,
+    };
+    let blur = lengths.get(2).copied().unwrap_or(0);
+
+    let mut out = String::new();
+    push_int(&mut out, dx);
+    out.push(' ');
+    push_int(&mut out, dy);
+    out.push(' ');
+    push_int(&mut out, blur);
+    out.push(' ');
+    out.push_str(&color);
+    Some(out)
+}
+
+/// Split `s` on commas that are **not** nested inside parentheses, returning each segment (untrimmed).
+/// Used to separate `linear-gradient` arguments without breaking a `rgb(r, g, b)` color stop apart.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Whether `s` is a canonical `#rrggbb` or `#rrggbbaa` hex color (the form [`normalize_color`]
+/// produces for a value it recognized). A value `normalize_color` couldn't resolve comes back
+/// verbatim and so fails this check.
+fn is_hex_color(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix('#') else {
+        return false;
+    };
+    (hex.len() == 6 || hex.len() == 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parse a `box-shadow` length token into an integer px, stripping a `px` suffix. Accepts an
+/// optional leading `-`; returns `None` for a non-integer (so it can be classified as a color).
+/// A fractional value (`4.5px`) is rejected — the canonical shadow form carries integer px.
+fn parse_px_int(tok: &str) -> Option<i32> {
+    let body = tok.strip_suffix("px").unwrap_or(tok);
+    if body.is_empty() {
+        return None;
+    }
+    body.parse::<i32>().ok()
+}
+
+/// Append a signed integer to `out` in decimal, by hand (no `format!`, to stay `no_std`-clean).
+fn push_int(out: &mut String, n: i32) {
+    if n < 0 {
+        out.push('-');
+    }
+    // Work in the unsigned domain so `i32::MIN` doesn't overflow when negated.
+    let mut mag = (n as i64).unsigned_abs();
+    if mag == 0 {
+        out.push('0');
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    while mag > 0 {
+        digits[len] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+        len += 1;
+    }
+    for &d in digits[..len].iter().rev() {
+        out.push(d as char);
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -1953,18 +2188,234 @@ mod tests {
     }
 
     #[test]
-    fn box_shadow_and_background_image_pass_through_verbatim() {
+    fn box_shadow_and_background_image_normalize_to_canonical_form() {
+        // `box-shadow` -> `<dx> <dy> <blur> <#hex>` (px stripped, rgba alpha folded to #rrggbbaa).
+        // `background-image` -> `linear-gradient(<deg>, <#hex>...)` (named colors normalized,
+        // default direction 180 when none is given).
         let sheet = parse(
             ".a { box-shadow: 0 2px 4px rgba(0,0,0,0.3) } .b { background-image: linear-gradient(red, blue) }",
         );
         assert_eq!(
             sheet.declarations("a"),
-            &[(BOX_SHADOW, "0 2px 4px rgba(0,0,0,0.3)".to_string())]
+            &[(BOX_SHADOW, "0 2 4 #0000004d".to_string())]
         );
         assert_eq!(
             sheet.declarations("b"),
-            &[(BACKGROUND_IMAGE, "linear-gradient(red, blue)".to_string())]
+            &[(
+                BACKGROUND_IMAGE,
+                "linear-gradient(180, #ff0000, #0000ff)".to_string()
+            )]
         );
+    }
+
+    // --- background-image: linear-gradient normalization -------------------
+
+    #[test]
+    fn gradient_to_right_folds_direction_to_90_degrees() {
+        let sheet = parse(".a { background-image: linear-gradient(to right, #89b4fa, #b4caff) }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(
+                BACKGROUND_IMAGE,
+                "linear-gradient(90, #89b4fa, #b4caff)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn gradient_default_direction_is_180() {
+        // No direction argument -> default `to bottom` (180deg).
+        let sheet = parse(".a { background-image: linear-gradient(#89b4fa, #b4caff) }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(
+                BACKGROUND_IMAGE,
+                "linear-gradient(180, #89b4fa, #b4caff)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn gradient_side_keywords_map_to_their_degrees() {
+        // to top -> 0, to bottom -> 180, to left -> 270, to right -> 90.
+        let sheet = parse(
+            ".t { background-image: linear-gradient(to top, #000000, #ffffff) } \
+             .b { background-image: linear-gradient(to bottom, #000000, #ffffff) } \
+             .l { background-image: linear-gradient(to left, #000000, #ffffff) }",
+        );
+        assert_eq!(
+            val(sheet.declarations("t"), BACKGROUND_IMAGE),
+            Some("linear-gradient(0, #000000, #ffffff)")
+        );
+        assert_eq!(
+            val(sheet.declarations("b"), BACKGROUND_IMAGE),
+            Some("linear-gradient(180, #000000, #ffffff)")
+        );
+        assert_eq!(
+            val(sheet.declarations("l"), BACKGROUND_IMAGE),
+            Some("linear-gradient(270, #000000, #ffffff)")
+        );
+    }
+
+    #[test]
+    fn gradient_bare_deg_angle_keeps_value_mod_360() {
+        let plain = parse(".a { background-image: linear-gradient(45deg, red, blue) }");
+        assert_eq!(
+            val(plain.declarations("a"), BACKGROUND_IMAGE),
+            Some("linear-gradient(45, #ff0000, #0000ff)")
+        );
+        // A bare number (no `deg`) is also accepted, and an angle past 360 wraps.
+        let wrap = parse(".b { background-image: linear-gradient(450, red, blue) }");
+        assert_eq!(
+            val(wrap.declarations("b"), BACKGROUND_IMAGE),
+            Some("linear-gradient(90, #ff0000, #0000ff)")
+        );
+    }
+
+    #[test]
+    fn gradient_three_stops_all_normalize() {
+        let sheet =
+            parse(".a { background-image: linear-gradient(to right, #89b4fa, #b4caff, #cba6f7) }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(
+                BACKGROUND_IMAGE,
+                "linear-gradient(90, #89b4fa, #b4caff, #cba6f7)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn gradient_rgba_stop_carries_alpha_as_rrggbbaa() {
+        // An rgba() stop with alpha < 1 folds to the 8-digit `#rrggbbaa` form.
+        let sheet = parse(
+            ".a { background-image: linear-gradient(to right, rgba(137,180,250,0.5), #b4caff) }",
+        );
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(
+                BACKGROUND_IMAGE,
+                "linear-gradient(90, #89b4fa80, #b4caff)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn gradient_drops_per_stop_position_percentages() {
+        // A per-stop position (`#fff 20%`) is dropped — only the color is kept for now.
+        let sheet =
+            parse(".a { background-image: linear-gradient(to right, #89b4fa 0%, #b4caff 100%) }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(
+                BACKGROUND_IMAGE,
+                "linear-gradient(90, #89b4fa, #b4caff)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn gradient_caps_at_eight_stops() {
+        // Nine stops -> the consumer's inline cap keeps the first eight.
+        let sheet = parse(
+            ".a { background-image: linear-gradient(to right, #010101, #020202, #030303, #040404, #050505, #060606, #070707, #080808, #090909) }",
+        );
+        let v = val(sheet.declarations("a"), BACKGROUND_IMAGE).unwrap();
+        assert_eq!(
+            v,
+            "linear-gradient(90, #010101, #020202, #030303, #040404, #050505, #060606, #070707, #080808)"
+        );
+    }
+
+    #[test]
+    fn gradient_with_a_bad_stop_drops_the_declaration() {
+        // `notacolor` doesn't resolve to a hex color -> the whole gradient is dropped cleanly,
+        // and a sibling declaration survives.
+        let sheet = parse(
+            ".a { background-image: linear-gradient(to right, #89b4fa, notacolor); background: #111111 }",
+        );
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, BACKGROUND_IMAGE), None, "bad gradient dropped");
+        assert_eq!(val(d, BG), Some("#111111"), "sibling survives");
+    }
+
+    #[test]
+    fn non_gradient_background_image_is_dropped() {
+        // A non-`linear-gradient` value (e.g. `url(...)`) isn't supported -> dropped cleanly.
+        let sheet = parse(".a { background-image: url(pic.png) }");
+        assert!(sheet.declarations("a").is_empty());
+    }
+
+    // --- box-shadow normalization ------------------------------------------
+
+    #[test]
+    fn box_shadow_color_last_form_normalizes() {
+        // `0 4px 12px rgba(0,0,0,0.25)` -> `0 4 12 #00000040` (px stripped, alpha 0.25 -> 0x40).
+        let sheet = parse(".a { box-shadow: 0 4px 12px rgba(0,0,0,0.25) }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(BOX_SHADOW, "0 4 12 #00000040".to_string())]
+        );
+    }
+
+    #[test]
+    fn box_shadow_color_first_form_normalizes() {
+        // The color may appear before the lengths.
+        let sheet = parse(".a { box-shadow: #000000 2px 4px 6px }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(BOX_SHADOW, "2 4 6 #000000".to_string())]
+        );
+    }
+
+    #[test]
+    fn box_shadow_blur_omitted_defaults_to_zero() {
+        // Only dx + dy given -> blur defaults to 0.
+        let sheet = parse(".a { box-shadow: 3px 5px red }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(BOX_SHADOW, "3 5 0 #ff0000".to_string())]
+        );
+    }
+
+    #[test]
+    fn box_shadow_drops_spread_and_inset() {
+        // A 4th length (spread) and the `inset` keyword are dropped from the canonical form.
+        let spread = parse(".a { box-shadow: 1px 2px 3px 4px #000000 }");
+        assert_eq!(
+            spread.declarations("a"),
+            &[(BOX_SHADOW, "1 2 3 #000000".to_string())]
+        );
+        let inset = parse(".b { box-shadow: inset 1px 2px 3px #000000 }");
+        assert_eq!(
+            inset.declarations("b"),
+            &[(BOX_SHADOW, "1 2 3 #000000".to_string())]
+        );
+    }
+
+    #[test]
+    fn box_shadow_negative_offsets_preserve_sign() {
+        let sheet = parse(".a { box-shadow: -2px -4px 6px #000000 }");
+        assert_eq!(
+            sheet.declarations("a"),
+            &[(BOX_SHADOW, "-2 -4 6 #000000".to_string())]
+        );
+    }
+
+    #[test]
+    fn box_shadow_without_a_color_is_dropped() {
+        // No color token -> the seam can't draw a shadow, so the declaration is dropped cleanly.
+        let sheet = parse(".a { box-shadow: 2px 4px 6px; background: #111111 }");
+        let d = sheet.declarations("a");
+        assert_eq!(val(d, BOX_SHADOW), None, "colorless shadow dropped");
+        assert_eq!(val(d, BG), Some("#111111"), "sibling survives");
+    }
+
+    #[test]
+    fn box_shadow_with_too_few_lengths_is_dropped() {
+        // A single length (only dx, no dy) is malformed -> dropped.
+        let sheet = parse(".a { box-shadow: 2px #000000 }");
+        assert!(sheet.declarations("a").is_empty());
     }
 
     #[test]

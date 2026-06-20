@@ -1361,6 +1361,36 @@ mod tests {
         assert!(is_navy(at(50, 8)), "top padding band is the container");
     }
 
+    #[test]
+    fn end_to_end_linear_gradient_background_renders_a_ramp() {
+        // Full Wave-2 chain: the parser normalizes `linear-gradient(to bottom, red, blue)` to a
+        // canonical form (style-css), the layout emits a Gradient display item (layout-taffy), and
+        // the software rasterizer interpolates the stops top-to-bottom (render-soft). A vertical
+        // red->blue ramp must read red-dominant at the top and blue-dominant at the bottom.
+        let mut e = Emitter::new();
+        let bx = e.create_element(ElementTag::new(1));
+        e.append(ROOT, bx);
+        e.set_attribute(bx, AttrId::ID, "g");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_viewport(100.0, 100.0);
+        host.set_stylesheet(
+            "#g { width: 100; height: 100; background-image: linear-gradient(to bottom, red, blue) }",
+        );
+
+        let buf = host.render_rgba(100, 100);
+        let at = |x: usize, y: usize| {
+            let i = (y * 100 + x) * 4;
+            (buf[i], buf[i + 2]) // (R, B)
+        };
+        let (rt, bt) = at(50, 6); // near the top
+        let (rb, bb) = at(50, 94); // near the bottom
+        assert!(rt > bt, "top of the ramp is red-dominant (R>B)");
+        assert!(bb > rb, "bottom of the ramp is blue-dominant (B>R)");
+        assert!(rt > rb, "red fades from top to bottom");
+        assert!(bb > bt, "blue grows from top to bottom");
+    }
+
     /// Read a node's resolved value for `p` out of a styled (cascaded) clone.
     fn styled_prop(dom: &Dom, node: NodeId, p: PropId) -> Option<String> {
         dom.node(node).and_then(|n| n.styles.get(&p)).cloned()

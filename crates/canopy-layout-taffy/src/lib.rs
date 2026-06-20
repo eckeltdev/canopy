@@ -44,16 +44,20 @@ use alloc::vec::Vec;
 
 use canopy_dom::{Dom, ROOT};
 use canopy_paint::{
-    ALIGN, ALIGN_SELF, ASPECT_RATIO, BG, BORDER_BOTTOM_WIDTH, BORDER_COLOR, BORDER_LEFT_WIDTH,
-    BORDER_RIGHT_WIDTH, BORDER_TOP_WIDTH, BORDER_WIDTH, BOX_SIZING, COLUMN_GAP, DIRECTION, DISPLAY,
-    FG, FLEX_BASIS, FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE, GAP, HEIGHT, INSET_BOTTOM,
-    INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, MARGIN, MARGIN_BOTTOM, MARGIN_LEFT, MARGIN_RIGHT,
-    MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY, PADDING, PADDING_BOTTOM,
-    PADDING_LEFT, PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TRANSLATE_X,
-    TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
+    ALIGN, ALIGN_SELF, ASPECT_RATIO, BACKGROUND_IMAGE, BG, BORDER_BOTTOM_WIDTH, BORDER_COLOR,
+    BORDER_LEFT_WIDTH, BORDER_RIGHT_WIDTH, BORDER_TOP_WIDTH, BORDER_WIDTH, BOX_SHADOW, BOX_SIZING,
+    COLUMN_GAP, DIRECTION, DISPLAY, FG, FLEX_BASIS, FLEX_GROW, FLEX_SHRINK, FLEX_WRAP, FONT_SIZE,
+    GAP, HEIGHT, INSET_BOTTOM, INSET_LEFT, INSET_RIGHT, INSET_TOP, JUSTIFY, MARGIN, MARGIN_BOTTOM,
+    MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH, OPACITY,
+    OUTLINE_COLOR, OUTLINE_OFFSET, OUTLINE_WIDTH, PADDING, PADDING_BOTTOM, PADDING_LEFT,
+    PADDING_RIGHT, PADDING_TOP, POSITION, RADIUS, ROW_GAP, TEXT_ALIGN, TEXT_DECORATION,
+    TRANSLATE_X, TRANSLATE_Y, VISIBILITY, WIDTH, Z_INDEX,
 };
 use canopy_protocol::{ElementTag, NodeId, PropId};
-use canopy_traits::{Color, DisplayItem, DisplayList, LayoutResult, Point, Rect, Size};
+use canopy_traits::{
+    Color, DisplayItem, DisplayList, GradientDirection, GradientStop, GradientStops, LayoutResult,
+    Point, Rect, Size,
+};
 
 use taffy::prelude::length;
 use taffy::{
@@ -79,16 +83,25 @@ const DEFAULT_FG: Color = Color {
     a: 255,
 };
 
+/// Parse a `#rrggbb` (alpha = 255) or `#rrggbbaa` (4th byte is the alpha) hex color.
+/// The 8-hex form lets translucent shadows/gradients survive parsing (a half-alpha
+/// `#00000080` drop shadow, a gradient stop fading to transparent), which the 6-hex-only
+/// form would reject. Any other length is rejected.
 fn parse_color(s: &str) -> Option<Color> {
     let hex = s.strip_prefix('#')?;
-    if hex.len() != 6 {
+    if hex.len() != 6 && hex.len() != 8 {
         return None;
     }
+    let a = if hex.len() == 8 {
+        u8::from_str_radix(&hex[6..8], 16).ok()?
+    } else {
+        255
+    };
     Some(Color {
         r: u8::from_str_radix(&hex[0..2], 16).ok()?,
         g: u8::from_str_radix(&hex[2..4], 16).ok()?,
         b: u8::from_str_radix(&hex[4..6], 16).ok()?,
-        a: 255,
+        a,
     })
 }
 
@@ -101,6 +114,87 @@ fn style_px(dom: &Dom, node: NodeId, prop: PropId) -> Option<u32> {
 
 fn style_color(dom: &Dom, node: NodeId, prop: PropId) -> Option<Color> {
     dom.style(node, prop).and_then(parse_color)
+}
+
+/// A parsed `box-shadow`: the producer freezes the value as four space-separated tokens,
+/// `<dx> <dy> <blur> <#hex>` (no spread, no `inset`). `dx`/`dy`/`blur` are signed integer
+/// px; the color is `#rrggbb`/`#rrggbbaa` (often translucent).
+struct ParsedShadow {
+    offset: Point,
+    blur: f32,
+    color: Color,
+}
+
+/// Parse the frozen `BOX_SHADOW` string `"<dx> <dy> <blur> <#hex>"` into its offset, blur,
+/// and color. Returns `None` if any of the four tokens is missing or unparseable. Offsets
+/// and blur are read via [`signed_px`] (a leading `-` survives, `no_std`-clean); the color
+/// via [`parse_color`] (so an 8-hex translucent shadow parses).
+fn parse_box_shadow(s: &str) -> Option<ParsedShadow> {
+    let mut tok = s.split_whitespace();
+    let dx = signed_px(tok.next()?)?;
+    let dy = signed_px(tok.next()?)?;
+    let blur = signed_px(tok.next()?)?;
+    let color = parse_color(tok.next()?)?;
+    Some(ParsedShadow {
+        offset: Point { x: dx, y: dy },
+        blur,
+        color,
+    })
+}
+
+/// Parse the frozen `BACKGROUND_IMAGE` string `"linear-gradient(<deg>, <#hex>[, <#hex>...]"`
+/// into evenly-spaced [`GradientStops`] plus a [`GradientDirection`]. `<deg>` is a bare
+/// integer `0..359` (0=to-top, 90=to-right, 180=to-bottom, 270=to-left); each `<#hex>` is
+/// `#rrggbb`/`#rrggbbaa`, 1..8 stops. Returns `None` if the wrapper is missing, the angle is
+/// unparseable, or there are no parseable color stops.
+///
+/// Stops are spaced evenly across `[0, 1]` (`i / (n - 1)`, a single stop at `0.0`). The angle
+/// maps to [`GradientDirection::Vertical`] for a roughly vertical run (`deg <= 45`, `135..=225`,
+/// or `>= 315`) and [`GradientDirection::Horizontal`] otherwise.
+fn parse_linear_gradient(s: &str) -> Option<(GradientStops, GradientDirection)> {
+    let inner = s
+        .trim()
+        .strip_prefix("linear-gradient(")?
+        .strip_suffix(')')?;
+    let mut parts = inner.split(',');
+    let deg = parts.next()?.trim().parse::<i32>().ok()?;
+    // Parse the color stops in order; ignore any unparseable token rather than aborting the
+    // whole gradient (the producer freezes well-formed hex, so this is defensive).
+    let mut colors: Vec<Color> = Vec::new();
+    for tok in parts {
+        if let Some(c) = parse_color(tok.trim()) {
+            colors.push(c);
+        }
+    }
+    if colors.is_empty() {
+        return None;
+    }
+    let n = colors.len();
+    let mut stops: Vec<GradientStop> = Vec::with_capacity(n);
+    for (i, color) in colors.into_iter().enumerate() {
+        // Evenly spaced: a single stop sits at 0.0; otherwise i/(n-1) spans [0, 1].
+        let position = if n == 1 {
+            0.0
+        } else {
+            i as f32 / (n - 1) as f32
+        };
+        stops.push(GradientStop { color, position });
+    }
+    let direction = gradient_direction(deg);
+    Some((GradientStops::from_slice(&stops), direction))
+}
+
+/// Map a `linear-gradient` angle (degrees) to one of the two display-list axes. A roughly
+/// vertical run (`deg <= 45`, `135..=225`, or `>= 315` — i.e. near 0/180/360) is
+/// [`GradientDirection::Vertical`]; everything else (near 90/270) is
+/// [`GradientDirection::Horizontal`]. The frozen producer angle is `0..359`, but the
+/// comparisons tolerate any integer.
+fn gradient_direction(deg: i32) -> GradientDirection {
+    if deg <= 45 || (135..=225).contains(&deg) || deg >= 315 {
+        GradientDirection::Vertical
+    } else {
+        GradientDirection::Horizontal
+    }
 }
 
 /// The node's corner [`RADIUS`] in logical px (default `0.0` = square). Geometry
@@ -951,17 +1045,24 @@ fn build_display_list(
         if !paint.visible {
             continue;
         }
+        // Per-node paint order, back to front: box-shadow (behind the box), the background
+        // fill (`Rect`), the background gradient (over the solid fill), the border frame,
+        // then — for a text leaf — the text run and its decoration. The outline lands last
+        // (on top of everything this node draws). The shared parts are factored out so the
+        // text and non-text branches stay in lockstep.
+        push_shadow(dom, id, rect, paint.opacity, &mut items);
+        // `background` is NOT inherited (per-element), so it is read off this node.
+        if let Some(bg) = style_color(dom, id, BG) {
+            items.push(DisplayItem::Rect {
+                rect,
+                color: fade(bg, paint.opacity),
+                radius: style_radius(dom, id),
+            });
+        }
+        push_gradient(dom, id, rect, paint.opacity, &mut items);
+        push_border(dom, id, rect, paint.opacity, &mut items);
         if let Some(text) = node.text.as_deref() {
-            // `background` is NOT inherited (per-element), so it is read off this node;
-            // the text `color` IS inherited (resolved in the tree walk -> `paint.fg`).
-            if let Some(bg) = style_color(dom, id, BG) {
-                items.push(DisplayItem::Rect {
-                    rect,
-                    color: fade(bg, paint.opacity),
-                    radius: style_radius(dom, id),
-                });
-            }
-            push_border(dom, id, rect, paint.opacity, &mut items);
+            // The text `color` IS inherited (resolved in the tree walk -> `paint.fg`).
             items.push(DisplayItem::Text {
                 origin: rect.origin,
                 text: text.to_string(),
@@ -975,16 +1076,12 @@ fn build_display_list(
                 box_w: rect.size.w,
                 align: paint.align,
             });
-        } else {
-            if let Some(bg) = style_color(dom, id, BG) {
-                items.push(DisplayItem::Rect {
-                    rect,
-                    color: fade(bg, paint.opacity),
-                    radius: style_radius(dom, id),
-                });
-            }
-            push_border(dom, id, rect, paint.opacity, &mut items);
+            // The decoration line rides on the text run's resolved (inherited) ink color and
+            // is emitted just after the run, so it paints over the glyph cell.
+            push_text_decoration(dom, id, rect, fade(paint.fg, paint.opacity), &mut items);
         }
+        // Outline is paint-only and on top of everything this node drew.
+        push_outline(dom, id, rect, paint.opacity, &mut items);
     }
     items
 }
@@ -1008,6 +1105,155 @@ fn push_border(dom: &Dom, id: NodeId, rect: Rect, opacity: f32, items: &mut Vec<
     };
     items.push(DisplayItem::Border {
         rect,
+        color: fade(color, opacity),
+        width: width as f32,
+        radius: style_radius(dom, id),
+    });
+}
+
+/// Emit a [`DisplayItem::Shadow`] for `id`'s [`BOX_SHADOW`] over `rect` (the node's
+/// border-box), or nothing when the property is unset/unparseable.
+///
+/// The shadow is pushed **first** in the node's paint sequence so it sits *behind* the box.
+/// The frozen value is `"<dx> <dy> <blur> <#hex>"` (no spread/inset); its color is [`fade`]d
+/// by the node's resolved opacity, matching how the fill and border fade. `rect` is the
+/// border-box; the renderer offsets it by `offset` and feathers it by `blur`.
+fn push_shadow(dom: &Dom, id: NodeId, rect: Rect, opacity: f32, items: &mut Vec<DisplayItem>) {
+    let Some(shadow) = dom.style(id, BOX_SHADOW).and_then(parse_box_shadow) else {
+        return;
+    };
+    items.push(DisplayItem::Shadow {
+        rect,
+        color: fade(shadow.color, opacity),
+        blur: shadow.blur,
+        offset: shadow.offset,
+    });
+}
+
+/// Emit a [`DisplayItem::Gradient`] for `id`'s [`BACKGROUND_IMAGE`] over `rect`, or nothing
+/// when the property is unset/unparseable.
+///
+/// Pushed **just after** the background `Rect` so it paints over the solid fill (a CSS
+/// `background-image` layers in front of `background-color`). The frozen value is
+/// `"linear-gradient(<deg>, <#hex>[, <#hex>...])"`; stops are spaced evenly across the axis
+/// and each stop's color is [`fade`]d by the node's resolved opacity so a translucent subtree
+/// fades the gradient with its other fills.
+fn push_gradient(dom: &Dom, id: NodeId, rect: Rect, opacity: f32, items: &mut Vec<DisplayItem>) {
+    let Some((stops, direction)) = dom
+        .style(id, BACKGROUND_IMAGE)
+        .and_then(parse_linear_gradient)
+    else {
+        return;
+    };
+    // Fade each stop's color by the node opacity, matching the fill/border treatment.
+    let faded: Vec<GradientStop> = stops
+        .as_slice()
+        .iter()
+        .map(|s| GradientStop {
+            color: fade(s.color, opacity),
+            position: s.position,
+        })
+        .collect();
+    items.push(DisplayItem::Gradient {
+        rect,
+        stops: GradientStops::from_slice(&faded),
+        direction,
+    });
+}
+
+/// Emit a thin [`DisplayItem::Rect`] for `id`'s [`TEXT_DECORATION`] (`underline` /
+/// `line-through`) across the text run, or nothing for `none`/unset/an unknown keyword.
+///
+/// `rect` is the text leaf's laid-out box and `color` the (already-faded) ink. The line
+/// spans the box width with thickness `max(1, font_size / 16)`, where `font_size` is the
+/// same height the text run uses (`rect.size.h`). An `underline` sits near the bottom of the
+/// cell (one thickness above the baseline edge); a `line-through` sits at the vertical
+/// middle. Pushed just after the text run so it paints over the glyphs.
+fn push_text_decoration(
+    dom: &Dom,
+    id: NodeId,
+    rect: Rect,
+    color: Color,
+    items: &mut Vec<DisplayItem>,
+) {
+    let kind = match dom.style(id, TEXT_DECORATION) {
+        Some("underline") => Decoration::Underline,
+        Some("line-through") => Decoration::LineThrough,
+        // `none`, unset, or an unrecognized keyword draws no line.
+        _ => return,
+    };
+    let font_size = rect.size.h;
+    // Thickness scales with the font size (a 16px run -> 1px), floored at 1px so the line is
+    // never invisible. Integer-friendly: cast-truncate, no `f32::floor` (std-only).
+    let thickness = ((font_size / 16.0) as u32).max(1) as f32;
+    let y = match kind {
+        // Underline: near the bottom of the cell, one thickness up from the bottom edge so
+        // the full line stays inside the box.
+        Decoration::Underline => rect.origin.y + font_size - thickness,
+        // Line-through: centered vertically through the run.
+        Decoration::LineThrough => rect.origin.y + (font_size - thickness) / 2.0,
+    };
+    items.push(DisplayItem::Rect {
+        rect: Rect {
+            origin: Point {
+                x: rect.origin.x,
+                y,
+            },
+            size: Size {
+                w: rect.size.w,
+                h: thickness,
+            },
+        },
+        color,
+        radius: 0.0,
+    });
+}
+
+/// Which line a [`TEXT_DECORATION`] draws.
+enum Decoration {
+    /// A line near the bottom of the text cell.
+    Underline,
+    /// A line through the vertical middle of the text cell.
+    LineThrough,
+}
+
+/// Emit a [`DisplayItem::Border`] for `id`'s outline ([`OUTLINE_WIDTH`] / [`OUTLINE_COLOR`] /
+/// [`OUTLINE_OFFSET`]) over `rect` inflated by the offset, or nothing when the width is `0`.
+///
+/// The outline is **paint-only** (it never affects layout) and pushed **last** in the node's
+/// sequence so it sits on top of everything else this node drew — matching CSS `outline`,
+/// which is drawn outside the border box and over neighboring content. `rect` (the
+/// border-box) is inflated by [`OUTLINE_OFFSET`] (which may be negative, pulling the outline
+/// inward) on all four sides; the stroke uses the node's own [`RADIUS`]. The color is
+/// [`fade`]d by the node's resolved opacity. A missing/unparseable color defaults to the
+/// node's [`FG`] ink, then [`DEFAULT_FG`], mirroring CSS `outline-color: currentColor`.
+fn push_outline(dom: &Dom, id: NodeId, rect: Rect, opacity: f32, items: &mut Vec<DisplayItem>) {
+    let width = style_px(dom, id, OUTLINE_WIDTH).unwrap_or(0);
+    if width == 0 {
+        return;
+    }
+    // CSS `outline-color` defaults to `currentColor`; fall back to the node's own `color`
+    // then the crate default so an outline with no explicit color still strokes.
+    let color = style_color(dom, id, OUTLINE_COLOR)
+        .or_else(|| style_color(dom, id, FG))
+        .unwrap_or(DEFAULT_FG);
+    // `outline-offset` is a signed px gap; a negative value pulls the outline inside the box.
+    let offset = dom
+        .style(id, OUTLINE_OFFSET)
+        .and_then(signed_px)
+        .unwrap_or(0.0);
+    let inflated = Rect {
+        origin: Point {
+            x: rect.origin.x - offset,
+            y: rect.origin.y - offset,
+        },
+        size: Size {
+            w: rect.size.w + offset * 2.0,
+            h: rect.size.h + offset * 2.0,
+        },
+    };
+    items.push(DisplayItem::Border {
+        rect: inflated,
         color: fade(color, opacity),
         width: width as f32,
         radius: style_radius(dom, id),
@@ -2573,6 +2819,530 @@ mod tests {
         assert!(
             red_idx < blue_idx,
             "equal z-index keeps tree order (stable sort): first sibling paints first"
+        );
+    }
+
+    #[test]
+    fn parse_color_accepts_8_hex_alpha() {
+        // `#rrggbb` keeps alpha 255; `#rrggbbaa` parses the 4th byte as the alpha. A
+        // translucent value must survive so shadows/gradients can fade.
+        assert_eq!(
+            parse_color("#11223344"),
+            Some(Color {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+                a: 0x44
+            }),
+            "8-hex parses the trailing alpha byte"
+        );
+        assert_eq!(
+            parse_color("#112233"),
+            Some(Color {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+                a: 255
+            }),
+            "6-hex defaults alpha to opaque"
+        );
+        // A non-6/8 length is still rejected.
+        assert_eq!(parse_color("#1234"), None);
+    }
+
+    #[test]
+    fn background_image_emits_a_gradient_with_even_stops() {
+        // A `linear-gradient(180, #ff0000, #00ff00, #0000ff)` background emits a Gradient
+        // just after the solid background Rect, with three evenly-spaced stops (0, 0.5, 1)
+        // and a Vertical direction (180deg).
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, BG, "#000000"); // a solid fill behind the gradient
+        e.set_inline_style(
+            card,
+            BACKGROUND_IMAGE,
+            "linear-gradient(180, #ff0000, #00ff00, #0000ff)",
+        );
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+
+        let (stops, direction) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Gradient {
+                    stops, direction, ..
+                } => Some((*stops, *direction)),
+                _ => None,
+            })
+            .expect("a Gradient item is in the scene");
+        assert_eq!(direction, GradientDirection::Vertical, "180deg -> vertical");
+        let slice = stops.as_slice();
+        assert_eq!(slice.len(), 3, "three stops");
+        assert_eq!(slice[0].position, 0.0);
+        assert_eq!(slice[1].position, 0.5, "evenly spaced: middle stop at 0.5");
+        assert_eq!(slice[2].position, 1.0);
+        assert_eq!(
+            (slice[0].color.r, slice[0].color.g, slice[0].color.b),
+            (0xff, 0x00, 0x00)
+        );
+        assert_eq!(
+            (slice[2].color.r, slice[2].color.g, slice[2].color.b),
+            (0x00, 0x00, 0xff)
+        );
+
+        // The gradient paints over the solid background fill.
+        let bg_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { .. }))
+            .unwrap();
+        let grad_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Gradient { .. }))
+            .unwrap();
+        assert!(
+            bg_idx < grad_idx,
+            "the gradient paints over the solid background"
+        );
+    }
+
+    #[test]
+    fn horizontal_gradient_maps_to_horizontal_direction() {
+        // A 90deg gradient (to-right) maps to the Horizontal axis; a single stop sits at 0.0.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, BACKGROUND_IMAGE, "linear-gradient(90, #abcdef)");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let (stops, direction) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Gradient {
+                    stops, direction, ..
+                } => Some((*stops, *direction)),
+                _ => None,
+            })
+            .expect("a Gradient item");
+        assert_eq!(
+            direction,
+            GradientDirection::Horizontal,
+            "90deg -> horizontal"
+        );
+        let slice = stops.as_slice();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].position, 0.0, "a single stop sits at 0.0");
+    }
+
+    #[test]
+    fn box_shadow_emits_a_shadow_with_offset_blur_and_translucent_color() {
+        // `box-shadow: 4 -2 6 #00000080` emits a Shadow behind the box, carrying the
+        // offset (4, -2), blur 6, and a HALF-ALPHA black — proving `parse_color`'s 8-hex
+        // alpha path feeds the shadow.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, BG, "#202020");
+        e.set_inline_style(card, BOX_SHADOW, "4 -2 6 #00000080");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let (color, blur, offset) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Shadow {
+                    color,
+                    blur,
+                    offset,
+                    ..
+                } => Some((*color, *blur, *offset)),
+                _ => None,
+            })
+            .expect("a Shadow item is in the scene");
+        assert_eq!(
+            offset,
+            Point { x: 4.0, y: -2.0 },
+            "signed dx/dy ride through"
+        );
+        assert_eq!(blur, 6.0);
+        assert_eq!(
+            color,
+            Color {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00,
+                a: 0x80
+            },
+            "the translucent #00000080 shadow color survives (parse_color alpha)"
+        );
+
+        // The shadow is emitted BEFORE the background fill so it sits behind the box.
+        let shadow_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Shadow { .. }))
+            .unwrap();
+        let bg_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { .. }))
+            .unwrap();
+        assert!(shadow_idx < bg_idx, "the shadow paints behind the box");
+    }
+
+    #[test]
+    fn underline_emits_a_thin_rect_near_the_baseline() {
+        // A text leaf with `text-decoration: underline` emits a thin Rect spanning the box
+        // width, positioned near the bottom of the cell, just after the Text run.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let t = e.create_text("ab");
+        e.append(col, t);
+        e.set_inline_style(t, WIDTH, "60");
+        e.set_inline_style(t, HEIGHT, "16");
+        e.set_inline_style(t, FG, "#ffd040");
+        e.set_inline_style(t, TEXT_DECORATION, "underline");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 100.0, h: 50.0 });
+        let t_rect = lay.rects.iter().find(|(id, _)| *id == t).unwrap().1;
+
+        // The decoration Rect: full box width, 1px thick (16/16 = 1), the run's ink color,
+        // near the bottom (origin.y + 16 - 1 = 15).
+        let (deco_rect, color) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, color, .. } => Some((*rect, *color)),
+                _ => None,
+            })
+            .expect("an underline Rect");
+        assert_eq!(deco_rect.size.w, 60.0, "the line spans the text box width");
+        assert_eq!(deco_rect.size.h, 1.0, "thickness max(1, 16/16) = 1");
+        assert_eq!(
+            deco_rect.origin.y,
+            t_rect.origin.y + 16.0 - 1.0,
+            "underline sits near the bottom of the cell"
+        );
+        assert_eq!(
+            color,
+            Color {
+                r: 0xff,
+                g: 0xd0,
+                b: 0x40,
+                a: 255
+            },
+            "the underline takes the text's ink color"
+        );
+
+        // The decoration is emitted AFTER the text run.
+        let text_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Text { .. }))
+            .unwrap();
+        let deco_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { .. }))
+            .unwrap();
+        assert!(text_idx < deco_idx, "the decoration paints over the glyphs");
+    }
+
+    #[test]
+    fn line_through_sits_at_the_vertical_middle() {
+        // `text-decoration: line-through` puts the line through the vertical middle of the
+        // cell, not the bottom. A 32px run -> thickness 2 (32/16), y = origin + (32-2)/2 = 15.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let t = e.create_text("ab");
+        e.append(col, t);
+        e.set_inline_style(t, WIDTH, "60");
+        e.set_inline_style(t, HEIGHT, "32");
+        e.set_inline_style(t, TEXT_DECORATION, "line-through");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 100.0, h: 60.0 });
+        let t_rect = lay.rects.iter().find(|(id, _)| *id == t).unwrap().1;
+        let deco_rect = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("a line-through Rect");
+        assert_eq!(deco_rect.size.h, 2.0, "thickness max(1, 32/16) = 2");
+        assert_eq!(
+            deco_rect.origin.y,
+            t_rect.origin.y + (32.0 - 2.0) / 2.0,
+            "line-through sits at the vertical middle"
+        );
+    }
+
+    #[test]
+    fn text_decoration_none_emits_no_line() {
+        // `text-decoration: none` (and an unset value) draws no decoration Rect.
+        let mut e = Emitter::new();
+        let col = e.create_element(ElementTag::new(1));
+        e.append(ROOT, col);
+        let t = e.create_text("ab");
+        e.append(col, t);
+        e.set_inline_style(t, HEIGHT, "16");
+        e.set_inline_style(t, TEXT_DECORATION, "none");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 50.0 });
+        let rects = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count();
+        assert_eq!(rects, 0, "text-decoration: none draws no line");
+    }
+
+    #[test]
+    fn outline_emits_an_inflated_border_last() {
+        // `outline-width: 2`, `outline-color`, `outline-offset: 3` on a node emits a Border
+        // whose rect is the border-box inflated by the offset on all sides, with the node's
+        // radius — and it is the LAST item this node draws (on top of its own border fill).
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, RADIUS, "5");
+        e.set_inline_style(card, BG, "#202020");
+        e.set_inline_style(card, OUTLINE_WIDTH, "2");
+        e.set_inline_style(card, OUTLINE_COLOR, "#89b4fa");
+        e.set_inline_style(card, OUTLINE_OFFSET, "3");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let card_rect = lay.rects.iter().find(|(id, _)| *id == card).unwrap().1;
+
+        let (rect, color, width, radius) = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Border {
+                    rect,
+                    color,
+                    width,
+                    radius,
+                } => Some((*rect, *color, *width, *radius)),
+                _ => None,
+            })
+            .expect("an outline Border item");
+        assert_eq!(width, 2.0, "outline width rides onto the Border");
+        assert_eq!(radius, 5.0, "outline uses the node's corner radius");
+        assert_eq!(
+            color,
+            Color {
+                r: 0x89,
+                g: 0xb4,
+                b: 0xfa,
+                a: 255
+            }
+        );
+        // Inflated by the 3px offset on all four sides.
+        assert_eq!(
+            rect.origin,
+            Point {
+                x: card_rect.origin.x - 3.0,
+                y: card_rect.origin.y - 3.0,
+            },
+            "the outline rect is inflated outward by the offset"
+        );
+        assert_eq!(
+            rect.size,
+            Size {
+                w: card_rect.size.w + 6.0,
+                h: card_rect.size.h + 6.0,
+            },
+            "inflated by the offset on both sides of each axis"
+        );
+
+        // The outline is the last item the node emits (after its background fill).
+        let bg_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { .. }))
+            .unwrap();
+        let outline_idx = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Border { .. }))
+            .unwrap();
+        assert!(bg_idx < outline_idx, "the outline paints on top of the box");
+    }
+
+    #[test]
+    fn zero_outline_width_emits_no_border() {
+        // An `outline-width: 0` (or unset) emits no Border, even with a color set.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, OUTLINE_WIDTH, "0");
+        e.set_inline_style(card, OUTLINE_COLOR, "#ffffff");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let borders = scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Border { .. }))
+            .count();
+        assert_eq!(borders, 0, "zero outline width draws no frame");
+    }
+
+    #[test]
+    fn full_node_paint_order_is_shadow_bg_gradient_border_outline() {
+        // A single node carrying ALL of the new paint properties emits them in the canonical
+        // back-to-front order: shadow, background fill, gradient, border, outline.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, BG, "#101010");
+        e.set_inline_style(card, BOX_SHADOW, "2 2 4 #00000080");
+        e.set_inline_style(
+            card,
+            BACKGROUND_IMAGE,
+            "linear-gradient(0, #ff0000, #0000ff)",
+        );
+        e.set_inline_style(card, BORDER_WIDTH, "2");
+        e.set_inline_style(card, BORDER_COLOR, "#ffffff");
+        e.set_inline_style(card, OUTLINE_WIDTH, "1");
+        e.set_inline_style(card, OUTLINE_COLOR, "#00ff00");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+
+        let shadow = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Shadow { .. }))
+            .unwrap();
+        let bg = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Rect { .. }))
+            .unwrap();
+        let gradient = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Gradient { .. }))
+            .unwrap();
+        // The border frame and the outline are both `Border` items; the border is pushed
+        // before the outline, so the first Border is the frame and the last is the outline.
+        let first_border = scene
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Border { .. }))
+            .unwrap();
+        let last_border = scene
+            .items
+            .iter()
+            .rposition(|i| matches!(i, DisplayItem::Border { .. }))
+            .unwrap();
+        assert!(
+            shadow < bg && bg < gradient && gradient < first_border && first_border < last_border,
+            "paint order: shadow < bg < gradient < border < outline (got {shadow}, {bg}, {gradient}, {first_border}, {last_border})"
+        );
+    }
+
+    #[test]
+    fn gradient_and_shadow_fade_with_opacity() {
+        // The gradient stops and the shadow color are faded by the node's resolved opacity,
+        // exactly like the background fill and border.
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, OPACITY, "0.5");
+        e.set_inline_style(card, BOX_SHADOW, "2 2 4 #000000"); // opaque, then faded to ~128
+        e.set_inline_style(card, BACKGROUND_IMAGE, "linear-gradient(180, #ffffff)");
+
+        let dom = dom_from(e);
+        let (scene, _) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let shadow_a = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Shadow { color, .. } => Some(color.a),
+                _ => None,
+            })
+            .expect("a Shadow item");
+        assert_eq!(shadow_a, 128, "the shadow alpha is scaled by opacity 0.5");
+        let stop_a = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Gradient { stops, .. } => Some(stops.as_slice()[0].color.a),
+                _ => None,
+            })
+            .expect("a Gradient item");
+        assert_eq!(
+            stop_a, 128,
+            "the gradient stop alpha is scaled by opacity 0.5"
+        );
+    }
+
+    #[test]
+    fn negative_outline_offset_pulls_the_outline_inward() {
+        // A negative `outline-offset` deflates the rect (the outline is drawn inside the box).
+        let mut e = Emitter::new();
+        let card = e.create_element(ElementTag::new(1));
+        e.append(ROOT, card);
+        e.set_inline_style(card, WIDTH, "40");
+        e.set_inline_style(card, HEIGHT, "40");
+        e.set_inline_style(card, OUTLINE_WIDTH, "2");
+        e.set_inline_style(card, OUTLINE_COLOR, "#ffffff");
+        e.set_inline_style(card, OUTLINE_OFFSET, "-4");
+
+        let dom = dom_from(e);
+        let (scene, lay) = layout(&dom, Size { w: 100.0, h: 100.0 });
+        let card_rect = lay.rects.iter().find(|(id, _)| *id == card).unwrap().1;
+        let rect = scene
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Border { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("an outline Border");
+        assert_eq!(
+            rect.origin,
+            Point {
+                x: card_rect.origin.x + 4.0,
+                y: card_rect.origin.y + 4.0,
+            },
+            "a negative offset pulls the outline inward"
+        );
+        assert_eq!(
+            rect.size,
+            Size { w: 32.0, h: 32.0 },
+            "deflated by 4 on each side"
         );
     }
 }
