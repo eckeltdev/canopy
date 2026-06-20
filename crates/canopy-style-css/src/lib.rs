@@ -116,9 +116,18 @@
 //!   single compound per argument), and the **interaction-state** pseudo-classes (`:hover`,
 //!   `:focus`, `:active`, plus attribute-driven `:disabled`/`:checked`), but not the sibling
 //!   combinators (`+`, `~`), the `~=`/`|=` attribute operators, or other pseudo-classes
-//!   (`:focus-within`, `:nth-of-type`, …); no media queries.
+//!   (`:focus-within`, `:nth-of-type`, …).
 //!   Box shorthands *are* expanded, but `!important` is only stripped (its precedence is not yet
 //!   honored).
+//! - **Responsive `@media` queries** are supported for the common width/height subset: a top-level
+//!   `@media <condition> { <rule>* }` block tags its inner rules with the condition, and
+//!   [`Stylesheet::resolve_for`] / [`Stylesheet::resolve_custom_for`] skip a tagged rule unless the
+//!   condition holds for the [`MediaContext`] (the live viewport in px) they are given. The
+//!   condition grammar is an OR-list (comma-separated) of AND-lists (joined by `and`) of the
+//!   `(min-width|max-width|min-height|max-height: <px>)` features; any other feature, unit, or
+//!   at-rule (`@font-face`, …) is skipped — a `@media` whose condition cannot be parsed has its
+//!   whole block dropped. There is still no support for `@import`, `@keyframes`, media *types*
+//!   (`screen`/`print`), `not`/`only`, or range syntax (`width >= 600px`).
 //! - The cascade matches each node against its own identity; there is no inheritance
 //!   here (the host folds matched rules in as inline styles, and author inline styles
 //!   win, mirroring CSS specificity where inline beats a selector).
@@ -205,6 +214,96 @@ enum StatePseudo {
     Focus,
     /// `:active` — the element is being activated (pressed).
     Active,
+}
+
+/// The **live viewport** a stylesheet is resolved against, in CSS pixels, so the `@media`
+/// width/height conditions on a [`Rule`] can be evaluated. `vw`/`vh` here are the **full** viewport
+/// dimensions — distinct from the `vw`/`vh` *unit* basis (1% of the viewport) used by
+/// [`resolve_value`]'s [`ResolveCtx`]; a `@media (min-width: 600px)` compares against the whole
+/// `vw`, not a hundredth of it.
+///
+/// A rule with no `@media` condition always applies regardless of this context; a conditional rule
+/// applies only when its condition holds for these dimensions (see [`MediaQuery::matches`]). The
+/// legacy [`Stylesheet::resolve`] wrapper passes [`MediaContext::ALL`], a maximally-large viewport
+/// that satisfies every `min-*` and (because it is also used as the "match all" sentinel) every
+/// `max-*` feature, so unconditional behavior is unchanged for callers that don't care about media.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MediaContext {
+    /// The viewport width in CSS px (the full dimension, not 1%).
+    pub vw: f32,
+    /// The viewport height in CSS px (the full dimension, not 1%).
+    pub vh: f32,
+}
+
+impl MediaContext {
+    /// A maximally-permissive context: a viewport so large that **every** supported `@media`
+    /// condition (`min-width`/`min-height` and, because nothing is wider, also any sane `max-*`
+    /// when treated as "all pass") is satisfied. Used by the legacy [`Stylesheet::resolve`] wrapper
+    /// and any caller that wants `@media`-tagged rules to behave as if always active.
+    ///
+    /// Note this is the back-compat sentinel, not a "no media" mode: a `max-width` rule would *not*
+    /// match against such a huge viewport. Its purpose is to keep the *unconditional* rules — the
+    /// only kind the legacy class-only path ever authored — resolving exactly as before.
+    pub const ALL: MediaContext = MediaContext {
+        vw: f32::MAX,
+        vh: f32::MAX,
+    };
+}
+
+/// Which viewport dimension an `@media` feature constrains, and on which side.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MediaFeature {
+    /// `(min-width: <px>)` — matches when `vw >= px`.
+    MinWidth,
+    /// `(max-width: <px>)` — matches when `vw <= px`.
+    MaxWidth,
+    /// `(min-height: <px>)` — matches when `vh >= px`.
+    MinHeight,
+    /// `(max-height: <px>)` — matches when `vh <= px`.
+    MaxHeight,
+}
+
+impl MediaFeature {
+    /// Whether this feature's `px` threshold is satisfied by `media`.
+    fn holds(self, px: f32, media: MediaContext) -> bool {
+        match self {
+            MediaFeature::MinWidth => media.vw >= px,
+            MediaFeature::MaxWidth => media.vw <= px,
+            MediaFeature::MinHeight => media.vh >= px,
+            MediaFeature::MaxHeight => media.vh <= px,
+        }
+    }
+}
+
+/// One `@media` feature test: a [`MediaFeature`] and its `px` threshold (the `px` suffix is
+/// stripped at parse time). A `(min-width: 600px)` is `(MinWidth, 600.0)`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct MediaCond {
+    feature: MediaFeature,
+    px: f32,
+}
+
+/// A parsed `@media` query: an **OR-list of AND-lists** of [`MediaCond`] feature tests, mirroring
+/// CSS's comma-(OR)-and-`and`-(AND) structure. The whole query matches when **any** of its
+/// AND-lists matches, and an AND-list matches when **all** of its conditions hold.
+///
+/// A query is only attached to a [`Rule`] when every one of its conditions parsed; an `@media`
+/// whose condition could not be fully parsed has its entire block dropped (its rules never reach
+/// the stylesheet), so a `MediaQuery` here always evaluates real, supported features.
+#[derive(Clone, PartialEq, Debug)]
+struct MediaQuery {
+    /// The OR-list: each entry is one AND-list of conditions. The query matches if ANY entry's
+    /// conditions ALL hold.
+    or_terms: Vec<Vec<MediaCond>>,
+}
+
+impl MediaQuery {
+    /// Whether this query holds for `media`: any AND-list whose every [`MediaCond`] holds.
+    fn matches(&self, media: MediaContext) -> bool {
+        self.or_terms
+            .iter()
+            .any(|and_list| and_list.iter().all(|c| c.feature.holds(c.px, media)))
+    }
 }
 
 /// One part of a **compound** selector. A compound is an AND of these against a single
@@ -381,6 +480,10 @@ struct Rule {
     /// **Custom-property** declarations (`--name: value`) on this rule, raw + un-normalized, in
     /// source order. Gathered in cascade order by [`Stylesheet::resolve_custom_for`].
     custom_decls: Vec<CustomDecl>,
+    /// The `@media` condition gating this rule, or `None` for a rule outside any `@media` block
+    /// (always active). When `Some`, the rule is skipped unless the query matches the resolve-time
+    /// [`MediaContext`]; rules sharing one `@media` block all carry the same query (cloned).
+    media: Option<MediaQuery>,
 }
 
 /// One element's identity for selector matching: its type/tag name, id, classes, and
@@ -559,14 +662,26 @@ impl Stylesheet {
     /// higher-specificity rule (or, at equal specificity, a later one) wins each property.
     /// Properties no matching rule touches are absent. The returned pairs are in first-appearance
     /// order (the order [`apply_state`] replays inline-style ops).
-    pub fn resolve_for(&self, target: &MatchTarget, states: ElementStates) -> Vec<Decl> {
+    ///
+    /// `media` is the live viewport: a rule carrying an `@media` condition is **skipped** unless its
+    /// query matches `media`; an unconditional rule always applies. Pass [`MediaContext::ALL`] (as
+    /// the legacy [`resolve`](Self::resolve) wrapper does) to treat every `@media`-tagged rule as
+    /// active.
+    pub fn resolve_for(
+        &self,
+        target: &MatchTarget,
+        states: ElementStates,
+        media: MediaContext,
+    ) -> Vec<Decl> {
         // Collect matching rules with their (specificity, source index) so we can order the
         // cascade correctly regardless of the order classes appear on the element. The
         // specificity is the `(a, b, c)` tuple, so the sort below is a true lexicographic
         // CSS comparison (id > class/pseudo > type) with the source index as the tie-break.
         let mut matched: Vec<(Spec, usize)> = Vec::new();
         for (idx, rule) in self.rules.iter().enumerate() {
-            if complex_matches(&rule.selector.parts, target, states) {
+            if rule_active_for_media(rule, media)
+                && complex_matches(&rule.selector.parts, target, states)
+            {
                 matched.push((rule.selector.specificity, idx));
             }
         }
@@ -590,15 +705,21 @@ impl Stylesheet {
     /// The returned values are the **raw**, un-normalized tokens (a custom property may itself hold
     /// `var()` / a relative unit / `calc()`); [`resolve_value`] substitutes and resolves them when a
     /// normal declaration references one through `var(--name)`.
+    ///
+    /// `media` gates `@media`-conditional rules exactly as in [`resolve_for`](Self::resolve_for): a
+    /// rule whose `@media` query does not match the viewport contributes no custom properties.
     pub fn resolve_custom_for(
         &self,
         target: &MatchTarget,
         states: ElementStates,
+        media: MediaContext,
     ) -> Vec<CustomDecl> {
         let mut matched: Vec<(Spec, usize)> = Vec::new();
         for (idx, rule) in self.rules.iter().enumerate() {
-            // Only rules that actually carry custom props are worth ordering.
+            // Only rules that actually carry custom props (and pass the media gate) are worth
+            // ordering.
             if !rule.custom_decls.is_empty()
+                && rule_active_for_media(rule, media)
                 && complex_matches(&rule.selector.parts, target, states)
             {
                 matched.push((rule.selector.specificity, idx));
@@ -617,6 +738,12 @@ impl Stylesheet {
     /// The legacy class-only resolve: a [`resolve_for`](Self::resolve_for) with no type/id and a
     /// single `hover` flag, so it matches exactly the pure-class rules it always did. Kept for
     /// `canopy-ui` / `LiteEngine`; maps `hovered` onto `ElementStates { hover: hovered, .. }`.
+    ///
+    /// It passes [`MediaContext::ALL`] — the maximally-large viewport sentinel — so any
+    /// **unconditional** rule (the only kind this class-only path ever authored) resolves exactly as
+    /// before media support landed. A `@media (min-*)` rule would also match at this huge viewport;
+    /// a `@media (max-*)` rule would not. Callers that need true viewport-aware media must use
+    /// [`resolve_for`](Self::resolve_for) with a real [`MediaContext`].
     pub fn resolve(&self, classes: &[&str], hovered: bool) -> Vec<Decl> {
         self.resolve_for(
             &MatchTarget::new(None, None, classes),
@@ -624,6 +751,7 @@ impl Stylesheet {
                 hover: hovered,
                 ..ElementStates::default()
             },
+            MediaContext::ALL,
         )
     }
 
@@ -689,6 +817,15 @@ impl Stylesheet {
     }
 }
 
+/// Whether `rule` is active for the current viewport: a rule with no `@media` condition always is;
+/// a conditional rule only when its [`MediaQuery`] matches `media`.
+fn rule_active_for_media(rule: &Rule, media: MediaContext) -> bool {
+    match &rule.media {
+        None => true,
+        Some(query) => query.matches(media),
+    }
+}
+
 /// Fold one declaration into the resolved set with last-wins semantics: overwrite the
 /// value if `prop` is already present (preserving its original position), otherwise
 /// append it.
@@ -722,6 +859,12 @@ fn cascade_custom(resolved: &mut Vec<CustomDecl>, name: &str, value: &str) {
 /// Whitespace and newlines are flexible; `/* … */` comments are stripped. Each rule
 /// is `.name { prop: value; … }`. Property names are mapped to [`PropId`]s and
 /// values normalized; unknown properties and malformed fragments are skipped.
+///
+/// A top-level `@media <condition> { <rule>* }` block tags each inner `selector { decls }` rule
+/// with the block's [`MediaQuery`]; those rules then only apply when the resolve-time
+/// [`MediaContext`] satisfies the condition. A `@media` whose condition cannot be parsed has its
+/// whole block dropped, and any **other** at-rule (`@font-face`, `@import`, …) is skipped over (its
+/// `{ … }` block, if any, is consumed so the following rules are not corrupted).
 pub fn parse(css: &str) -> Stylesheet {
     let css = strip_comments(css);
     let mut rules = Vec::new();
@@ -729,11 +872,18 @@ pub fn parse(css: &str) -> Stylesheet {
     let mut i = 0;
 
     while i < bytes.len() {
-        // Read the selector-list (everything up to `{`); a stray `}`/`;` is skipped.
+        // Skip a stray `}`/`;`/whitespace between rules.
         if bytes[i] == b'}' || bytes[i] == b';' || bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
+        // An at-rule (`@media`, `@font-face`, …): handle separately so a `@media` block's nested
+        // braces don't confuse the flat rule scanner, and an unknown at-rule is skipped cleanly.
+        if bytes[i] == b'@' {
+            i = parse_at_rule(&css, i, &mut rules);
+            continue;
+        }
+        // Read the selector-list (everything up to `{`).
         let sel_start = i;
         while i < bytes.len() && bytes[i] != b'{' {
             i += 1;
@@ -754,25 +904,238 @@ pub fn parse(css: &str) -> Stylesheet {
             i += 1; // consume `}`
         }
 
-        let (decls, custom_decls) = parse_block(body);
-        if decls.is_empty() && custom_decls.is_empty() {
-            continue; // a rule with no known (normal or custom) declarations contributes nothing
-        }
-        // Selector grouping: `.a, button#b { … }` expands to one Rule per selector, sharing decls.
-        // Split on TOP-LEVEL commas only, so a functional pseudo's own comma-separated argument
-        // list (`:is(.a, .b)`) is not mistaken for a grouping separator.
-        for sel in split_top_level_commas(selector_list) {
-            if let Some(selector) = parse_selector(sel.trim()) {
-                rules.push(Rule {
-                    selector,
-                    decls: decls.clone(),
-                    custom_decls: custom_decls.clone(),
-                });
-            }
-        }
+        push_rules(selector_list, body, None, &mut rules);
     }
 
     Stylesheet { rules }
+}
+
+/// Parse the contents of an at-rule beginning at `start` (which indexes the `@`), pushing any rules
+/// it yields onto `rules`, and return the index **just past** the at-rule. Only `@media` carries
+/// rules; every other at-rule is skipped (its block, or its `;`-terminated prelude, is consumed but
+/// contributes nothing). This keeps a `@font-face { … }` from corrupting the rules that follow it.
+fn parse_at_rule(css: &str, start: usize, rules: &mut Vec<Rule>) -> usize {
+    let bytes = css.as_bytes();
+    // Read the at-rule name (`@media`, `@font-face`, …) and the prelude up to `{` or `;`.
+    let mut i = start + 1; // past `@`
+    let name_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-') {
+        i += 1;
+    }
+    let name = css[name_start..i].to_ascii_lowercase();
+    // The prelude is everything from here up to the block's `{` (or a `;` for a statement at-rule
+    // like `@import url(...);`).
+    let prelude_start = i;
+    while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b';' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return i; // a truncated at-rule with no block/terminator — drop the rest
+    }
+    if bytes[i] == b';' {
+        return i + 1; // a statement at-rule (`@import …;`): consume the `;`, contribute nothing
+    }
+    // A block at-rule: capture the brace-balanced body so nested rule `{ … }`s are read whole.
+    let prelude = css[prelude_start..i].trim();
+    let (inner, after) = match read_balanced_braces(css, i) {
+        Some(pair) => pair,
+        None => return bytes.len(), // unbalanced — consume the rest, contribute nothing
+    };
+    if name == "media" {
+        // Only attach the inner rules if the whole condition parsed; an unsupported condition drops
+        // the entire block (its rules never apply), per the documented contract.
+        if let Some(query) = parse_media_query(prelude) {
+            parse_media_body(inner, &query, rules);
+        }
+    }
+    // Any other at-rule (`@font-face`, `@keyframes`, …): block consumed, nothing contributed.
+    after
+}
+
+/// Parse the inner body of a `@media` block — a sequence of `selector { decls }` rules — tagging
+/// each with `query`. Reuses the flat rule scanner (the body holds no nested at-rules in this
+/// subset; a stray inner at-rule's braces would simply be read as a rule body and yield nothing).
+fn parse_media_body(body: &str, query: &MediaQuery, rules: &mut Vec<Rule>) {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'}' || bytes[i] == b';' || bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let sel_start = i;
+        while i < bytes.len() && bytes[i] != b'{' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let selector_list = body[sel_start..i].trim();
+        i += 1; // consume `{`
+        let body_start = i;
+        while i < bytes.len() && bytes[i] != b'}' {
+            i += 1;
+        }
+        let inner_body = &body[body_start..i];
+        if i < bytes.len() {
+            i += 1; // consume `}`
+        }
+        push_rules(selector_list, inner_body, Some(query.clone()), rules);
+    }
+}
+
+/// Parse one `selector { body }` into rules tagged with `media` (`None` for an unconditional
+/// top-level rule), expanding the selector grouping (`.a, .b { … }` → one [`Rule`] per selector,
+/// sharing the decls + media). A block with no known declarations contributes nothing.
+fn push_rules(selector_list: &str, body: &str, media: Option<MediaQuery>, rules: &mut Vec<Rule>) {
+    let (decls, custom_decls) = parse_block(body);
+    if decls.is_empty() && custom_decls.is_empty() {
+        return; // a rule with no known (normal or custom) declarations contributes nothing
+    }
+    // Selector grouping: `.a, button#b { … }` expands to one Rule per selector, sharing decls.
+    // Split on TOP-LEVEL commas only, so a functional pseudo's own comma-separated argument
+    // list (`:is(.a, .b)`) is not mistaken for a grouping separator.
+    for sel in split_top_level_commas(selector_list) {
+        if let Some(selector) = parse_selector(sel.trim()) {
+            rules.push(Rule {
+                selector,
+                decls: decls.clone(),
+                custom_decls: custom_decls.clone(),
+                media: media.clone(),
+            });
+        }
+    }
+}
+
+/// Read a brace-balanced `{ … }` group starting at `open` (which must index a `{`), returning the
+/// **inner** text (between the braces) and the index **just past** the closing `}`. Tracks nesting
+/// so a `@media` body containing several rule `{ … }` blocks is read whole. Returns `None` if the
+/// braces never balance.
+fn read_balanced_braces(s: &str, open: usize) -> Option<(&str, usize)> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes[open], b'{');
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[open + 1..i], i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None // never closed
+}
+
+/// Parse a `@media` query's condition text (the part between `@media` and the `{`) into a
+/// [`MediaQuery`], or `None` if any part is unsupported (which drops the whole `@media` block).
+///
+/// Grammar (the common responsive subset): a comma-separated **OR-list**, each entry an
+/// **AND-list** joined by `and`, each conjunct a `(min-width|max-width|min-height|max-height: <px>)`
+/// feature. A leading media *type* is not accepted, nor `not`/`only`, nor range syntax. An empty
+/// query (no conditions at all) is rejected — a bare `@media { … }` has nothing to gate on.
+fn parse_media_query(cond: &str) -> Option<MediaQuery> {
+    let cond = cond.trim();
+    if cond.is_empty() {
+        return None;
+    }
+    let mut or_terms: Vec<Vec<MediaCond>> = Vec::new();
+    for term in cond.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            return None; // a dangling comma (`(min-width: 1px),`) is malformed → drop the block
+        }
+        let mut and_list: Vec<MediaCond> = Vec::new();
+        // Conjuncts are separated by the keyword `and` (whitespace-delimited, case-insensitive).
+        for conj in split_media_and(term) {
+            and_list.push(parse_media_cond(conj.trim())?);
+        }
+        if and_list.is_empty() {
+            return None;
+        }
+        or_terms.push(and_list);
+    }
+    if or_terms.is_empty() {
+        return None;
+    }
+    Some(MediaQuery { or_terms })
+}
+
+/// Split a media AND-list on the keyword `and` (ASCII case-insensitive, surrounded by whitespace),
+/// without splitting on an `and` that appears inside a `( … )` feature. Returns the conjunct texts.
+fn split_media_and(term: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let bytes = term.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        // A top-level `and` token, delimited by whitespace (or string ends) on both sides.
+        if depth == 0
+            && (bytes[i] == b'a' || bytes[i] == b'A')
+            && term[i..].len() >= 3
+            && term[i..i + 3].eq_ignore_ascii_case("and")
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 3 == bytes.len() || bytes[i + 3].is_ascii_whitespace())
+        {
+            parts.push(&term[start..i]);
+            i += 3;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&term[start..]);
+    parts
+}
+
+/// Parse one parenthesized media feature `(min-width: 600px)` into a [`MediaCond`]. Returns `None`
+/// for an unsupported feature name, a missing/extra paren, a missing value, or a non-px unit — any
+/// of which drops the enclosing `@media` block.
+fn parse_media_cond(conj: &str) -> Option<MediaCond> {
+    let inner = conj.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let (name, value) = inner.split_once(':')?;
+    let feature = match name.trim().to_ascii_lowercase().as_str() {
+        "min-width" => MediaFeature::MinWidth,
+        "max-width" => MediaFeature::MaxWidth,
+        "min-height" => MediaFeature::MinHeight,
+        "max-height" => MediaFeature::MaxHeight,
+        _ => return None, // an unsupported feature (`orientation`, `min-aspect-ratio`, …)
+    };
+    let px = parse_media_px(value.trim())?;
+    Some(MediaCond { feature, px })
+}
+
+/// Parse a media-feature length: a bare number or a `px`-suffixed number (other units are
+/// unsupported and return `None`, dropping the block). A bare number is read as px (lenient).
+fn parse_media_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let body = match value.strip_suffix("px") {
+        Some(rest) => rest.trim(),
+        None => {
+            // Reject any other alphabetic unit (`em`, `rem`, `vw`, `%`); a bare number is ok.
+            if value.bytes().any(|b| b.is_ascii_alphabetic() || b == b'%') {
+                return None;
+            }
+            value
+        }
+    };
+    let px: f32 = body.parse().ok()?;
+    if px.is_finite() {
+        Some(px)
+    } else {
+        None
+    }
 }
 
 /// Parse one selector — a **complex** selector (`.card > button.primary#go`, descendant/child
@@ -3320,7 +3683,7 @@ mod tests {
         let sheet =
             parse("button { background:#111111 } #go { color:#222222 } .btn { padding:4px }");
         let hit = MatchTarget::new(Some("button"), Some("go"), &["btn"]);
-        let r = sheet.resolve_for(&hit, ElementStates::default());
+        let r = sheet.resolve_for(&hit, ElementStates::default(), MediaContext::ALL);
         assert!(
             r.contains(&(BG, "#111111".to_string())),
             "type selector matched"
@@ -3336,7 +3699,7 @@ mod tests {
         let miss = MatchTarget::new(Some("div"), None, &[]);
         assert!(
             sheet
-                .resolve_for(&miss, ElementStates::default())
+                .resolve_for(&miss, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             "no selector matches a bare div"
         );
@@ -3347,20 +3710,20 @@ mod tests {
         let sheet = parse("button.primary { background:#abcdef }");
         let both = MatchTarget::new(Some("button"), None, &["primary"]);
         assert_eq!(
-            sheet.resolve_for(&both, ElementStates::default()),
+            sheet.resolve_for(&both, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#abcdef".to_string())]
         );
         let only_type = MatchTarget::new(Some("button"), None, &[]);
         assert!(
             sheet
-                .resolve_for(&only_type, ElementStates::default())
+                .resolve_for(&only_type, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             "missing the .primary class"
         );
         let only_class = MatchTarget::new(Some("div"), None, &["primary"]);
         assert!(
             sheet
-                .resolve_for(&only_class, ElementStates::default())
+                .resolve_for(&only_class, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             "wrong type"
         );
@@ -3375,7 +3738,7 @@ mod tests {
         );
         let hit = MatchTarget::new(Some("button"), Some("x"), &["c"]);
         assert_eq!(
-            sheet.resolve_for(&hit, ElementStates::default()),
+            sheet.resolve_for(&hit, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#111111".to_string())]
         );
     }
@@ -3390,7 +3753,7 @@ mod tests {
         ];
         for target in &targets {
             assert_eq!(
-                sheet.resolve_for(target, ElementStates::default()),
+                sheet.resolve_for(target, ElementStates::default(), MediaContext::ALL),
                 vec![(FG, "#445566".to_string())]
             );
         }
@@ -3409,26 +3772,26 @@ mod tests {
         let parent_card = [card];
         let inside = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent_card);
         assert_eq!(
-            sheet.resolve_for(&inside, ElementStates::default()),
+            sheet.resolve_for(&inside, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#abcdef".to_string())]
         );
         // A `.title` nested deeper (grandparent is the `.card`) still matches (any depth).
         let deep_chain = [wrapper, card];
         let deep = MatchTarget::new(None, None, &["title"]).with_ancestors(&deep_chain);
         assert_eq!(
-            sheet.resolve_for(&deep, ElementStates::default()),
+            sheet.resolve_for(&deep, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#abcdef".to_string())]
         );
         // A `.title` with no `.card` ancestor does NOT match.
         let no_card = [wrapper];
         let outside = MatchTarget::new(None, None, &["title"]).with_ancestors(&no_card);
         assert!(sheet
-            .resolve_for(&outside, ElementStates::default())
+            .resolve_for(&outside, ElementStates::default(), MediaContext::ALL)
             .is_empty());
         // A `.title` with NO ancestors does not match either.
         let bare = MatchTarget::new(None, None, &["title"]);
         assert!(sheet
-            .resolve_for(&bare, ElementStates::default())
+            .resolve_for(&bare, ElementStates::default(), MediaContext::ALL)
             .is_empty());
     }
 
@@ -3442,7 +3805,7 @@ mod tests {
         let parent_nav = [nav];
         let direct = MatchTarget::new(None, None, &["item"]).with_ancestors(&parent_nav);
         assert_eq!(
-            sheet.resolve_for(&direct, ElementStates::default()),
+            sheet.resolve_for(&direct, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#222222".to_string())]
         );
         // A `.item` whose immediate parent is a `.list` (nav is the grandparent): NO match.
@@ -3450,7 +3813,7 @@ mod tests {
         let grandchild = MatchTarget::new(None, None, &["item"]).with_ancestors(&list_then_nav);
         assert!(
             sheet
-                .resolve_for(&grandchild, ElementStates::default())
+                .resolve_for(&grandchild, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             "child combinator requires the immediate parent"
         );
@@ -3469,14 +3832,14 @@ mod tests {
         let chain = [inner, card, root];
         let hit = MatchTarget::new(None, None, &["title"]).with_ancestors(&chain);
         assert_eq!(
-            sheet.resolve_for(&hit, ElementStates::default()),
+            sheet.resolve_for(&hit, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#0a0b0c".to_string())]
         );
         // If `.card` is NOT a direct child of root (a wrapper sits between), the `>` edge fails.
         let chain_with_wrap = [inner, card, wrap, root];
         let miss = MatchTarget::new(None, None, &["title"]).with_ancestors(&chain_with_wrap);
         assert!(sheet
-            .resolve_for(&miss, ElementStates::default())
+            .resolve_for(&miss, ElementStates::default(), MediaContext::ALL)
             .is_empty());
     }
 
@@ -3489,7 +3852,7 @@ mod tests {
         let parent_card = [card];
         let target = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent_card);
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#222222".to_string())],
             "the 2-compound rule outranks the 1-compound rule by specificity"
         );
@@ -3499,7 +3862,7 @@ mod tests {
         let parent_nav = [nav];
         let item = MatchTarget::new(None, None, &["item", "lead"]).with_ancestors(&parent_nav);
         assert_eq!(
-            sheet2.resolve_for(&item, ElementStates::default()),
+            sheet2.resolve_for(&item, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#333333".to_string())]
         );
     }
@@ -3510,18 +3873,18 @@ mod tests {
         let role_attr = [("data-role", "nav")];
         let with = MatchTarget::new(Some("div"), None, &[]).with_attrs(&role_attr);
         assert_eq!(
-            sheet.resolve_for(&with, ElementStates::default()),
+            sheet.resolve_for(&with, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#010203".to_string())]
         );
         let other_attr = [("other", "x")];
         let without = MatchTarget::new(Some("div"), None, &[]).with_attrs(&other_attr);
         assert!(sheet
-            .resolve_for(&without, ElementStates::default())
+            .resolve_for(&without, ElementStates::default(), MediaContext::ALL)
             .is_empty());
         // No attribute context at all: the attribute selector cannot match.
         let none = MatchTarget::new(Some("div"), None, &[]);
         assert!(sheet
-            .resolve_for(&none, ElementStates::default())
+            .resolve_for(&none, ElementStates::default(), MediaContext::ALL)
             .is_empty());
     }
 
@@ -3531,14 +3894,14 @@ mod tests {
         let nav_attr = [("data-role", "nav")];
         let hit = MatchTarget::new(None, None, &[]).with_attrs(&nav_attr);
         assert_eq!(
-            sheet.resolve_for(&hit, ElementStates::default()),
+            sheet.resolve_for(&hit, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#445566".to_string())]
         );
         // A different value does not match exact.
         let main_attr = [("data-role", "main")];
         let miss = MatchTarget::new(None, None, &[]).with_attrs(&main_attr);
         assert!(sheet
-            .resolve_for(&miss, ElementStates::default())
+            .resolve_for(&miss, ElementStates::default(), MediaContext::ALL)
             .is_empty());
     }
 
@@ -3552,7 +3915,7 @@ mod tests {
         // prefix: starts with https
         let all_attr = [("href", "https://example.com/docs/x.pdf")];
         let pre = MatchTarget::new(Some("a"), None, &[]).with_attrs(&all_attr);
-        let r = sheet.resolve_for(&pre, ElementStates::default());
+        let r = sheet.resolve_for(&pre, ElementStates::default(), MediaContext::ALL);
         // All three match this url (starts with https, ends with .pdf, contains docs); the last in
         // source order wins on equal specificity (each is type+attr = (0,1,1)).
         assert_eq!(r, vec![(FG, "#333333".to_string())]);
@@ -3561,14 +3924,14 @@ mod tests {
         let pre_attr = [("href", "https://example.com/page")];
         let only_pre = MatchTarget::new(Some("a"), None, &[]).with_attrs(&pre_attr);
         assert_eq!(
-            sheet.resolve_for(&only_pre, ElementStates::default()),
+            sheet.resolve_for(&only_pre, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#111111".to_string())]
         );
         // A url matching only the suffix rule.
         let suf_attr = [("href", "ftp://host/file.pdf")];
         let only_suf = MatchTarget::new(Some("a"), None, &[]).with_attrs(&suf_attr);
         assert_eq!(
-            sheet.resolve_for(&only_suf, ElementStates::default()),
+            sheet.resolve_for(&only_suf, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#222222".to_string())]
         );
     }
@@ -3581,7 +3944,7 @@ mod tests {
         let data_x = [("data-x", "1")];
         let target = MatchTarget::new(Some("div"), None, &[]).with_attrs(&data_x);
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#222222".to_string())]
         );
     }
@@ -3595,7 +3958,8 @@ mod tests {
         assert_eq!(
             sheet.resolve_for(
                 &MatchTarget::new(None, None, &["a"]),
-                ElementStates::default()
+                ElementStates::default(),
+                MediaContext::ALL
             ),
             vec![(FG, "#445566".to_string())]
         );
@@ -3603,7 +3967,8 @@ mod tests {
         assert_eq!(
             sheet.resolve_for(
                 &MatchTarget::new(Some("button"), None, &[]),
-                ElementStates::default()
+                ElementStates::default(),
+                MediaContext::ALL
             ),
             vec![(BG, "#111111".to_string())]
         );
@@ -3611,7 +3976,8 @@ mod tests {
         assert_eq!(
             sheet.resolve_for(
                 &MatchTarget::new(None, Some("x"), &[]),
-                ElementStates::default()
+                ElementStates::default(),
+                MediaContext::ALL
             ),
             vec![(PADDING, "4".to_string())]
         );
@@ -3619,7 +3985,8 @@ mod tests {
         assert!(sheet
             .resolve_for(
                 &MatchTarget::new(Some("div"), None, &["nope"]),
-                ElementStates::default()
+                ElementStates::default(),
+                MediaContext::ALL
             )
             .is_empty());
     }
@@ -3889,7 +4256,7 @@ mod tests {
         );
         // The id rule wins despite appearing later and having far fewer simple selectors.
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#111111".to_string())]
         );
     }
@@ -3900,7 +4267,7 @@ mod tests {
         let sheet = parse("BUTTON { background:#abcdef }");
         let target = MatchTarget::new(Some("button"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#abcdef".to_string())]
         );
     }
@@ -3911,7 +4278,7 @@ mod tests {
         let sheet = parse(".Btn { background:#abcdef }");
         let target = MatchTarget::new(None, None, &["btn"]);
         assert!(sheet
-            .resolve_for(&target, ElementStates::default())
+            .resolve_for(&target, ElementStates::default(), MediaContext::ALL)
             .is_empty());
     }
 
@@ -3934,7 +4301,7 @@ mod tests {
         let target = MatchTarget::new(None, None, &["btn"]);
         // No state -> base only.
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#313244".to_string())]
         );
         // focus set -> the :focus rule overrides the base background.
@@ -3944,7 +4311,8 @@ mod tests {
                 ElementStates {
                     focus: true,
                     ..ElementStates::default()
-                }
+                },
+                MediaContext::ALL
             ),
             vec![(BG, "#89b4fa".to_string())]
         );
@@ -3955,7 +4323,8 @@ mod tests {
                 ElementStates {
                     hover: true,
                     ..ElementStates::default()
-                }
+                },
+                MediaContext::ALL
             ),
             vec![(BG, "#313244".to_string())],
             "hover does not satisfy :focus"
@@ -3967,7 +4336,7 @@ mod tests {
         let sheet = parse("button { background:#111111 } button:active { background:#f38ba8 }");
         let target = MatchTarget::new(Some("button"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#111111".to_string())]
         );
         assert_eq!(
@@ -3976,7 +4345,8 @@ mod tests {
                 ElementStates {
                     active: true,
                     ..ElementStates::default()
-                }
+                },
+                MediaContext::ALL
             ),
             vec![(BG, "#f38ba8".to_string())]
         );
@@ -3995,6 +4365,7 @@ mod tests {
                     focus,
                     active: false,
                 },
+                MediaContext::ALL,
             )
         };
         assert!(only(false, false).is_empty(), "neither -> no match");
@@ -4015,14 +4386,14 @@ mod tests {
         let disabled_attr = [("disabled", "")];
         let disabled = MatchTarget::new(Some("input"), None, &[]).with_attrs(&disabled_attr);
         assert_eq!(
-            sheet.resolve_for(&disabled, ElementStates::default()),
+            sheet.resolve_for(&disabled, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#45475a".to_string())],
             ":disabled matches a node with a `disabled` attribute (no host state)"
         );
         let checked_attr = [("checked", "true")];
         let checked = MatchTarget::new(Some("input"), None, &[]).with_attrs(&checked_attr);
         assert_eq!(
-            sheet.resolve_for(&checked, ElementStates::default()),
+            sheet.resolve_for(&checked, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#a6e3a1".to_string())],
             ":checked matches a node with a `checked` attribute (value ignored)"
         );
@@ -4036,7 +4407,8 @@ mod tests {
                         hover: true,
                         focus: true,
                         active: true,
-                    }
+                    },
+                    MediaContext::ALL
                 )
                 .is_empty(),
             ":disabled/:checked are not dynamic states, so no flag makes them match"
@@ -4054,7 +4426,8 @@ mod tests {
                 ElementStates {
                     focus: true,
                     ..ElementStates::default()
-                }
+                },
+                MediaContext::ALL
             ),
             vec![(FG, "#222222".to_string())],
             "button:focus outranks bare button by the state pseudo's class-level specificity"
@@ -4095,7 +4468,8 @@ mod tests {
                 ElementStates {
                     hover: true,
                     ..ElementStates::default()
-                }
+                },
+                MediaContext::ALL
             ),
             vec![(FG, "#abcdef".to_string())],
             "the `.card:hover .title` rule was dropped; the plain `.title` rule still applies"
@@ -4612,6 +4986,7 @@ mod tests {
             sheet.resolve_for(
                 &MatchTarget::new(Some("li"), None, &[]).with_structure(index, count, 0),
                 ElementStates::default(),
+                MediaContext::ALL,
             )
         };
         // First of three -> :first-child.
@@ -4636,6 +5011,7 @@ mod tests {
                 .resolve_for(
                     &MatchTarget::new(Some("li"), None, &[]).with_structure(index, count, 0),
                     ElementStates::default(),
+                    MediaContext::ALL,
                 )
                 .is_empty()
         };
@@ -4663,6 +5039,7 @@ mod tests {
                         .resolve_for(
                             &MatchTarget::new(Some("li"), None, &[]).with_structure(i, count, 0),
                             ElementStates::default(),
+                            MediaContext::ALL,
                         )
                         .is_empty()
                 })
@@ -4686,13 +5063,13 @@ mod tests {
         // A div with no children matches :empty.
         let empty = MatchTarget::new(Some("div"), None, &[]).with_structure(0, 1, 0);
         assert_eq!(
-            sheet.resolve_for(&empty, ElementStates::default()),
+            sheet.resolve_for(&empty, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#445566".to_string())]
         );
         // A div WITH children does not.
         let parent = MatchTarget::new(Some("div"), None, &[]).with_structure(0, 1, 2);
         assert!(sheet
-            .resolve_for(&parent, ElementStates::default())
+            .resolve_for(&parent, ElementStates::default(), MediaContext::ALL)
             .is_empty());
     }
 
@@ -4704,7 +5081,7 @@ mod tests {
         let no_info = MatchTarget::new(Some("li"), None, &[]); // no .with_structure
         assert!(
             sheet
-                .resolve_for(&no_info, ElementStates::default())
+                .resolve_for(&no_info, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             "no structural info -> structural pseudos do not match"
         );
@@ -4716,14 +5093,14 @@ mod tests {
         let sheet = parse("a:not(.disabled) { color:#123456 }");
         let plain = MatchTarget::new(Some("a"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&plain, ElementStates::default()),
+            sheet.resolve_for(&plain, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#123456".to_string())],
             "a without .disabled is styled"
         );
         let disabled = MatchTarget::new(Some("a"), None, &["disabled"]);
         assert!(
             sheet
-                .resolve_for(&disabled, ElementStates::default())
+                .resolve_for(&disabled, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             ":not(.disabled) excludes the .disabled anchor"
         );
@@ -4737,17 +5114,19 @@ mod tests {
         let b = MatchTarget::new(None, None, &["b"]);
         let c = MatchTarget::new(None, None, &["c"]);
         assert_eq!(
-            sheet.resolve_for(&a, ElementStates::default()),
+            sheet.resolve_for(&a, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#0099ff".to_string())],
             ":is matches .a"
         );
         assert_eq!(
-            sheet.resolve_for(&b, ElementStates::default()),
+            sheet.resolve_for(&b, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#0099ff".to_string())],
             ":is matches .b"
         );
         assert!(
-            sheet.resolve_for(&c, ElementStates::default()).is_empty(),
+            sheet
+                .resolve_for(&c, ElementStates::default(), MediaContext::ALL)
+                .is_empty(),
             ":is does not match an element with neither class"
         );
     }
@@ -4761,19 +5140,19 @@ mod tests {
         let sheet = parse(":where(.high) { color:#ffffff } .low { color:#000000 }");
         let both = MatchTarget::new(None, None, &["high", "low"]);
         assert_eq!(
-            sheet.resolve_for(&both, ElementStates::default()),
+            sheet.resolve_for(&both, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#000000".to_string())],
             ":where adds 0 specificity, so the plain .low class rule wins"
         );
         // Sanity: :where still FILTERS — an element without .high is not matched by the :where rule.
         let only_low = MatchTarget::new(None, None, &["low"]);
         assert_eq!(
-            sheet.resolve_for(&only_low, ElementStates::default()),
+            sheet.resolve_for(&only_low, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#000000".to_string())]
         );
         let only_high = MatchTarget::new(None, None, &["high"]);
         assert_eq!(
-            sheet.resolve_for(&only_high, ElementStates::default()),
+            sheet.resolve_for(&only_high, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#ffffff".to_string())],
             ":where(.high) still matches when .high is present"
         );
@@ -4788,7 +5167,7 @@ mod tests {
         let sheet = parse(":is(#hero, .cls) { color:#111111 } .cls { color:#222222 }");
         let target = MatchTarget::new(None, None, &["cls"]);
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#111111".to_string())],
             ":is(#id, .cls) carries the #id specificity and beats a plain .cls rule"
         );
@@ -4801,7 +5180,7 @@ mod tests {
         let sheet = parse("a { color:#111111 } a:not(.x) { color:#222222 }");
         let plain_a = MatchTarget::new(Some("a"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&plain_a, ElementStates::default()),
+            sheet.resolve_for(&plain_a, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#222222".to_string())],
             "a:not(.x) outranks a bare a by the :not argument's class specificity"
         );
@@ -4815,7 +5194,7 @@ mod tests {
         let sheet = parse(":is(.a, .b > .c) { color:#334455 }");
         let a = MatchTarget::new(None, None, &["a"]);
         assert_eq!(
-            sheet.resolve_for(&a, ElementStates::default()),
+            sheet.resolve_for(&a, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#334455".to_string())],
             "the valid single-compound `.a` entry is kept"
         );
@@ -4823,7 +5202,9 @@ mod tests {
         // the whole `.b > .c` entry was dropped.
         let c = MatchTarget::new(None, None, &["c"]);
         assert!(
-            sheet.resolve_for(&c, ElementStates::default()).is_empty(),
+            sheet
+                .resolve_for(&c, ElementStates::default(), MediaContext::ALL)
+                .is_empty(),
             "the combinator entry was dropped, so .c does not match via :is"
         );
     }
@@ -4875,7 +5256,7 @@ mod tests {
         // Decls are returned in first-appearance order across matched rules (lowest specificity
         // applied first): `button` (BG) folds before `.a` (FG).
         assert_eq!(
-            sheet.resolve_for(&with_struct, ElementStates::default()),
+            sheet.resolve_for(&with_struct, ElementStates::default(), MediaContext::ALL),
             vec![(BG, "#111111".to_string()), (FG, "#445566".to_string())],
             "structure info present but unused by a plain sheet -> same result"
         );
@@ -4887,7 +5268,7 @@ mod tests {
         let sheet = parse("li { color:#111111 } li:first-child { color:#222222 }");
         let first = MatchTarget::new(Some("li"), None, &[]).with_structure(0, 3, 0);
         assert_eq!(
-            sheet.resolve_for(&first, ElementStates::default()),
+            sheet.resolve_for(&first, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#222222".to_string())],
             "li:first-child outranks bare li by the pseudo's class-level specificity"
         );
@@ -4908,7 +5289,7 @@ mod tests {
             let sheet = parse(bad);
             let p = MatchTarget::new(Some("p"), None, &[]).with_structure(0, 1, 0);
             assert_eq!(
-                sheet.resolve_for(&p, ElementStates::default()),
+                sheet.resolve_for(&p, ElementStates::default(), MediaContext::ALL),
                 vec![(FG, "#abcdef".to_string())],
                 "the bad selector in `{bad}` was dropped; the plain `p` rule still applies"
             );
@@ -4925,7 +5306,7 @@ mod tests {
         // A `.a` nested under a `.card` matches.
         let inside = MatchTarget::new(None, None, &["a"]).with_ancestors(&parent_card);
         assert_eq!(
-            sheet.resolve_for(&inside, ElementStates::default()),
+            sheet.resolve_for(&inside, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#123456".to_string())],
             ":is(.a,.b) under a .card matches via the descendant combinator"
         );
@@ -4933,7 +5314,7 @@ mod tests {
         let no_card = MatchTarget::new(None, None, &["b"]);
         assert!(
             sheet
-                .resolve_for(&no_card, ElementStates::default())
+                .resolve_for(&no_card, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             ":is(.a,.b) with no .card ancestor does not match"
         );
@@ -4948,12 +5329,12 @@ mod tests {
         let p = MatchTarget::new(Some("p"), None, &[]);
         assert!(
             is_sheet
-                .resolve_for(&p, ElementStates::default())
+                .resolve_for(&p, ElementStates::default(), MediaContext::ALL)
                 .is_empty(),
             ":is() matches nothing"
         );
         assert_eq!(
-            not_sheet.resolve_for(&p, ElementStates::default()),
+            not_sheet.resolve_for(&p, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#222222".to_string())],
             ":not() matches everything (no inner compound to exclude)"
         );
@@ -4980,12 +5361,12 @@ mod tests {
         let target = MatchTarget::new(None, None, &["t"]);
         // Normal decls: only `color` (the custom prop is not normalized into a PropId decl).
         assert_eq!(
-            sheet.resolve_for(&target, ElementStates::default()),
+            sheet.resolve_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![(FG, "#0000ff".to_string())]
         );
         // Custom decls expose the raw `--accent` value verbatim (NOT folded to `#rrggbb`).
         assert_eq!(
-            sheet.resolve_custom_for(&target, ElementStates::default()),
+            sheet.resolve_custom_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![("--accent".to_string(), "#ff0000".to_string())]
         );
     }
@@ -4996,7 +5377,7 @@ mod tests {
         let sheet = parse(".t { --c: 1px } #x.t { --c: 2px }");
         let target = MatchTarget::new(None, Some("x"), &["t"]);
         assert_eq!(
-            sheet.resolve_custom_for(&target, ElementStates::default()),
+            sheet.resolve_custom_for(&target, ElementStates::default(), MediaContext::ALL),
             vec![("--c".to_string(), "2px".to_string())]
         );
     }
@@ -5163,6 +5544,196 @@ mod tests {
         assert_eq!(
             sheet.declarations("p"),
             &[(PADDING, "calc(8px + 4px)".to_string())]
+        );
+    }
+
+    // ---- @media responsive queries (Wave 4c) ----
+
+    /// A viewport context of `w` × `h` px for the media-query tests.
+    fn vp(w: f32, h: f32) -> MediaContext {
+        MediaContext { vw: w, vh: h }
+    }
+
+    /// Resolve a single `.a` class against `media`, returning its declarations.
+    fn resolve_a(sheet: &Stylesheet, media: MediaContext) -> Vec<Decl> {
+        let target = MatchTarget::new(None, None, &["a"]);
+        sheet.resolve_for(&target, ElementStates::default(), media)
+    }
+
+    #[test]
+    fn media_min_width_applies_only_above_threshold() {
+        let sheet = parse("@media (min-width: 600px) { .a { color: red } }");
+        // At a wide viewport (800 >= 600) the rule applies; at a narrow one (400 < 600) it does not.
+        assert_eq!(
+            resolve_a(&sheet, vp(800.0, 600.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "min-width matches when vw >= threshold"
+        );
+        assert!(
+            resolve_a(&sheet, vp(400.0, 600.0)).is_empty(),
+            "min-width does not match when vw < threshold"
+        );
+    }
+
+    #[test]
+    fn media_max_width_applies_only_below_threshold() {
+        let sheet = parse("@media (max-width: 500px) { .a { color: red } }");
+        assert_eq!(
+            resolve_a(&sheet, vp(400.0, 600.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "max-width matches when vw <= threshold"
+        );
+        assert!(
+            resolve_a(&sheet, vp(800.0, 600.0)).is_empty(),
+            "max-width does not match when vw > threshold"
+        );
+    }
+
+    #[test]
+    fn media_and_combines_conditions() {
+        // (min-width: 600px) and (max-width: 900px): both must hold.
+        let sheet = parse("@media (min-width: 600px) and (max-width: 900px) { .a { color: red } }");
+        assert_eq!(
+            resolve_a(&sheet, vp(800.0, 600.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "inside the band [600, 900] both conditions hold"
+        );
+        assert!(
+            resolve_a(&sheet, vp(500.0, 600.0)).is_empty(),
+            "below the band the min-width fails"
+        );
+        assert!(
+            resolve_a(&sheet, vp(1000.0, 600.0)).is_empty(),
+            "above the band the max-width fails"
+        );
+    }
+
+    #[test]
+    fn media_comma_is_or() {
+        // A comma at the top of the query is an OR: either term matching is enough.
+        let sheet = parse("@media (max-width: 400px), (min-width: 900px) { .a { color: red } }");
+        assert_eq!(
+            resolve_a(&sheet, vp(300.0, 600.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "narrow viewport satisfies the first (max-width) term"
+        );
+        assert_eq!(
+            resolve_a(&sheet, vp(1000.0, 600.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "wide viewport satisfies the second (min-width) term"
+        );
+        assert!(
+            resolve_a(&sheet, vp(600.0, 600.0)).is_empty(),
+            "a mid viewport satisfies neither OR term"
+        );
+    }
+
+    #[test]
+    fn media_height_features_resolve_against_vh() {
+        let sheet =
+            parse("@media (min-height: 500px) and (max-height: 800px) { .a { color: red } }");
+        assert_eq!(
+            resolve_a(&sheet, vp(1000.0, 600.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "vh inside [500, 800] matches regardless of vw"
+        );
+        assert!(
+            resolve_a(&sheet, vp(1000.0, 400.0)).is_empty(),
+            "vh below 500 fails min-height"
+        );
+    }
+
+    #[test]
+    fn unconditional_rule_always_applies() {
+        // A rule outside any @media carries no condition: it applies at any viewport.
+        let sheet = parse(".a { color: red }");
+        assert_eq!(
+            resolve_a(&sheet, vp(100.0, 100.0)),
+            vec![(FG, "#ff0000".to_string())]
+        );
+        assert_eq!(
+            resolve_a(&sheet, vp(5000.0, 5000.0)),
+            vec![(FG, "#ff0000".to_string())]
+        );
+    }
+
+    #[test]
+    fn malformed_media_query_drops_the_whole_block() {
+        // An unsupported feature (`orientation`) drops the entire @media block: its rule never
+        // applies, even at a viewport where a width condition would have. The trailing
+        // unconditional `.b` rule must still parse — the block is consumed without corruption.
+        let sheet =
+            parse("@media (orientation: landscape) { .a { color: red } } .b { background: navy }");
+        assert!(
+            resolve_a(&sheet, vp(800.0, 600.0)).is_empty(),
+            "the malformed @media block's rule is dropped"
+        );
+        let b = MatchTarget::new(None, None, &["b"]);
+        assert_eq!(
+            sheet.resolve_for(&b, ElementStates::default(), MediaContext::ALL),
+            vec![(BG, "#000080".to_string())],
+            "a rule after a dropped @media still parses (no corruption)"
+        );
+    }
+
+    #[test]
+    fn non_media_at_rule_is_skipped_gracefully() {
+        // A `@font-face` block (no rules) must be consumed whole so the following rule survives.
+        let sheet = parse("@font-face { font-family: x; src: url(y) } .a { color: red }");
+        assert_eq!(
+            resolve_a(&sheet, vp(100.0, 100.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "the rule after a skipped @font-face still applies"
+        );
+    }
+
+    #[test]
+    fn statement_at_rule_is_skipped_gracefully() {
+        // A `;`-terminated statement at-rule (`@import`) must be consumed up to its `;`.
+        let sheet = parse("@import \"reset.css\"; .a { color: red }");
+        assert_eq!(
+            resolve_a(&sheet, vp(100.0, 100.0)),
+            vec![(FG, "#ff0000".to_string())],
+            "the rule after a skipped @import still applies"
+        );
+    }
+
+    #[test]
+    fn media_gates_custom_properties() {
+        // A custom property declared inside @media respects the query: it is only resolved when the
+        // condition holds, and a normal decl's var() then falls back outside the query.
+        let sheet = parse(
+            "@media (min-width: 600px) { .a { --accent: #112233 } } .a { color: var(--accent, #000000) }",
+        );
+        let target = MatchTarget::new(None, None, &["a"]);
+        // Inside the query: the custom property resolves.
+        let wide = sheet.resolve_custom_for(&target, ElementStates::default(), vp(800.0, 600.0));
+        assert_eq!(
+            wide,
+            vec![("--accent".to_string(), "#112233".to_string())],
+            "the @media custom property is present at a wide viewport"
+        );
+        // Outside the query: the custom property is absent (so a var() would take its fallback).
+        let narrow = sheet.resolve_custom_for(&target, ElementStates::default(), vp(400.0, 600.0));
+        assert!(
+            narrow.is_empty(),
+            "the @media custom property is dropped at a narrow viewport"
+        );
+    }
+
+    #[test]
+    fn legacy_resolve_treats_media_as_all_pass_for_min_width() {
+        // The legacy class-only resolve() uses MediaContext::ALL, so an unconditional rule resolves
+        // unchanged and a (min-width) rule (which a huge viewport satisfies) also applies.
+        let sheet = parse(".a { padding: 4px } @media (min-width: 600px) { .a { color: red } }");
+        let r = sheet.resolve(&["a"], false);
+        assert!(
+            r.contains(&(PADDING, "4".to_string())),
+            "the unconditional rule resolves through the legacy wrapper"
+        );
+        assert!(
+            r.contains(&(FG, "#ff0000".to_string())),
+            "a min-width rule passes against the ALL sentinel viewport"
         );
     }
 }

@@ -61,7 +61,7 @@ use canopy_dom::{Dom, ROOT};
 use canopy_layout_taffy::{hit_test, layout};
 use canopy_protocol::{ElementTag, EventPayload, HandlerId, NodeId, PropId};
 use canopy_signals::{Memo, Runtime, Signal};
-use canopy_style_css::{resolve_value, ElementStates, ResolveCtx, Stylesheet};
+use canopy_style_css::{resolve_value, ElementStates, MediaContext, ResolveCtx, Stylesheet};
 use canopy_traits::{Point, Size};
 use canopy_view::{App, CLICK};
 
@@ -407,6 +407,12 @@ impl Ui {
     /// `hover_target`, not at style time). `calc()`/`min()`/`max()`/`clamp()` over absolute lengths
     /// resolve fully; a `%` inside `calc` drops the declaration (deferred), and a bare `%` passes
     /// through for Taffy.
+    ///
+    /// **`@media` (Wave 4c):** for the same "no live viewport at style time" reason, `@media`
+    /// width/height queries here resolve against that fixed [`DEFAULT_VIEWPORT`] — a
+    /// `@media (max-width: …)` rule applies iff `DEFAULT_VIEWPORT.w` satisfies it, not the real
+    /// window size. The viewport-tracking `@media` path is the `canopy-abi` host cascade, which
+    /// threads its live viewport.
     fn apply_node(&self, node: NodeId, classes: &[&str], states: ElementStates) {
         let ident = self
             .identity
@@ -426,15 +432,25 @@ impl Ui {
         let target = canopy_style_css::MatchTarget::new(type_name, id, classes).with_attrs(&attrs);
         let css = self.css.borrow();
 
+        // In-process `Ui` holds no live viewport at style time, so `@media` queries resolve against
+        // the same fixed `DEFAULT_VIEWPORT` that backs `vw`/`vh` here. This is the FULL viewport px
+        // (not 1% of it), so a `@media (min-width: 600px)` compares against 1280, a `(max-width:
+        // …)` against 1280, etc. A host that needs true viewport-aware media goes through the
+        // `canopy-abi` cascade, which threads its live viewport instead.
+        let media = MediaContext {
+            vw: DEFAULT_VIEWPORT.w,
+            vh: DEFAULT_VIEWPORT.h,
+        };
+
         // The node's OWN custom properties (no ancestor inheritance in-process — see the doc above),
         // as `(name, raw-value)` for `var()` lookup.
-        let custom_owned = css.resolve_custom_for(&target, states);
+        let custom_owned = css.resolve_custom_for(&target, states, media);
         let custom: Vec<(&str, &str)> = custom_owned
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let resolved = css.resolve_for(&target, states);
+        let resolved = css.resolve_for(&target, states, media);
         // Resolve the node's own font-size first (default 16px) so its `em` lengths resolve against
         // it. No inheritance here: only an own/matched `font-size` counts.
         let font_px = resolved
@@ -888,6 +904,33 @@ mod tests {
             dom.style(btn, FG),
             Some("#222222"),
             "#submit id rule styles the in-process node"
+        );
+    }
+
+    #[test]
+    fn lite_media_query_resolves_against_the_default_viewport() {
+        // In-process `Ui` has no live viewport at style time, so `@media` resolves against the fixed
+        // 1280×720 DEFAULT_VIEWPORT. A `(max-width: 2000px)` rule matches (1280 <= 2000); a
+        // `(min-width: 2000px)` one does not (1280 < 2000) and the base color shows through.
+        const CSS: &str = "
+            .btn { color: #111111 }
+            @media (max-width: 2000px) { .btn { background: #00ff00 } }
+            @media (min-width: 2000px) { .btn { color: #ff0000 } }
+        ";
+        let ui = Ui::with_css(CSS);
+        let btn = ui.button("ok");
+        ui.class(btn, &["btn"]);
+        ui.mount_root(btn);
+        let dom = mount(&ui);
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#00ff00"),
+            "max-width:2000px matches the 1280-wide default viewport"
+        );
+        assert_eq!(
+            dom.style(btn, FG),
+            Some("#111111"),
+            "min-width:2000px does not match, so the base color stays"
         );
     }
 

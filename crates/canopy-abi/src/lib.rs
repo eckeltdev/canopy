@@ -72,7 +72,8 @@ use canopy_dom::{Dom, ROOT};
 use canopy_protocol::{AttrId, EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
 use canopy_style_css::{
-    resolve_value, ElementIdentity, ElementStates, MatchTarget, ResolveCtx, Stylesheet,
+    resolve_value, ElementIdentity, ElementStates, MatchTarget, MediaContext, ResolveCtx,
+    Stylesheet,
 };
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
@@ -196,6 +197,14 @@ impl CanopyHost {
         // until `set_viewport`, in which case `vw`/`vh` resolve to 0 (no layout box yet).
         let vw_px = self.viewport.w / 100.0;
         let vh_px = self.viewport.h / 100.0;
+        // The `@media` context is the FULL viewport in px (distinct from `vw_px`/`vh_px`, which are
+        // 1% of each dimension for the unit resolver) — a `@media (min-width: 600px)` compares
+        // against the whole width. Before `set_viewport` this is `0×0`, so a `max-*` query matches
+        // and a `min-*` query (above 0) does not — the honest "no viewport yet" answer.
+        let media = MediaContext {
+            vw: self.viewport.w,
+            vh: self.viewport.h,
+        };
         for (idx, &child) in root_children.iter().enumerate() {
             collect_cascade(
                 &dom,
@@ -211,6 +220,7 @@ impl CanopyHost {
                 ROOT_FONT_PX,
                 vw_px,
                 vh_px,
+                media,
                 &[],
                 &mut overlay,
             );
@@ -487,6 +497,7 @@ fn collect_cascade(
     parent_font_px: f32,
     vw_px: f32,
     vh_px: f32,
+    media: MediaContext,
     ancestors: &[NodeIdentity<'_>],
     overlay: &mut Vec<(NodeId, PropId, String)>,
 ) {
@@ -535,7 +546,7 @@ fn collect_cascade(
     if is_element {
         // Overlay this node's own matched custom props onto the inherited map (last-wins by cascade
         // order, already applied inside `resolve_custom_for`).
-        for (name, value) in sheet.resolve_custom_for(&target, states) {
+        for (name, value) in sheet.resolve_custom_for(&target, states, media) {
             custom_map.insert(name, value);
         }
     }
@@ -546,7 +557,7 @@ fn collect_cascade(
     // font-size value is resolved with the PARENT font-size as the `em` basis (an `em` font-size is
     // relative to the parent's, per CSS).
     let matched = if is_element {
-        sheet.resolve_for(&target, states)
+        sheet.resolve_for(&target, states, media)
     } else {
         Vec::new()
     };
@@ -662,6 +673,7 @@ fn collect_cascade(
             node_font_px,
             vw_px,
             vh_px,
+            media,
             &child_ancestors,
             overlay,
         );
@@ -1656,6 +1668,34 @@ mod tests {
             styled_prop(&styled, btn, BG).as_deref(),
             Some("#313244"),
             "clearing active reverts to the base"
+        );
+    }
+
+    #[test]
+    fn media_max_width_rule_tracks_the_host_viewport() {
+        use canopy_paint::BG;
+        // A `@media (max-width: 500px)` rule styles the button only when the host viewport is narrow
+        // enough. This proves the host threads its real viewport into the cascade as a MediaContext.
+        let (mut host, btn) = host_with_btn(
+            ".btn { background: #313244 } @media (max-width: 500px) { .btn { background: #f38ba8 } }",
+        );
+
+        // A wide viewport (800 > 500): the @media rule does NOT apply, so the base shows through.
+        host.set_viewport(800.0, 600.0);
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, btn, BG).as_deref(),
+            Some("#313244"),
+            "at 800px wide the max-width:500px rule is inactive"
+        );
+
+        // A narrow viewport (400 <= 500): the @media rule applies and overrides the base.
+        host.set_viewport(400.0, 600.0);
+        let styled = host.styled_dom().unwrap();
+        assert_eq!(
+            styled_prop(&styled, btn, BG).as_deref(),
+            Some("#f38ba8"),
+            "at 400px wide the max-width:500px rule restyles the button"
         );
     }
 
