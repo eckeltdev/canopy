@@ -18,8 +18,10 @@
 //!
 //! A selector is a **complex** selector: a sequence of **compounds** joined by
 //! combinators. A compound is an optional leading type/tag name followed by any run of
-//! `.class`, `#id`, `[attr]`, and pseudo-class parts (`:hover` only on the subject; the structural
-//! and functional pseudo-classes on any compound). `*` is the universal (matches anything). A
+//! `.class`, `#id`, `[attr]`, and pseudo-class parts (the dynamic interaction-state pseudos
+//! `:hover`/`:focus`/`:active` only on the subject; the structural, functional, and
+//! attribute-driven `:disabled`/`:checked` pseudo-classes on any compound). `*` is the universal
+//! (matches anything). A
 //! descendant combinator is whitespace; a child combinator is `>`. Commas group several selectors
 //! onto one declaration block.
 //!
@@ -67,10 +69,15 @@
 //! class/pseudo = 10, type = 1; ties broken by source order), and folds their
 //! declarations **last-wins** per [`PropId`] — a higher-specificity (or later) rule
 //! overrides an earlier one on the same property, while untouched properties are
-//! preserved. `:hover` rules join the cascade only when `hovered` is set.
-//! [`Stylesheet::resolve`] is the legacy class-only entry point (a [`MatchTarget`]
-//! with no type/id); [`Stylesheet::apply_state`] replays a resolution onto an
-//! [`App`], which the host re-calls whenever a node's hover state flips.
+//! preserved. The **interaction-state** pseudo-classes (`:hover`, `:focus`, `:active`)
+//! join the cascade only when the element is in that state: [`Stylesheet::resolve_for`]
+//! takes an [`ElementStates`] describing the element's current dynamic states, and a
+//! state pseudo matches when its flag is set. `:disabled` / `:checked` are *not* dynamic
+//! states — they are matched as a `disabled` / `checked` **attribute-presence** test, so
+//! they need no host plumbing. [`Stylesheet::resolve`] is the legacy class-only entry
+//! point (a [`MatchTarget`] with no type/id, taking a single `hovered` bool mapped onto
+//! [`ElementStates`]); [`Stylesheet::apply_state`] replays a resolution onto an
+//! [`App`], which the host re-calls whenever a node's interaction state flips.
 //!
 //! # Supported properties and colors
 //!
@@ -105,9 +112,11 @@
 //! - Selectors support the **descendant** (` `) and **child** (`>`) combinators,
 //!   **attribute selectors** (`[name]`, `[name="v"]`, `^=`/`$=`/`*=`), the **structural**
 //!   pseudo-classes (`:first-child`/`:last-child`/`:only-child`/`:empty`/`:nth-child`/
-//!   `:nth-last-child`), and the **functional** pseudo-classes (`:not`/`:is`/`:where`, scoped to a
-//!   single compound per argument), but not the sibling combinators (`+`, `~`), the `~=`/`|=`
-//!   attribute operators, or other pseudo-classes (`:focus`, `:nth-of-type`, …); no media queries.
+//!   `:nth-last-child`), the **functional** pseudo-classes (`:not`/`:is`/`:where`, scoped to a
+//!   single compound per argument), and the **interaction-state** pseudo-classes (`:hover`,
+//!   `:focus`, `:active`, plus attribute-driven `:disabled`/`:checked`), but not the sibling
+//!   combinators (`+`, `~`), the `~=`/`|=` attribute operators, or other pseudo-classes
+//!   (`:focus-within`, `:nth-of-type`, …); no media queries.
 //!   Box shorthands *are* expanded, but `!important` is only stripped (its precedence is not yet
 //!   honored).
 //! - The cascade matches each node against its own identity; there is no inheritance
@@ -149,17 +158,53 @@ use canopy_view::App;
 /// value, in source order.
 type Decl = (PropId, String);
 
-/// The interaction state a rule's `:hover`-style pseudo-class binds it to.
+/// The element's **current dynamic interaction state**, threaded into the cascade so the
+/// state pseudo-classes ([`StatePseudo`]) resolve. Each flag is whether the element is, *right
+/// now*, in that state; a [`Simple::State`] pseudo matches when its corresponding flag is set.
 ///
-/// `Base` rules (a plain `.name` selector) always apply; stateful rules apply only
-/// when the node is in that state. Today the only stateful variant is [`State::Hover`]
-/// (`.name:hover`).
+/// `Default` is all-false (no state), so a selector with no state pseudo resolves identically to
+/// a caller that passes `ElementStates::default()` — the back-compat path. The host flips these as
+/// the pointer/focus moves (`canopy-abi`/`canopy-ui` set them per node before resolving).
+///
+/// `:disabled` / `:checked` are **not** dynamic states — they are driven by a `disabled` /
+/// `checked` *attribute* on the element and matched as an attribute-presence test (see
+/// [`parse_pseudo`]), so they need no flag here.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct ElementStates {
+    /// The pointer is over this element (or, host-side, a descendant): `:hover`.
+    pub hover: bool,
+    /// This element has keyboard focus: `:focus`.
+    pub focus: bool,
+    /// This element is being activated (pressed): `:active`.
+    pub active: bool,
+}
+
+impl ElementStates {
+    /// Whether the flag this `pseudo` names is currently set on the element.
+    fn satisfies(self, pseudo: StatePseudo) -> bool {
+        match pseudo {
+            StatePseudo::Hover => self.hover,
+            StatePseudo::Focus => self.focus,
+            StatePseudo::Active => self.active,
+        }
+    }
+}
+
+/// A **dynamic** interaction-state pseudo-class — one whose match depends on the element's
+/// current [`ElementStates`], not on its identity. A compound may list several
+/// (`button:hover:focus`), and ALL must be satisfied for the compound to match.
+///
+/// Each counts at the class/pseudo level of specificity (`+10`, like `:hover` always did). The
+/// non-dynamic interaction pseudos `:disabled` / `:checked` are NOT here — they are attribute-
+/// presence tests (a `disabled` / `checked` attribute), see [`parse_pseudo`].
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// A plain selector with no pseudo-class; always applies.
-    Base,
-    /// A `:hover` rule; applies only when the node is hovered.
+enum StatePseudo {
+    /// `:hover` — the pointer is over the element.
     Hover,
+    /// `:focus` — the element has keyboard focus.
+    Focus,
+    /// `:active` — the element is being activated (pressed).
+    Active,
 }
 
 /// One part of a **compound** selector. A compound is an AND of these against a single
@@ -182,6 +227,10 @@ enum Simple {
     /// A **functional** pseudo-class (`:not(...)`, `:is(...)`, `:where(...)`) — matches against the
     /// element's own identity using an inner selector LIST of single compounds. See [`Functional`].
     Functional(Functional),
+    /// A **dynamic state** pseudo-class (`:hover`, `:focus`, `:active`) — matches against the
+    /// element's current [`ElementStates`] rather than its identity. See [`StatePseudo`]. Counts at
+    /// the class/pseudo level of specificity (like the structural pseudos).
+    State(StatePseudo),
 }
 
 /// A **structural** pseudo-class: a test on the element's position among its siblings (and, for
@@ -304,15 +353,16 @@ struct ComplexPart {
 /// and 11 classes outrank 10). Ties break on source order at the call site.
 type Spec = (u32, u32, u32);
 
-/// A **complex** selector — a sequence of compounds joined by combinators — plus its
-/// pseudo-state and CSS **specificity** (see [`Spec`]).
+/// A **complex** selector — a sequence of compounds joined by combinators — plus its CSS
+/// **specificity** (see [`Spec`]).
 ///
 /// `parts` reads left-to-right as written: `parts.last()` is the **subject** (matches the
 /// element itself) and each earlier part carries the [`Combinator`] relating it to the part on
-/// its right. A single-compound selector (`button.primary`) is a one-element `parts`.
+/// its right. A single-compound selector (`button.primary`) is a one-element `parts`. The dynamic
+/// interaction state (`:hover`/`:focus`/`:active`) lives in the subject compound's simples as
+/// [`Simple::State`]; there is no longer a rule-level state field.
 struct Selector {
     parts: Vec<ComplexPart>,
-    state: State,
     specificity: Spec,
 }
 
@@ -481,8 +531,7 @@ impl Stylesheet {
     /// [`resolve`]: Stylesheet::resolve
     pub fn declarations(&self, class: &str) -> &[Decl] {
         for rule in &self.rules {
-            if rule.selector.state == State::Base
-                && rule.selector.parts.len() == 1
+            if rule.selector.parts.len() == 1
                 && rule.selector.parts[0].simples.len() == 1
                 && matches!(&rule.selector.parts[0].simples[0], Simple::Class(c) if c == class)
             {
@@ -493,24 +542,22 @@ impl Stylesheet {
     }
 
     /// Resolve the final declarations for an element from its full [`MatchTarget`] (type, id,
-    /// classes), applying CSS **specificity + source order**: every rule whose compound selector
-    /// matches the element (and whose `:hover` state is satisfied by `hovered`) is collected, the
-    /// matches are ordered by `(specificity, source position)`, and their declarations are folded
-    /// last-wins — so a higher-specificity rule (or, at equal specificity, a later one) wins each
-    /// property. Properties no matching rule touches are absent. The returned pairs are in first-
-    /// appearance order (the order [`apply_state`] replays inline-style ops).
-    pub fn resolve_for(&self, target: &MatchTarget, hovered: bool) -> Vec<Decl> {
+    /// classes, attrs, ancestors) and its current dynamic [`ElementStates`], applying CSS
+    /// **specificity + source order**: every rule whose compound selector matches the element — its
+    /// state pseudos (`:hover`/`:focus`/`:active`) satisfied by `states`, its `:disabled`/`:checked`
+    /// satisfied by the target's attributes — is collected, the matches are ordered by
+    /// `(specificity, source position)`, and their declarations are folded last-wins, so a
+    /// higher-specificity rule (or, at equal specificity, a later one) wins each property.
+    /// Properties no matching rule touches are absent. The returned pairs are in first-appearance
+    /// order (the order [`apply_state`] replays inline-style ops).
+    pub fn resolve_for(&self, target: &MatchTarget, states: ElementStates) -> Vec<Decl> {
         // Collect matching rules with their (specificity, source index) so we can order the
         // cascade correctly regardless of the order classes appear on the element. The
         // specificity is the `(a, b, c)` tuple, so the sort below is a true lexicographic
         // CSS comparison (id > class/pseudo > type) with the source index as the tie-break.
         let mut matched: Vec<(Spec, usize)> = Vec::new();
         for (idx, rule) in self.rules.iter().enumerate() {
-            let state_ok = match rule.selector.state {
-                State::Base => true,
-                State::Hover => hovered,
-            };
-            if state_ok && complex_matches(&rule.selector.parts, target) {
+            if complex_matches(&rule.selector.parts, target, states) {
                 matched.push((rule.selector.specificity, idx));
             }
         }
@@ -524,10 +571,17 @@ impl Stylesheet {
         resolved
     }
 
-    /// The legacy class-only resolve: a [`resolve_for`](Self::resolve_for) with no type/id, so it
-    /// matches exactly the pure-class rules it always did. Kept for `canopy-ui` / `LiteEngine`.
+    /// The legacy class-only resolve: a [`resolve_for`](Self::resolve_for) with no type/id and a
+    /// single `hover` flag, so it matches exactly the pure-class rules it always did. Kept for
+    /// `canopy-ui` / `LiteEngine`; maps `hovered` onto `ElementStates { hover: hovered, .. }`.
     pub fn resolve(&self, classes: &[&str], hovered: bool) -> Vec<Decl> {
-        self.resolve_for(&MatchTarget::new(None, None, classes), hovered)
+        self.resolve_for(
+            &MatchTarget::new(None, None, classes),
+            ElementStates {
+                hover: hovered,
+                ..ElementStates::default()
+            },
+        )
     }
 
     /// Whether any of `classes` has a `:hover` rule, i.e. the node would restyle when
@@ -535,14 +589,26 @@ impl Stylesheet {
     /// considered) — the cheap "is this node worth tracking for hover" check `canopy-ui` uses.
     #[must_use]
     pub fn reacts_to_hover(&self, classes: &[&str]) -> bool {
+        self.reacts_to_state_pseudo(classes, StatePseudo::Hover)
+    }
+
+    /// Whether any of `classes` has a rule carrying the given dynamic-state pseudo
+    /// (`:hover`/`:focus`/`:active`) on a compound that also references one of those classes — i.e.
+    /// the node would restyle when it enters or leaves that state. The generalization of
+    /// [`reacts_to_hover`](Self::reacts_to_hover): a class-only predicate `canopy-ui` uses to decide
+    /// which nodes are worth tracking for a given interaction state. `pseudo` selects which state.
+    fn reacts_to_state_pseudo(&self, classes: &[&str], pseudo: StatePseudo) -> bool {
         self.rules.iter().any(|rule| {
-            rule.selector.state == State::Hover
-                && rule
-                    .selector
+            let simples = || {
+                rule.selector
                     .parts
                     .iter()
                     .flat_map(|part| part.simples.iter())
-                    .any(|s| matches!(s, Simple::Class(c) if classes.contains(&c.as_str())))
+            };
+            // The rule must carry this state pseudo AND name one of `classes` (so flipping that
+            // class's state could change its styling). Mirrors the old `reacts_to_hover` shape.
+            simples().any(|s| matches!(s, Simple::State(p) if *p == pseudo))
+                && simples().any(|s| matches!(s, Simple::Class(c) if classes.contains(&c.as_str())))
         })
     }
 
@@ -652,15 +718,16 @@ pub fn parse(css: &str) -> Stylesheet {
 }
 
 /// Parse one selector — a **complex** selector (`.card > button.primary#go`, descendant/child
-/// combinators between compounds), an optional `:hover` on the subject, and any structural /
-/// functional pseudo-classes (`:first-child`, `:nth-child(2n)`, `:not(.x)`, `:is(.a, .b)`, …) on any
-/// compound — into a [`Selector`] with its specificity. Returns `None` for an empty selector, an
-/// empty compound, or one carrying an unsupported pseudo-class (`:focus`, `::before`, …), so it is
-/// dropped (not mistaken for a base).
+/// combinators between compounds), the dynamic interaction-state pseudos (`:hover`/`:focus`/
+/// `:active`) on the subject, and any structural / functional / attribute-driven pseudo-classes
+/// (`:first-child`, `:nth-child(2n)`, `:not(.x)`, `:is(.a, .b)`, `:disabled`, …) on any compound —
+/// into a [`Selector`] with its specificity. Returns `None` for an empty selector, an empty
+/// compound, a state pseudo on a non-subject compound, or one carrying an unsupported pseudo-class
+/// (`::before`, `:focus-within`, …), so it is dropped (not mistaken for a base).
 ///
 /// Specificity sums over every compound: each `id` adds to `a`; each class / attribute / structural
-/// pseudo / `:hover` adds to `b`; each type adds to `c`. A functional `:is(...)` / `:not(...)` adds
-/// the specificity of its **most-specific** argument; `:where(...)` adds **zero** (see
+/// pseudo / state pseudo adds to `b`; each type adds to `c`. A functional `:is(...)` / `:not(...)`
+/// adds the specificity of its **most-specific** argument; `:where(...)` adds **zero** (see
 /// [`functional_specificity`]).
 fn parse_selector(sel: &str) -> Option<Selector> {
     let sel = sel.trim();
@@ -676,19 +743,16 @@ fn parse_selector(sel: &str) -> Option<Selector> {
     let mut parts: Vec<ComplexPart> = Vec::with_capacity(tokens.len());
     let mut spec: Spec = (0, 0, 0);
     let last = tokens.len() - 1;
-    let mut state = State::Base;
 
     for (idx, (combinator, compound_text)) in tokens.into_iter().enumerate() {
-        // `:hover` is the one pseudo that lifts to the rule's interaction State, and it is only
-        // honored on the subject (rightmost) compound. On any compound, structural/functional
-        // pseudos parse into Simples; an unsupported pseudo drops the whole selector.
-        let (simples, has_hover) = parse_compound(compound_text)?;
-        if has_hover && idx != last {
-            return None; // `:hover` on a non-subject compound is unsupported -> drop the selector
-        }
-        if has_hover {
-            state = State::Hover;
-            spec.1 += 1; // a pseudo-class counts at the class/pseudo level of specificity
+        // A dynamic-state pseudo (`:hover`/`:focus`/`:active`) is only honored on the subject
+        // (rightmost) compound — its state is the resolved element's, not an ancestor's. On any
+        // compound, structural/functional pseudos parse into Simples; an unsupported pseudo drops
+        // the whole selector.
+        let simples = parse_compound(compound_text)?;
+        let has_state = simples.iter().any(|s| matches!(s, Simple::State(_)));
+        if has_state && idx != last {
+            return None; // a state pseudo on a non-subject compound is unsupported -> drop it
         }
         for simple in &simples {
             add_simple_specificity(&mut spec, simple);
@@ -701,7 +765,6 @@ fn parse_selector(sel: &str) -> Option<Selector> {
 
     Some(Selector {
         parts,
-        state,
         specificity: spec,
     })
 }
@@ -712,7 +775,9 @@ fn parse_selector(sel: &str) -> Option<Selector> {
 fn add_simple_specificity(spec: &mut Spec, simple: &Simple) {
     match simple {
         Simple::Id(_) => spec.0 += 1,
-        Simple::Class(_) | Simple::Attr(_) | Simple::Structural(_) => spec.1 += 1,
+        Simple::Class(_) | Simple::Attr(_) | Simple::Structural(_) | Simple::State(_) => {
+            spec.1 += 1;
+        }
         Simple::Type(_) => spec.2 += 1,
         Simple::Functional(f) => {
             let (a, b, c) = functional_specificity(f);
@@ -891,18 +956,18 @@ fn is_simple_boundary(b: u8) -> bool {
     b == b'.' || b == b'#' || b == b'[' || b == b':'
 }
 
-/// Parse a compound selector into its simple parts plus whether it carried `:hover` (which the
-/// caller lifts to the rule's interaction [`State`]). A compound is an optional leading **type**
-/// name, then a run of `.class` / `#id` / `[attr]` / `:pseudo` parts in any order. A bare `*`
-/// (universal) yields an empty (always-matching) list. Returns `None` on a malformed identifier,
-/// attribute selector, or unsupported pseudo-class, or an empty compound.
-fn parse_compound(compound: &str) -> Option<(Vec<Simple>, bool)> {
+/// Parse a compound selector into its simple parts. A compound is an optional leading **type**
+/// name, then a run of `.class` / `#id` / `[attr]` / `:pseudo` parts in any order. The dynamic
+/// state pseudos (`:hover`/`:focus`/`:active`) parse into [`Simple::State`]; `:disabled`/`:checked`
+/// fold to a `disabled`/`checked` attribute-presence test; structural/functional pseudos parse as
+/// before. A bare `*` (universal) yields an empty (always-matching) list. Returns `None` on a
+/// malformed identifier, attribute selector, or unsupported pseudo-class, or an empty compound.
+fn parse_compound(compound: &str) -> Option<Vec<Simple>> {
     let compound = compound.trim();
     if compound.is_empty() {
         return None;
     }
     let mut simples = Vec::new();
-    let mut has_hover = false;
     let bytes = compound.as_bytes();
     let mut i = 0;
     // Optional leading type/tag name (anything before the first `.`/`#`/`[`/`:`).
@@ -944,10 +1009,7 @@ fn parse_compound(compound: &str) -> Option<(Vec<Simple>, bool)> {
             } else {
                 None
             };
-            match parse_pseudo(name, arg)? {
-                Pseudo::Hover => has_hover = true,
-                Pseudo::Simple(s) => simples.push(s),
-            }
+            simples.push(parse_pseudo(name, arg)?);
             continue;
         }
         i += 1;
@@ -965,16 +1027,7 @@ fn parse_compound(compound: &str) -> Option<(Vec<Simple>, bool)> {
             _ => return None,
         }
     }
-    Some((simples, has_hover))
-}
-
-/// The outcome of parsing one pseudo-class: `:hover` lifts to the rule's [`State`]; every other
-/// supported pseudo becomes a [`Simple`] AND-ed into the compound.
-enum Pseudo {
-    /// `:hover` — handled at the [`Selector`] level (not a per-compound simple).
-    Hover,
-    /// A structural or functional pseudo, matched as part of the compound.
-    Simple(Simple),
+    Some(simples)
 }
 
 /// Read a balanced `(...)` group starting at `open` (which must index a `(`), returning the **inner**
@@ -1002,39 +1055,53 @@ fn read_balanced_parens(s: &str, open: usize) -> Option<(&str, usize)> {
     None // never closed
 }
 
-/// Parse one pseudo-class `name` (lowercased) and its optional functional `arg` into a [`Pseudo`].
+/// Parse one pseudo-class `name` (lowercased) and its optional functional `arg` into the [`Simple`]
+/// it contributes to the compound.
 ///
-/// Supported: `:hover` (lifts to State); the structural pseudos `:first-child`, `:last-child`,
-/// `:only-child`, `:empty`, `:nth-child(An+B)`, `:nth-last-child(An+B)`; and the functional pseudos
-/// `:not(...)`, `:is(...)`, `:where(...)`. Any other name (`:focus`, a `::`-element, a structural
-/// pseudo given an unexpected argument, a malformed `An+B`) returns `None`, dropping the selector.
-fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Pseudo> {
+/// Supported:
+/// - the **dynamic state** pseudos `:hover`, `:focus`, `:active` → [`Simple::State`] (matched
+///   against the element's current [`ElementStates`]);
+/// - the **attribute-driven** interaction pseudos `:disabled`, `:checked` → an attribute-presence
+///   test on a `disabled` / `checked` attribute ([`Simple::Attr`] with [`AttrMatch::Present`]), so
+///   they need no host state plumbing (they reuse the Wave 3a attribute path);
+/// - the **structural** pseudos `:first-child`, `:last-child`, `:only-child`, `:empty`,
+///   `:nth-child(An+B)`, `:nth-last-child(An+B)`;
+/// - the **functional** pseudos `:not(...)`, `:is(...)`, `:where(...)`.
+///
+/// Any other name (a `::`-element, a structural pseudo given an unexpected argument, a malformed
+/// `An+B`) returns `None`, dropping the selector.
+fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Simple> {
     // ASCII-lowercase the pseudo name without allocating beyond a small buffer.
     let lname = name.to_ascii_lowercase();
+    // The two attribute-driven interaction pseudos fold to an attribute-presence test, so a node
+    // carrying a `disabled` / `checked` attribute matches with no host state needed.
+    let attr_present = |name: &str| {
+        Simple::Attr(AttrSelector {
+            name: name.to_string(),
+            op: AttrMatch::Present,
+            value: String::new(),
+        })
+    };
     match (lname.as_str(), arg) {
-        ("hover", None) => Some(Pseudo::Hover),
-        ("first-child", None) => Some(Pseudo::Simple(Simple::Structural(Structural::FirstChild))),
-        ("last-child", None) => Some(Pseudo::Simple(Simple::Structural(Structural::LastChild))),
-        ("only-child", None) => Some(Pseudo::Simple(Simple::Structural(Structural::OnlyChild))),
-        ("empty", None) => Some(Pseudo::Simple(Simple::Structural(Structural::Empty))),
-        ("nth-child", Some(a)) => Some(Pseudo::Simple(Simple::Structural(Structural::NthChild(
-            parse_nth(a)?,
-        )))),
-        ("nth-last-child", Some(a)) => Some(Pseudo::Simple(Simple::Structural(
-            Structural::NthLastChild(parse_nth(a)?),
-        ))),
-        ("not", Some(a)) => Some(Pseudo::Simple(Simple::Functional(parse_functional(
-            FunctionalKind::Not,
-            a,
-        )))),
-        ("is", Some(a)) => Some(Pseudo::Simple(Simple::Functional(parse_functional(
-            FunctionalKind::Is,
-            a,
-        )))),
-        ("where", Some(a)) => Some(Pseudo::Simple(Simple::Functional(parse_functional(
+        ("hover", None) => Some(Simple::State(StatePseudo::Hover)),
+        ("focus", None) => Some(Simple::State(StatePseudo::Focus)),
+        ("active", None) => Some(Simple::State(StatePseudo::Active)),
+        ("disabled", None) => Some(attr_present("disabled")),
+        ("checked", None) => Some(attr_present("checked")),
+        ("first-child", None) => Some(Simple::Structural(Structural::FirstChild)),
+        ("last-child", None) => Some(Simple::Structural(Structural::LastChild)),
+        ("only-child", None) => Some(Simple::Structural(Structural::OnlyChild)),
+        ("empty", None) => Some(Simple::Structural(Structural::Empty)),
+        ("nth-child", Some(a)) => Some(Simple::Structural(Structural::NthChild(parse_nth(a)?))),
+        ("nth-last-child", Some(a)) => {
+            Some(Simple::Structural(Structural::NthLastChild(parse_nth(a)?)))
+        }
+        ("not", Some(a)) => Some(Simple::Functional(parse_functional(FunctionalKind::Not, a))),
+        ("is", Some(a)) => Some(Simple::Functional(parse_functional(FunctionalKind::Is, a))),
+        ("where", Some(a)) => Some(Simple::Functional(parse_functional(
             FunctionalKind::Where,
             a,
-        )))),
+        ))),
         _ => None, // unsupported pseudo-class (or a structural pseudo given a bad/missing arg)
     }
 }
@@ -1055,9 +1122,12 @@ fn parse_functional(kind: FunctionalKind, arg: &str) -> Functional {
         // descendant/child relation), drop just this entry (the single-compound scope limitation).
         match tokenize_complex(entry) {
             Some(tokens) if tokens.len() == 1 => {
-                // A single compound — parse it; drop the entry if it is malformed or carries :hover.
-                if let Some((simples, has_hover)) = parse_compound(tokens[0].1) {
-                    if !has_hover {
+                // A single compound — parse it; drop the entry if it is malformed or carries a
+                // dynamic-state pseudo (`:hover`/`:focus`/`:active`), which `functional_matches`
+                // resolves against identity only and so cannot evaluate (the single-compound,
+                // identity-scoped limitation of functional args).
+                if let Some(simples) = parse_compound(tokens[0].1) {
+                    if !simples.iter().any(|s| matches!(s, Simple::State(_))) {
                         list.push(simples);
                     }
                 }
@@ -1198,11 +1268,12 @@ fn is_ident(s: &str) -> bool {
 /// for a [`Combinator::Descendant`] edge SOME ancestor (at any depth) must match the next compound
 /// (and matching continues from above that ancestor); for a [`Combinator::Child`] edge the
 /// IMMEDIATE parent must match. A single-compound selector matches iff its subject matches.
-fn complex_matches(parts: &[ComplexPart], target: &MatchTarget) -> bool {
+fn complex_matches(parts: &[ComplexPart], target: &MatchTarget, states: ElementStates) -> bool {
     let Some((subject, rest)) = parts.split_last() else {
         return false;
     };
-    if !compound_matches(&subject.simples, &target.own) {
+    // The subject is the resolved element, so its dynamic-state pseudos are checked against `states`.
+    if !compound_matches(&subject.simples, &target.own, states) {
         return false;
     }
     // The combinator on each compound describes how it relates to the compound on its RIGHT; so
@@ -1218,7 +1289,9 @@ fn complex_matches(parts: &[ComplexPart], target: &MatchTarget) -> bool {
                 let Some(parent) = ancestors.get(cursor) else {
                     return false;
                 };
-                if !compound_matches(&part.simples, parent) {
+                // Ancestor compounds never carry a dynamic-state pseudo (those are subject-only),
+                // so the default (no-state) `ElementStates` is correct here.
+                if !compound_matches(&part.simples, parent, ElementStates::default()) {
                     return false;
                 }
                 cursor += 1;
@@ -1227,7 +1300,7 @@ fn complex_matches(parts: &[ComplexPart], target: &MatchTarget) -> bool {
                 // Some ancestor at or above the cursor must match; continue from above it.
                 let mut found = None;
                 for (offset, anc) in ancestors[cursor..].iter().enumerate() {
-                    if compound_matches(&part.simples, anc) {
+                    if compound_matches(&part.simples, anc, ElementStates::default()) {
                         found = Some(cursor + offset + 1);
                         break;
                     }
@@ -1247,15 +1320,17 @@ fn complex_matches(parts: &[ComplexPart], target: &MatchTarget) -> bool {
 /// Type names are matched ASCII case-insensitively (`BUTTON` matches `<button>`), per HTML's
 /// case-insensitive tag names. Classes, ids, and attribute names/values stay case-**sensitive**,
 /// per CSS.
-fn compound_matches(simples: &[Simple], identity: &ElementIdentity) -> bool {
+fn compound_matches(simples: &[Simple], identity: &ElementIdentity, states: ElementStates) -> bool {
     simples
         .iter()
-        .all(|simple| simple_matches(simple, identity))
+        .all(|simple| simple_matches(simple, identity, states))
 }
 
-/// Whether a single simple selector matches `identity`. Factored out of [`compound_matches`] so the
-/// functional pseudos (`:not`/`:is`/`:where`) can re-use it against their inner compounds.
-fn simple_matches(simple: &Simple, identity: &ElementIdentity) -> bool {
+/// Whether a single simple selector matches `identity` given the element's current dynamic
+/// `states`. Factored out of [`compound_matches`] so the functional pseudos (`:not`/`:is`/`:where`)
+/// can re-use it against their inner compounds. A [`Simple::State`] consults `states`; every other
+/// simple consults `identity` only.
+fn simple_matches(simple: &Simple, identity: &ElementIdentity, states: ElementStates) -> bool {
     match simple {
         Simple::Type(t) => identity
             .type_name
@@ -1264,7 +1339,8 @@ fn simple_matches(simple: &Simple, identity: &ElementIdentity) -> bool {
         Simple::Class(c) => identity.classes.contains(&c.as_str()),
         Simple::Attr(attr) => attr_matches(attr, identity.attrs),
         Simple::Structural(s) => structural_matches(*s, identity.structure),
-        Simple::Functional(f) => functional_matches(f, identity),
+        Simple::Functional(f) => functional_matches(f, identity, states),
+        Simple::State(p) => states.satisfies(*p),
     }
 }
 
@@ -1313,12 +1389,13 @@ fn nth_matches(nth: Nth, i: u32) -> bool {
 /// Whether a functional pseudo (`:not`/`:is`/`:where`) matches `identity`: `:not` matches when NONE
 /// of its inner compounds match; `:is`/`:where` match when ANY does. Each inner compound is matched
 /// against the element's own identity (the functional arg is scoped to a single compound — no tree
-/// walk needed).
-fn functional_matches(f: &Functional, identity: &ElementIdentity) -> bool {
+/// walk needed). `states` is threaded for completeness, but a dynamic-state pseudo inside a
+/// functional arg is dropped at parse time (see [`parse_functional`]), so it never reaches here.
+fn functional_matches(f: &Functional, identity: &ElementIdentity, states: ElementStates) -> bool {
     let any = f
         .list
         .iter()
-        .any(|compound| compound.iter().all(|s| simple_matches(s, identity)));
+        .any(|compound| compound.iter().all(|s| simple_matches(s, identity, states)));
     match f.kind {
         FunctionalKind::Not => !any,
         FunctionalKind::Is | FunctionalKind::Where => any,
@@ -2572,7 +2649,7 @@ mod tests {
         let sheet =
             parse("button { background:#111111 } #go { color:#222222 } .btn { padding:4px }");
         let hit = MatchTarget::new(Some("button"), Some("go"), &["btn"]);
-        let r = sheet.resolve_for(&hit, false);
+        let r = sheet.resolve_for(&hit, ElementStates::default());
         assert!(
             r.contains(&(BG, "#111111".to_string())),
             "type selector matched"
@@ -2587,7 +2664,9 @@ mod tests {
         );
         let miss = MatchTarget::new(Some("div"), None, &[]);
         assert!(
-            sheet.resolve_for(&miss, false).is_empty(),
+            sheet
+                .resolve_for(&miss, ElementStates::default())
+                .is_empty(),
             "no selector matches a bare div"
         );
     }
@@ -2597,17 +2676,21 @@ mod tests {
         let sheet = parse("button.primary { background:#abcdef }");
         let both = MatchTarget::new(Some("button"), None, &["primary"]);
         assert_eq!(
-            sheet.resolve_for(&both, false),
+            sheet.resolve_for(&both, ElementStates::default()),
             vec![(BG, "#abcdef".to_string())]
         );
         let only_type = MatchTarget::new(Some("button"), None, &[]);
         assert!(
-            sheet.resolve_for(&only_type, false).is_empty(),
+            sheet
+                .resolve_for(&only_type, ElementStates::default())
+                .is_empty(),
             "missing the .primary class"
         );
         let only_class = MatchTarget::new(Some("div"), None, &["primary"]);
         assert!(
-            sheet.resolve_for(&only_class, false).is_empty(),
+            sheet
+                .resolve_for(&only_class, ElementStates::default())
+                .is_empty(),
             "wrong type"
         );
     }
@@ -2621,7 +2704,7 @@ mod tests {
         );
         let hit = MatchTarget::new(Some("button"), Some("x"), &["c"]);
         assert_eq!(
-            sheet.resolve_for(&hit, false),
+            sheet.resolve_for(&hit, ElementStates::default()),
             vec![(BG, "#111111".to_string())]
         );
     }
@@ -2636,7 +2719,7 @@ mod tests {
         ];
         for target in &targets {
             assert_eq!(
-                sheet.resolve_for(target, false),
+                sheet.resolve_for(target, ElementStates::default()),
                 vec![(FG, "#445566".to_string())]
             );
         }
@@ -2655,23 +2738,27 @@ mod tests {
         let parent_card = [card];
         let inside = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent_card);
         assert_eq!(
-            sheet.resolve_for(&inside, false),
+            sheet.resolve_for(&inside, ElementStates::default()),
             vec![(FG, "#abcdef".to_string())]
         );
         // A `.title` nested deeper (grandparent is the `.card`) still matches (any depth).
         let deep_chain = [wrapper, card];
         let deep = MatchTarget::new(None, None, &["title"]).with_ancestors(&deep_chain);
         assert_eq!(
-            sheet.resolve_for(&deep, false),
+            sheet.resolve_for(&deep, ElementStates::default()),
             vec![(FG, "#abcdef".to_string())]
         );
         // A `.title` with no `.card` ancestor does NOT match.
         let no_card = [wrapper];
         let outside = MatchTarget::new(None, None, &["title"]).with_ancestors(&no_card);
-        assert!(sheet.resolve_for(&outside, false).is_empty());
+        assert!(sheet
+            .resolve_for(&outside, ElementStates::default())
+            .is_empty());
         // A `.title` with NO ancestors does not match either.
         let bare = MatchTarget::new(None, None, &["title"]);
-        assert!(sheet.resolve_for(&bare, false).is_empty());
+        assert!(sheet
+            .resolve_for(&bare, ElementStates::default())
+            .is_empty());
     }
 
     #[test]
@@ -2684,14 +2771,16 @@ mod tests {
         let parent_nav = [nav];
         let direct = MatchTarget::new(None, None, &["item"]).with_ancestors(&parent_nav);
         assert_eq!(
-            sheet.resolve_for(&direct, false),
+            sheet.resolve_for(&direct, ElementStates::default()),
             vec![(BG, "#222222".to_string())]
         );
         // A `.item` whose immediate parent is a `.list` (nav is the grandparent): NO match.
         let list_then_nav = [list, nav];
         let grandchild = MatchTarget::new(None, None, &["item"]).with_ancestors(&list_then_nav);
         assert!(
-            sheet.resolve_for(&grandchild, false).is_empty(),
+            sheet
+                .resolve_for(&grandchild, ElementStates::default())
+                .is_empty(),
             "child combinator requires the immediate parent"
         );
     }
@@ -2709,13 +2798,15 @@ mod tests {
         let chain = [inner, card, root];
         let hit = MatchTarget::new(None, None, &["title"]).with_ancestors(&chain);
         assert_eq!(
-            sheet.resolve_for(&hit, false),
+            sheet.resolve_for(&hit, ElementStates::default()),
             vec![(FG, "#0a0b0c".to_string())]
         );
         // If `.card` is NOT a direct child of root (a wrapper sits between), the `>` edge fails.
         let chain_with_wrap = [inner, card, wrap, root];
         let miss = MatchTarget::new(None, None, &["title"]).with_ancestors(&chain_with_wrap);
-        assert!(sheet.resolve_for(&miss, false).is_empty());
+        assert!(sheet
+            .resolve_for(&miss, ElementStates::default())
+            .is_empty());
     }
 
     #[test]
@@ -2727,7 +2818,7 @@ mod tests {
         let parent_card = [card];
         let target = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent_card);
         assert_eq!(
-            sheet.resolve_for(&target, false),
+            sheet.resolve_for(&target, ElementStates::default()),
             vec![(FG, "#222222".to_string())],
             "the 2-compound rule outranks the 1-compound rule by specificity"
         );
@@ -2737,7 +2828,7 @@ mod tests {
         let parent_nav = [nav];
         let item = MatchTarget::new(None, None, &["item", "lead"]).with_ancestors(&parent_nav);
         assert_eq!(
-            sheet2.resolve_for(&item, false),
+            sheet2.resolve_for(&item, ElementStates::default()),
             vec![(FG, "#333333".to_string())]
         );
     }
@@ -2748,15 +2839,19 @@ mod tests {
         let role_attr = [("data-role", "nav")];
         let with = MatchTarget::new(Some("div"), None, &[]).with_attrs(&role_attr);
         assert_eq!(
-            sheet.resolve_for(&with, false),
+            sheet.resolve_for(&with, ElementStates::default()),
             vec![(BG, "#010203".to_string())]
         );
         let other_attr = [("other", "x")];
         let without = MatchTarget::new(Some("div"), None, &[]).with_attrs(&other_attr);
-        assert!(sheet.resolve_for(&without, false).is_empty());
+        assert!(sheet
+            .resolve_for(&without, ElementStates::default())
+            .is_empty());
         // No attribute context at all: the attribute selector cannot match.
         let none = MatchTarget::new(Some("div"), None, &[]);
-        assert!(sheet.resolve_for(&none, false).is_empty());
+        assert!(sheet
+            .resolve_for(&none, ElementStates::default())
+            .is_empty());
     }
 
     #[test]
@@ -2765,13 +2860,15 @@ mod tests {
         let nav_attr = [("data-role", "nav")];
         let hit = MatchTarget::new(None, None, &[]).with_attrs(&nav_attr);
         assert_eq!(
-            sheet.resolve_for(&hit, false),
+            sheet.resolve_for(&hit, ElementStates::default()),
             vec![(FG, "#445566".to_string())]
         );
         // A different value does not match exact.
         let main_attr = [("data-role", "main")];
         let miss = MatchTarget::new(None, None, &[]).with_attrs(&main_attr);
-        assert!(sheet.resolve_for(&miss, false).is_empty());
+        assert!(sheet
+            .resolve_for(&miss, ElementStates::default())
+            .is_empty());
     }
 
     #[test]
@@ -2784,7 +2881,7 @@ mod tests {
         // prefix: starts with https
         let all_attr = [("href", "https://example.com/docs/x.pdf")];
         let pre = MatchTarget::new(Some("a"), None, &[]).with_attrs(&all_attr);
-        let r = sheet.resolve_for(&pre, false);
+        let r = sheet.resolve_for(&pre, ElementStates::default());
         // All three match this url (starts with https, ends with .pdf, contains docs); the last in
         // source order wins on equal specificity (each is type+attr = (0,1,1)).
         assert_eq!(r, vec![(FG, "#333333".to_string())]);
@@ -2793,14 +2890,14 @@ mod tests {
         let pre_attr = [("href", "https://example.com/page")];
         let only_pre = MatchTarget::new(Some("a"), None, &[]).with_attrs(&pre_attr);
         assert_eq!(
-            sheet.resolve_for(&only_pre, false),
+            sheet.resolve_for(&only_pre, ElementStates::default()),
             vec![(FG, "#111111".to_string())]
         );
         // A url matching only the suffix rule.
         let suf_attr = [("href", "ftp://host/file.pdf")];
         let only_suf = MatchTarget::new(Some("a"), None, &[]).with_attrs(&suf_attr);
         assert_eq!(
-            sheet.resolve_for(&only_suf, false),
+            sheet.resolve_for(&only_suf, ElementStates::default()),
             vec![(FG, "#222222".to_string())]
         );
     }
@@ -2813,7 +2910,7 @@ mod tests {
         let data_x = [("data-x", "1")];
         let target = MatchTarget::new(Some("div"), None, &[]).with_attrs(&data_x);
         assert_eq!(
-            sheet.resolve_for(&target, false),
+            sheet.resolve_for(&target, ElementStates::default()),
             vec![(FG, "#222222".to_string())]
         );
     }
@@ -2825,22 +2922,34 @@ mod tests {
         let sheet = parse(".a { color:#445566 } button { background:#111111 } #x { padding:4px }");
         // Class only.
         assert_eq!(
-            sheet.resolve_for(&MatchTarget::new(None, None, &["a"]), false),
+            sheet.resolve_for(
+                &MatchTarget::new(None, None, &["a"]),
+                ElementStates::default()
+            ),
             vec![(FG, "#445566".to_string())]
         );
         // Type only.
         assert_eq!(
-            sheet.resolve_for(&MatchTarget::new(Some("button"), None, &[]), false),
+            sheet.resolve_for(
+                &MatchTarget::new(Some("button"), None, &[]),
+                ElementStates::default()
+            ),
             vec![(BG, "#111111".to_string())]
         );
         // Id only.
         assert_eq!(
-            sheet.resolve_for(&MatchTarget::new(None, Some("x"), &[]), false),
+            sheet.resolve_for(
+                &MatchTarget::new(None, Some("x"), &[]),
+                ElementStates::default()
+            ),
             vec![(PADDING, "4".to_string())]
         );
         // A non-matching target stays empty.
         assert!(sheet
-            .resolve_for(&MatchTarget::new(Some("div"), None, &["nope"]), false)
+            .resolve_for(
+                &MatchTarget::new(Some("div"), None, &["nope"]),
+                ElementStates::default()
+            )
             .is_empty());
     }
 
@@ -3109,7 +3218,7 @@ mod tests {
         );
         // The id rule wins despite appearing later and having far fewer simple selectors.
         assert_eq!(
-            sheet.resolve_for(&target, false),
+            sheet.resolve_for(&target, ElementStates::default()),
             vec![(BG, "#111111".to_string())]
         );
     }
@@ -3120,7 +3229,7 @@ mod tests {
         let sheet = parse("BUTTON { background:#abcdef }");
         let target = MatchTarget::new(Some("button"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&target, false),
+            sheet.resolve_for(&target, ElementStates::default()),
             vec![(BG, "#abcdef".to_string())]
         );
     }
@@ -3130,7 +3239,9 @@ mod tests {
         // Classes remain case-sensitive per CSS: `.Btn` does not match the `btn` class.
         let sheet = parse(".Btn { background:#abcdef }");
         let target = MatchTarget::new(None, None, &["btn"]);
-        assert!(sheet.resolve_for(&target, false).is_empty());
+        assert!(sheet
+            .resolve_for(&target, ElementStates::default())
+            .is_empty());
     }
 
     #[test]
@@ -3141,6 +3252,205 @@ mod tests {
             vec![(BG, "#585b70".to_string())]
         );
         assert!(sheet.resolve(&["btn"], false).is_empty(), "base unaffected");
+    }
+
+    // --- Wave 3c: interaction-state pseudo-classes -------------------------
+
+    #[test]
+    fn focus_pseudo_applies_only_when_the_focus_state_is_set() {
+        // `.btn:focus` joins the cascade only when ElementStates.focus is true.
+        let sheet = parse(".btn { background:#313244 } .btn:focus { background:#89b4fa }");
+        let target = MatchTarget::new(None, None, &["btn"]);
+        // No state -> base only.
+        assert_eq!(
+            sheet.resolve_for(&target, ElementStates::default()),
+            vec![(BG, "#313244".to_string())]
+        );
+        // focus set -> the :focus rule overrides the base background.
+        assert_eq!(
+            sheet.resolve_for(
+                &target,
+                ElementStates {
+                    focus: true,
+                    ..ElementStates::default()
+                }
+            ),
+            vec![(BG, "#89b4fa".to_string())]
+        );
+        // hover set but NOT focus -> the :focus rule does not apply.
+        assert_eq!(
+            sheet.resolve_for(
+                &target,
+                ElementStates {
+                    hover: true,
+                    ..ElementStates::default()
+                }
+            ),
+            vec![(BG, "#313244".to_string())],
+            "hover does not satisfy :focus"
+        );
+    }
+
+    #[test]
+    fn active_pseudo_applies_only_when_the_active_state_is_set() {
+        let sheet = parse("button { background:#111111 } button:active { background:#f38ba8 }");
+        let target = MatchTarget::new(Some("button"), None, &[]);
+        assert_eq!(
+            sheet.resolve_for(&target, ElementStates::default()),
+            vec![(BG, "#111111".to_string())]
+        );
+        assert_eq!(
+            sheet.resolve_for(
+                &target,
+                ElementStates {
+                    active: true,
+                    ..ElementStates::default()
+                }
+            ),
+            vec![(BG, "#f38ba8".to_string())]
+        );
+    }
+
+    #[test]
+    fn composed_state_pseudos_require_all_listed_states() {
+        // `button:hover:focus` matches only when BOTH hover AND focus are set.
+        let sheet = parse("button:hover:focus { background:#a6e3a1 }");
+        let target = MatchTarget::new(Some("button"), None, &[]);
+        let only = |hover: bool, focus: bool| {
+            sheet.resolve_for(
+                &target,
+                ElementStates {
+                    hover,
+                    focus,
+                    active: false,
+                },
+            )
+        };
+        assert!(only(false, false).is_empty(), "neither -> no match");
+        assert!(only(true, false).is_empty(), "hover alone -> no match");
+        assert!(only(false, true).is_empty(), "focus alone -> no match");
+        assert_eq!(
+            only(true, true),
+            vec![(BG, "#a6e3a1".to_string())],
+            "hover AND focus -> matches"
+        );
+    }
+
+    #[test]
+    fn disabled_and_checked_match_by_attribute_presence_not_dynamic_state() {
+        // `:disabled` / `:checked` are attribute-driven: a node carrying a `disabled` / `checked`
+        // attribute matches with NO ElementStates needed (states stay default).
+        let sheet = parse("input:disabled { background:#45475a } input:checked { color:#a6e3a1 }");
+        let disabled_attr = [("disabled", "")];
+        let disabled = MatchTarget::new(Some("input"), None, &[]).with_attrs(&disabled_attr);
+        assert_eq!(
+            sheet.resolve_for(&disabled, ElementStates::default()),
+            vec![(BG, "#45475a".to_string())],
+            ":disabled matches a node with a `disabled` attribute (no host state)"
+        );
+        let checked_attr = [("checked", "true")];
+        let checked = MatchTarget::new(Some("input"), None, &[]).with_attrs(&checked_attr);
+        assert_eq!(
+            sheet.resolve_for(&checked, ElementStates::default()),
+            vec![(FG, "#a6e3a1".to_string())],
+            ":checked matches a node with a `checked` attribute (value ignored)"
+        );
+        // An input with neither attribute matches neither rule, even with every dynamic state set.
+        let plain = MatchTarget::new(Some("input"), None, &[]);
+        assert!(
+            sheet
+                .resolve_for(
+                    &plain,
+                    ElementStates {
+                        hover: true,
+                        focus: true,
+                        active: true,
+                    }
+                )
+                .is_empty(),
+            ":disabled/:checked are not dynamic states, so no flag makes them match"
+        );
+    }
+
+    #[test]
+    fn state_pseudo_adds_class_level_specificity() {
+        // `button:focus` ((0,1,1)) beats a bare `button` ((0,0,1)) on the same property when focused.
+        let sheet = parse("button { color:#111111 } button:focus { color:#222222 }");
+        let target = MatchTarget::new(Some("button"), None, &[]);
+        assert_eq!(
+            sheet.resolve_for(
+                &target,
+                ElementStates {
+                    focus: true,
+                    ..ElementStates::default()
+                }
+            ),
+            vec![(FG, "#222222".to_string())],
+            "button:focus outranks bare button by the state pseudo's class-level specificity"
+        );
+    }
+
+    #[test]
+    fn legacy_resolve_maps_hovered_bool_onto_element_states() {
+        // The class-only `resolve(classes, hovered)` wrapper still honors a `:hover` rule via the
+        // hover flag, but a `:focus` rule never fires through it (only hover is mapped).
+        let sheet = parse(
+            ".btn { background:#313244 } .btn:hover { background:#585b70 } \
+             .btn:focus { background:#89b4fa }",
+        );
+        assert_eq!(
+            sheet.resolve(&["btn"], true),
+            vec![(BG, "#585b70".to_string())],
+            "hovered=true maps onto ElementStates.hover, firing :hover"
+        );
+        assert_eq!(
+            sheet.resolve(&["btn"], false),
+            vec![(BG, "#313244".to_string())],
+            ":focus never fires through the hover-only legacy wrapper"
+        );
+    }
+
+    #[test]
+    fn state_pseudo_on_a_non_subject_compound_drops_the_selector() {
+        // A dynamic-state pseudo is only honored on the subject compound. `.card:hover .title` is
+        // unsupported (state on a non-subject compound), so the whole rule is dropped — the plain
+        // companion rule still applies.
+        let sheet = parse(".card:hover .title { color:#000000 } .title { color:#abcdef }");
+        let parent = [ElementIdentity::new(None, None, &["card"])];
+        let title = MatchTarget::new(None, None, &["title"]).with_ancestors(&parent);
+        assert_eq!(
+            sheet.resolve_for(
+                &title,
+                ElementStates {
+                    hover: true,
+                    ..ElementStates::default()
+                }
+            ),
+            vec![(FG, "#abcdef".to_string())],
+            "the `.card:hover .title` rule was dropped; the plain `.title` rule still applies"
+        );
+    }
+
+    #[test]
+    fn reacts_to_hover_only_fires_for_hover_rules() {
+        // `reacts_to_hover` is the hover-registration predicate canopy-ui relies on: true when a
+        // class has a `:hover` rule, false for `:focus`/`:active`/base-only.
+        let hover = parse(".btn:hover { background:#585b70 }");
+        assert!(hover.reacts_to_hover(&["btn"]), ":hover rule -> reactive");
+        assert!(
+            !hover.reacts_to_hover(&["other"]),
+            "a class with no :hover rule is not reactive"
+        );
+        let focus = parse(".btn:focus { background:#89b4fa }");
+        assert!(
+            !focus.reacts_to_hover(&["btn"]),
+            ":focus is not a :hover rule, so reacts_to_hover stays false"
+        );
+        let base = parse(".btn { background:#313244 }");
+        assert!(
+            !base.reacts_to_hover(&["btn"]),
+            "a base-only class does not react to hover"
+        );
     }
 
     // --- New keyword + numeric props ---------------------------------------
@@ -3478,9 +3788,10 @@ mod tests {
 
     #[test]
     fn unknown_pseudo_class_rule_is_dropped() {
-        // `:focus` is outside the subset: the whole rule is dropped, and it must not
-        // be mistaken for a base `.btn` rule.
-        let sheet = parse(".btn:focus { background:#000000 } .btn { background:#313244 }");
+        // `:focus-within` is outside the subset: the whole rule is dropped, and it must not
+        // be mistaken for a base `.btn` rule. (`:focus`/`:active` ARE supported now — see the
+        // state-pseudo tests below.)
+        let sheet = parse(".btn:focus-within { background:#000000 } .btn { background:#313244 }");
         assert_eq!(sheet.declarations("btn"), &[(BG, "#313244".to_string())]);
         assert_eq!(
             sheet.resolve(&["btn"], true),
@@ -3629,7 +3940,7 @@ mod tests {
         let resolve = |index: u32, count: u32| {
             sheet.resolve_for(
                 &MatchTarget::new(Some("li"), None, &[]).with_structure(index, count, 0),
-                false,
+                ElementStates::default(),
             )
         };
         // First of three -> :first-child.
@@ -3653,7 +3964,7 @@ mod tests {
             !sheet
                 .resolve_for(
                     &MatchTarget::new(Some("li"), None, &[]).with_structure(index, count, 0),
-                    false,
+                    ElementStates::default(),
                 )
                 .is_empty()
         };
@@ -3680,7 +3991,7 @@ mod tests {
                     !sheet
                         .resolve_for(
                             &MatchTarget::new(Some("li"), None, &[]).with_structure(i, count, 0),
-                            false,
+                            ElementStates::default(),
                         )
                         .is_empty()
                 })
@@ -3704,12 +4015,14 @@ mod tests {
         // A div with no children matches :empty.
         let empty = MatchTarget::new(Some("div"), None, &[]).with_structure(0, 1, 0);
         assert_eq!(
-            sheet.resolve_for(&empty, false),
+            sheet.resolve_for(&empty, ElementStates::default()),
             vec![(FG, "#445566".to_string())]
         );
         // A div WITH children does not.
         let parent = MatchTarget::new(Some("div"), None, &[]).with_structure(0, 1, 2);
-        assert!(sheet.resolve_for(&parent, false).is_empty());
+        assert!(sheet
+            .resolve_for(&parent, ElementStates::default())
+            .is_empty());
     }
 
     #[test]
@@ -3719,7 +4032,9 @@ mod tests {
         let sheet = parse("li:first-child { color:#111111 } li:nth-child(2n) { color:#222222 }");
         let no_info = MatchTarget::new(Some("li"), None, &[]); // no .with_structure
         assert!(
-            sheet.resolve_for(&no_info, false).is_empty(),
+            sheet
+                .resolve_for(&no_info, ElementStates::default())
+                .is_empty(),
             "no structural info -> structural pseudos do not match"
         );
     }
@@ -3730,13 +4045,15 @@ mod tests {
         let sheet = parse("a:not(.disabled) { color:#123456 }");
         let plain = MatchTarget::new(Some("a"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&plain, false),
+            sheet.resolve_for(&plain, ElementStates::default()),
             vec![(FG, "#123456".to_string())],
             "a without .disabled is styled"
         );
         let disabled = MatchTarget::new(Some("a"), None, &["disabled"]);
         assert!(
-            sheet.resolve_for(&disabled, false).is_empty(),
+            sheet
+                .resolve_for(&disabled, ElementStates::default())
+                .is_empty(),
             ":not(.disabled) excludes the .disabled anchor"
         );
     }
@@ -3749,17 +4066,17 @@ mod tests {
         let b = MatchTarget::new(None, None, &["b"]);
         let c = MatchTarget::new(None, None, &["c"]);
         assert_eq!(
-            sheet.resolve_for(&a, false),
+            sheet.resolve_for(&a, ElementStates::default()),
             vec![(FG, "#0099ff".to_string())],
             ":is matches .a"
         );
         assert_eq!(
-            sheet.resolve_for(&b, false),
+            sheet.resolve_for(&b, ElementStates::default()),
             vec![(FG, "#0099ff".to_string())],
             ":is matches .b"
         );
         assert!(
-            sheet.resolve_for(&c, false).is_empty(),
+            sheet.resolve_for(&c, ElementStates::default()).is_empty(),
             ":is does not match an element with neither class"
         );
     }
@@ -3773,19 +4090,19 @@ mod tests {
         let sheet = parse(":where(.high) { color:#ffffff } .low { color:#000000 }");
         let both = MatchTarget::new(None, None, &["high", "low"]);
         assert_eq!(
-            sheet.resolve_for(&both, false),
+            sheet.resolve_for(&both, ElementStates::default()),
             vec![(FG, "#000000".to_string())],
             ":where adds 0 specificity, so the plain .low class rule wins"
         );
         // Sanity: :where still FILTERS — an element without .high is not matched by the :where rule.
         let only_low = MatchTarget::new(None, None, &["low"]);
         assert_eq!(
-            sheet.resolve_for(&only_low, false),
+            sheet.resolve_for(&only_low, ElementStates::default()),
             vec![(FG, "#000000".to_string())]
         );
         let only_high = MatchTarget::new(None, None, &["high"]);
         assert_eq!(
-            sheet.resolve_for(&only_high, false),
+            sheet.resolve_for(&only_high, ElementStates::default()),
             vec![(FG, "#ffffff".to_string())],
             ":where(.high) still matches when .high is present"
         );
@@ -3800,7 +4117,7 @@ mod tests {
         let sheet = parse(":is(#hero, .cls) { color:#111111 } .cls { color:#222222 }");
         let target = MatchTarget::new(None, None, &["cls"]);
         assert_eq!(
-            sheet.resolve_for(&target, false),
+            sheet.resolve_for(&target, ElementStates::default()),
             vec![(FG, "#111111".to_string())],
             ":is(#id, .cls) carries the #id specificity and beats a plain .cls rule"
         );
@@ -3813,7 +4130,7 @@ mod tests {
         let sheet = parse("a { color:#111111 } a:not(.x) { color:#222222 }");
         let plain_a = MatchTarget::new(Some("a"), None, &[]);
         assert_eq!(
-            sheet.resolve_for(&plain_a, false),
+            sheet.resolve_for(&plain_a, ElementStates::default()),
             vec![(FG, "#222222".to_string())],
             "a:not(.x) outranks a bare a by the :not argument's class specificity"
         );
@@ -3827,7 +4144,7 @@ mod tests {
         let sheet = parse(":is(.a, .b > .c) { color:#334455 }");
         let a = MatchTarget::new(None, None, &["a"]);
         assert_eq!(
-            sheet.resolve_for(&a, false),
+            sheet.resolve_for(&a, ElementStates::default()),
             vec![(FG, "#334455".to_string())],
             "the valid single-compound `.a` entry is kept"
         );
@@ -3835,7 +4152,7 @@ mod tests {
         // the whole `.b > .c` entry was dropped.
         let c = MatchTarget::new(None, None, &["c"]);
         assert!(
-            sheet.resolve_for(&c, false).is_empty(),
+            sheet.resolve_for(&c, ElementStates::default()).is_empty(),
             "the combinator entry was dropped, so .c does not match via :is"
         );
     }
@@ -3887,7 +4204,7 @@ mod tests {
         // Decls are returned in first-appearance order across matched rules (lowest specificity
         // applied first): `button` (BG) folds before `.a` (FG).
         assert_eq!(
-            sheet.resolve_for(&with_struct, false),
+            sheet.resolve_for(&with_struct, ElementStates::default()),
             vec![(BG, "#111111".to_string()), (FG, "#445566".to_string())],
             "structure info present but unused by a plain sheet -> same result"
         );
@@ -3899,7 +4216,7 @@ mod tests {
         let sheet = parse("li { color:#111111 } li:first-child { color:#222222 }");
         let first = MatchTarget::new(Some("li"), None, &[]).with_structure(0, 3, 0);
         assert_eq!(
-            sheet.resolve_for(&first, false),
+            sheet.resolve_for(&first, ElementStates::default()),
             vec![(FG, "#222222".to_string())],
             "li:first-child outranks bare li by the pseudo's class-level specificity"
         );
@@ -3908,18 +4225,19 @@ mod tests {
     #[test]
     fn malformed_pseudo_rules_are_dropped_not_mistaken_for_a_base() {
         // A `::before` pseudo-ELEMENT (double colon -> empty pseudo name), an unbalanced `:not(`,
-        // and a bogus `:nth-child(2x)` all drop their selector cleanly. The companion plain rule
-        // still parses, proving the bad selector did not poison the sheet.
+        // a bogus `:nth-child(2x)`, and a still-unsupported `:focus-within` all drop their selector
+        // cleanly. The companion plain rule still parses, proving the bad selector did not poison
+        // the sheet.
         for bad in [
             "p::before { color:#000000 } p { color:#abcdef }",
             "p:not(.x { color:#000000 } p { color:#abcdef }",
             "p:nth-child(2x) { color:#000000 } p { color:#abcdef }",
-            "p:focus { color:#000000 } p { color:#abcdef }",
+            "p:focus-within { color:#000000 } p { color:#abcdef }",
         ] {
             let sheet = parse(bad);
             let p = MatchTarget::new(Some("p"), None, &[]).with_structure(0, 1, 0);
             assert_eq!(
-                sheet.resolve_for(&p, false),
+                sheet.resolve_for(&p, ElementStates::default()),
                 vec![(FG, "#abcdef".to_string())],
                 "the bad selector in `{bad}` was dropped; the plain `p` rule still applies"
             );
@@ -3936,14 +4254,16 @@ mod tests {
         // A `.a` nested under a `.card` matches.
         let inside = MatchTarget::new(None, None, &["a"]).with_ancestors(&parent_card);
         assert_eq!(
-            sheet.resolve_for(&inside, false),
+            sheet.resolve_for(&inside, ElementStates::default()),
             vec![(FG, "#123456".to_string())],
             ":is(.a,.b) under a .card matches via the descendant combinator"
         );
         // A `.b` with no `.card` ancestor does NOT match (the combinator is unsatisfied).
         let no_card = MatchTarget::new(None, None, &["b"]);
         assert!(
-            sheet.resolve_for(&no_card, false).is_empty(),
+            sheet
+                .resolve_for(&no_card, ElementStates::default())
+                .is_empty(),
             ":is(.a,.b) with no .card ancestor does not match"
         );
     }
@@ -3956,11 +4276,13 @@ mod tests {
         let not_sheet = parse("p:not() { color:#222222 }");
         let p = MatchTarget::new(Some("p"), None, &[]);
         assert!(
-            is_sheet.resolve_for(&p, false).is_empty(),
+            is_sheet
+                .resolve_for(&p, ElementStates::default())
+                .is_empty(),
             ":is() matches nothing"
         );
         assert_eq!(
-            not_sheet.resolve_for(&p, false),
+            not_sheet.resolve_for(&p, ElementStates::default()),
             vec![(FG, "#222222".to_string())],
             ":not() matches everything (no inner compound to exclude)"
         );

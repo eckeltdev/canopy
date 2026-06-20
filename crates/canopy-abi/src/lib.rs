@@ -71,7 +71,7 @@ use std::collections::BTreeMap;
 use canopy_dom::{Dom, ROOT};
 use canopy_protocol::{AttrId, EventKind, EventPayload, NodeId, Op, OpEncoder, PropId};
 use canopy_render_soft::SoftwareRenderer;
-use canopy_style_css::{ElementIdentity, MatchTarget, Stylesheet};
+use canopy_style_css::{ElementIdentity, ElementStates, MatchTarget, Stylesheet};
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
@@ -134,6 +134,12 @@ pub struct CanopyHost {
     /// The node currently under the pointer (set via [`canopy_host_hover`]); its `:hover` rules
     /// (and its ancestors') apply during the cascade. `None` when the pointer is outside the tree.
     hovered: Option<NodeId>,
+    /// The node that currently has keyboard focus (set via [`CanopyHost::set_focus`]); its `:focus`
+    /// rules apply during the cascade. `None` when nothing is focused.
+    focused: Option<NodeId>,
+    /// The node currently being activated/pressed (set via [`CanopyHost::set_active`]); its
+    /// `:active` rules apply during the cascade. `None` when nothing is active.
+    active: Option<NodeId>,
 }
 
 impl CanopyHost {
@@ -148,6 +154,8 @@ impl CanopyHost {
             event_seq: 0,
             stylesheet: None,
             hovered: None,
+            focused: None,
+            active: None,
         }
     }
 
@@ -186,6 +194,8 @@ impl CanopyHost {
                 &dom,
                 sheet,
                 &hover_path,
+                self.focused,
+                self.active,
                 child,
                 idx as u32,
                 root_count,
@@ -228,6 +238,30 @@ impl CanopyHost {
             return false;
         }
         self.hovered = hit;
+        true
+    }
+
+    /// Set (or clear, with `None`) the node that has keyboard focus, so a later render applies its
+    /// `:focus` rules. Mirrors [`set_hover`](Self::set_hover): returns `true` if the focused node
+    /// changed (the caller should re-render to reflect it) and `false` if it did not (the render can
+    /// be skipped). Unlike hover, focus is not hit-tested off a coordinate — the caller decides
+    /// which node is focused (e.g. on a tab/click) and names it here.
+    pub fn set_focus(&mut self, node: Option<NodeId>) -> bool {
+        if node == self.focused {
+            return false;
+        }
+        self.focused = node;
+        true
+    }
+
+    /// Set (or clear, with `None`) the node being activated (pressed), so a later render applies its
+    /// `:active` rules. Mirrors [`set_hover`](Self::set_hover)/[`set_focus`](Self::set_focus):
+    /// returns `true` if the active node changed (re-render) and `false` if it did not.
+    pub fn set_active(&mut self, node: Option<NodeId>) -> bool {
+        if node == self.active {
+            return false;
+        }
+        self.active = node;
         true
     }
 
@@ -405,7 +439,11 @@ fn element_type_name(node: &canopy_dom::Node) -> Option<&str> {
 /// Walk `node`'s subtree top-down (parent before children), folding the lite cascade into
 /// `overlay`, threading inherited properties down through `inherited`, and threading the
 /// **ancestor stack** (`ancestors`, root-first) down so descendant/child combinators and the
-/// node's attribute pairs join its [`MatchTarget`]. `sibling_index` (0-based) and `sibling_count`
+/// node's attribute pairs join its [`MatchTarget`]. The interaction-state pseudo-classes are fed
+/// from `hover_path` (every node on the hovered-leaf-to-root chain matches `:hover`) and the
+/// `focused` / `active` node ids (the focused / active node itself matches `:focus` / `:active`);
+/// `:disabled` / `:checked` resolve off the node's own attributes, needing no state here.
+/// `sibling_index` (0-based) and `sibling_count`
 /// give the node's position among its siblings; together with its own child count they are threaded
 /// via [`MatchTarget::with_structure`] so the structural pseudo-classes (`:first-child`,
 /// `:nth-child`, `:empty`, …) resolve on the host path.
@@ -428,6 +466,8 @@ fn collect_cascade(
     dom: &Dom,
     sheet: &Stylesheet,
     hover_path: &[NodeId],
+    focused: Option<NodeId>,
+    active: Option<NodeId>,
     node: NodeId,
     sibling_index: u32,
     sibling_count: u32,
@@ -463,7 +503,17 @@ fn collect_cascade(
             .with_attrs(&identity.attrs)
             .with_ancestors(&chain)
             .with_structure(sibling_index, sibling_count, n.children.len() as u32);
-        for (prop, value) in sheet.resolve_for(&target, hover_path.contains(&node)) {
+        // This node's current dynamic interaction state, fed to the state pseudos
+        // (`:hover`/`:focus`/`:active`). `:hover` fires for the node and every ancestor of the
+        // hovered leaf (the hover_path, CSS semantics); `:focus`/`:active` fire only on the focused
+        // / active node itself (no ancestor walk this wave). `:disabled`/`:checked` are NOT here —
+        // they match off this node's `disabled`/`checked` attribute via `target` instead.
+        let states = ElementStates {
+            hover: hover_path.contains(&node),
+            focus: focused == Some(node),
+            active: active == Some(node),
+        };
+        for (prop, value) in sheet.resolve_for(&target, states) {
             // Author inline styles win over class rules (CSS specificity: inline beats a class
             // selector), so only fold in a property the node didn't set itself. The matched-rule
             // value is overlaid onto the live tree below; record it in `own` too so it shadows any
@@ -507,6 +557,8 @@ fn collect_cascade(
             dom,
             sheet,
             hover_path,
+            focused,
+            active,
             child,
             idx as u32,
             child_count,
@@ -517,6 +569,17 @@ fn collect_cascade(
     }
 }
 
+/// The reference-host **attribute** ids whose CSS names the lite cascade understands, beyond the
+/// well-known [`AttrId::ID`] (`1` → `"id"`). These mirror the hardcoded ElementTag→name table in
+/// [`element_type_name`]: there is still no general attr-name registry, but the two
+/// interaction-state attribute pseudos `:disabled` / `:checked` need their attributes exposed under
+/// a CSS name, so a constrained author who emits `SetAttribute(DISABLED_ATTR, …)` matches a
+/// `:disabled` rule. (`:disabled` / `:checked` are presence tests — the attribute's value is
+/// ignored, exactly as in CSS.)
+const DISABLED_ATTR: AttrId = AttrId::new(2);
+/// See [`DISABLED_ATTR`]: the reference-host attribute id whose CSS name is `"checked"`.
+const CHECKED_ATTR: AttrId = AttrId::new(3);
+
 /// One node's borrowed identity for selector matching, owning the small `Vec`s that back the
 /// `&[&str]` / `&[(&str, &str)]` slices [`ElementIdentity`] needs. Strings are borrowed from the
 /// cloned `Dom`, which outlives the whole cascade walk, so an instance can sit on the ancestor
@@ -525,9 +588,11 @@ struct NodeIdentity<'a> {
     type_name: Option<&'a str>,
     id: Option<&'a str>,
     classes: Vec<&'a str>,
-    /// The CSS attribute `(name, value)` pairs. Only the well-known **id** attribute has a known
-    /// CSS name (`"id"`) — there is no attr-name registry for host-minted numeric attr ids yet, so
-    /// other attributes are not exposed to attribute selectors (a documented limitation).
+    /// The CSS attribute `(name, value)` pairs. The well-known **id** attribute (`"id"`) plus the
+    /// interaction-state attributes **disabled** / **checked** (the reference-host ids
+    /// [`DISABLED_ATTR`] / [`CHECKED_ATTR`], surfaced for the `:disabled` / `:checked` pseudos) have
+    /// known CSS names; other host-minted numeric attrs have no name mapping yet, so they are not
+    /// exposed to attribute selectors (a documented limitation).
     attrs: Vec<(&'a str, &'a str)>,
 }
 
@@ -535,9 +600,17 @@ impl<'a> NodeIdentity<'a> {
     /// Derive a node's identity from its retained [`canopy_dom::Node`].
     fn from_node(n: &'a canopy_dom::Node) -> Self {
         let id = n.attrs.get(&AttrId::ID).map(String::as_str);
-        // Expose the id attribute under its CSS name so `[id="x"]` / `[id^="…"]` selectors work.
-        // Other attrs have no CSS-name mapping (no registry), so they are intentionally omitted.
-        let attrs: Vec<(&str, &str)> = id.map(|v| ("id", v)).into_iter().collect();
+        // Expose the id attribute under its CSS name so `[id="x"]` / `[id^="…"]` selectors work,
+        // and the disabled/checked attributes under theirs so `:disabled` / `:checked` (which fold
+        // to a `disabled` / `checked` attribute-presence test) match. Other attrs have no CSS-name
+        // mapping (no registry), so they are intentionally omitted.
+        let mut attrs: Vec<(&str, &str)> = id.map(|v| ("id", v)).into_iter().collect();
+        if let Some(v) = n.attrs.get(&DISABLED_ATTR) {
+            attrs.push(("disabled", v.as_str()));
+        }
+        if let Some(v) = n.attrs.get(&CHECKED_ATTR) {
+            attrs.push(("checked", v.as_str()));
+        }
         Self {
             type_name: element_type_name(n),
             id,
@@ -1367,6 +1440,187 @@ mod tests {
         assert!(
             !host.set_hover(500.0, 500.0),
             "no change reported when hover stays out"
+        );
+    }
+
+    // --- Wave 3c: interaction-state pseudos (:focus/:active/:disabled/:checked) -------------
+    // (reuses the `styled_prop` helper defined later in this test module)
+
+    /// Build a host with a single `.btn` button under ROOT and the given `css`, returning the host
+    /// plus the button node id.
+    fn host_with_btn(css: &str) -> (CanopyHost, NodeId) {
+        let mut e = Emitter::new();
+        let btn = e.create_element(ElementTag::new(3)); // button
+        e.append(ROOT, btn);
+        e.set_class(btn, "btn");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(css);
+        (host, btn)
+    }
+
+    #[test]
+    fn focus_rule_applies_after_set_focus_and_reverts_after_clear() {
+        use canopy_paint::BG;
+        // `.btn:focus` styles the button only while it is the focused node.
+        let (mut host, btn) =
+            host_with_btn(".btn { background: #313244 } .btn:focus { background: #89b4fa }");
+
+        // No focus yet: base only.
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(styled_prop(&styled, btn, BG).as_deref(), Some("#313244"));
+
+        // Focus the button -> :focus applies (and the host reports the change).
+        assert!(host.set_focus(Some(btn)), "focus changed -> re-render");
+        let styled = host.styled_dom().unwrap();
+        assert_eq!(
+            styled_prop(&styled, btn, BG).as_deref(),
+            Some("#89b4fa"),
+            ".btn:focus restyles the focused node"
+        );
+
+        // Focusing the same node again is a no-op (no re-render needed).
+        assert!(
+            !host.set_focus(Some(btn)),
+            "no change when focus is unchanged"
+        );
+
+        // Clear focus -> reverts to the base.
+        assert!(host.set_focus(None), "focus left the button -> re-render");
+        let styled = host.styled_dom().unwrap();
+        assert_eq!(
+            styled_prop(&styled, btn, BG).as_deref(),
+            Some("#313244"),
+            "clearing focus reverts to the base background"
+        );
+    }
+
+    #[test]
+    fn active_rule_applies_after_set_active_and_reverts() {
+        use canopy_paint::BG;
+        let (mut host, btn) =
+            host_with_btn(".btn { background: #313244 } .btn:active { background: #f38ba8 }");
+
+        assert!(host.set_active(Some(btn)));
+        let styled = host.styled_dom().unwrap();
+        assert_eq!(
+            styled_prop(&styled, btn, BG).as_deref(),
+            Some("#f38ba8"),
+            ".btn:active restyles the active node"
+        );
+
+        assert!(host.set_active(None));
+        let styled = host.styled_dom().unwrap();
+        assert_eq!(
+            styled_prop(&styled, btn, BG).as_deref(),
+            Some("#313244"),
+            "clearing active reverts to the base"
+        );
+    }
+
+    #[test]
+    fn disabled_pseudo_matches_a_node_with_a_disabled_attribute_no_host_state() {
+        use canopy_paint::BG;
+        // `:disabled` is attribute-driven: a node carrying the `disabled` attribute matches with NO
+        // host state set, exactly like the `:disabled` CSS pseudo (the value is ignored).
+        let mut e = Emitter::new();
+        let on = e.create_element(ElementTag::new(4)); // input
+        e.append(ROOT, on);
+        let off = e.create_element(ElementTag::new(4)); // input
+        e.append(ROOT, off);
+        e.set_attribute(off, DISABLED_ATTR, ""); // carries the disabled attribute
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet("input:disabled { background: #585b70 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, off, BG).as_deref(),
+            Some("#585b70"),
+            "the input carrying a `disabled` attribute matches :disabled"
+        );
+        assert_eq!(
+            styled_prop(&styled, on, BG),
+            None,
+            "the input without the attribute does not match :disabled"
+        );
+    }
+
+    #[test]
+    fn checked_pseudo_matches_a_node_with_a_checked_attribute() {
+        use canopy_paint::FG;
+        let mut e = Emitter::new();
+        let checked = e.create_element(ElementTag::new(4)); // input
+        e.append(ROOT, checked);
+        e.set_attribute(checked, CHECKED_ATTR, "true");
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet("input:checked { color: #a6e3a1 }");
+
+        let styled = host.styled_dom().expect("a stylesheet is set");
+        assert_eq!(
+            styled_prop(&styled, checked, FG).as_deref(),
+            Some("#a6e3a1"),
+            ":checked matches a node carrying the `checked` attribute"
+        );
+    }
+
+    #[test]
+    fn composed_hover_and_focus_requires_both_states() {
+        use canopy_paint::BG;
+        // `.btn:hover:focus` applies only when the button is BOTH hovered and focused.
+        let (mut host, btn) = host_with_btn(
+            ".btn { width: 100; height: 60; background: #313244 } \
+             .btn:hover:focus { background: #a6e3a1 }",
+        );
+        host.set_viewport(100.0, 60.0);
+
+        let bg = |host: &CanopyHost| {
+            let styled = host.styled_dom().unwrap();
+            styled_prop(&styled, btn, BG)
+        };
+
+        // Focus only: the composed rule does not fire.
+        host.set_focus(Some(btn));
+        assert_eq!(
+            bg(&host).as_deref(),
+            Some("#313244"),
+            "focus without hover does not satisfy :hover:focus"
+        );
+        // Add hover (pointer over the button) -> both states set -> the composed rule fires.
+        assert!(host.set_hover(50.0, 30.0), "the pointer entered the button");
+        assert_eq!(
+            bg(&host).as_deref(),
+            Some("#a6e3a1"),
+            ":hover:focus fires once the button is both hovered AND focused"
+        );
+        // Drop hover -> back to base even though focus remains.
+        assert!(host.set_hover(500.0, 500.0), "the pointer left the button");
+        assert_eq!(
+            bg(&host).as_deref(),
+            Some("#313244"),
+            "losing hover drops the composed rule, even with focus still set"
+        );
+    }
+
+    #[test]
+    fn a_sheet_with_no_state_pseudos_is_unaffected_by_focus_active() {
+        use canopy_paint::BG;
+        // A plain class sheet (no state pseudos) must resolve identically regardless of the host's
+        // focus/active state — the back-compat guarantee.
+        let (mut host, btn) = host_with_btn(".btn { background: #313244 }");
+        let base = host.styled_dom().and_then(|d| styled_prop(&d, btn, BG));
+        host.set_focus(Some(btn));
+        host.set_active(Some(btn));
+        let after = host.styled_dom().and_then(|d| styled_prop(&d, btn, BG));
+        assert_eq!(
+            base.as_deref(),
+            Some("#313244"),
+            "the plain class rule resolves the base background"
+        );
+        assert_eq!(
+            base, after,
+            "focus/active leave a state-pseudo-free sheet unchanged"
         );
     }
 

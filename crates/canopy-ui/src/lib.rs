@@ -37,9 +37,11 @@
 //!   records the `(node, classes)` pair. That registry is the single source of truth
 //!   for [`Ui::reload_css`] (hot-reload) — a node cannot be styled without also being
 //!   reloadable, so styles never silently stop updating.
-//! - **Hover**: [`Ui::hoverables`] is derived (not hand-maintained) from the registry
-//!   and the stylesheet's `:hover` rules, and [`Ui::hover_target`]/[`Ui::set_hover`]
-//!   drive a live hover off the cursor.
+//! - **Interaction state**: [`Ui::hoverables`] is derived (not hand-maintained) from the
+//!   registry and the stylesheet's `:hover` rules, and [`Ui::hover_target`]/[`Ui::set_hover`]
+//!   drive a live hover off the cursor. [`Ui::set_focus`]/[`Ui::set_active`] are the `:focus` /
+//!   `:active` counterparts — each re-resolves the node with its full interaction state, so a node
+//!   that is both hovered and focused keeps both rules.
 //! - **Events**: [`Ui::click_handler`] hit-tests a point to the handler that should
 //!   fire, walking up to the nearest ancestor with a click listener.
 //!
@@ -59,7 +61,7 @@ use canopy_dom::{Dom, ROOT};
 use canopy_layout_taffy::{hit_test, layout};
 use canopy_protocol::{ElementTag, EventPayload, HandlerId, NodeId, PropId};
 use canopy_signals::{Memo, Runtime, Signal};
-use canopy_style_css::Stylesheet;
+use canopy_style_css::{ElementStates, Stylesheet};
 use canopy_traits::{Point, Size};
 use canopy_view::{App, CLICK};
 
@@ -153,6 +155,14 @@ pub struct Ui {
     /// [`resolve_for`](canopy_style_css::Stylesheet::resolve_for) — the same identity the
     /// C-ABI host builds, so both paths style an identical sheet identically.
     identity: RefCell<BTreeMap<NodeId, Identity>>,
+    /// The node currently in each dynamic interaction state (hovered / focused / active), so a
+    /// later [`set_hover`](Ui::set_hover) / [`set_focus`](Ui::set_focus) / [`set_active`](Ui::set_active)
+    /// re-resolves a node with its FULL [`ElementStates`] (e.g. a node that is both hovered and
+    /// focused keeps both rules), rather than each setter clobbering the others. `None` = no node is
+    /// in that state.
+    hovered: RefCell<Option<NodeId>>,
+    focused: RefCell<Option<NodeId>>,
+    active: RefCell<Option<NodeId>>,
 }
 
 impl Ui {
@@ -167,6 +177,9 @@ impl Ui {
             css: RefCell::new(Stylesheet::new()),
             styled: RefCell::new(Vec::new()),
             identity: RefCell::new(BTreeMap::new()),
+            hovered: RefCell::new(None),
+            focused: RefCell::new(None),
+            active: RefCell::new(None),
         }
     }
 
@@ -183,6 +196,9 @@ impl Ui {
             css: RefCell::new(canopy_style_css::parse(src)),
             styled: RefCell::new(Vec::new()),
             identity: RefCell::new(BTreeMap::new()),
+            hovered: RefCell::new(None),
+            focused: RefCell::new(None),
+            active: RefCell::new(None),
         }
     }
 
@@ -200,6 +216,9 @@ impl Ui {
             css: RefCell::new(Stylesheet::new()),
             styled: RefCell::new(Vec::new()),
             identity: RefCell::new(BTreeMap::new()),
+            hovered: RefCell::new(None),
+            focused: RefCell::new(None),
+            active: RefCell::new(None),
         }
     }
 
@@ -327,8 +346,9 @@ impl Ui {
     /// exactly as they style the freestanding/C-ABI render path.
     pub fn class(&self, node: NodeId, classes: Classes) {
         match self.cascade {
-            // Constrained tier: resolve the rules to inline styles author-side.
-            Cascade::Lite => self.apply_node(node, classes, false),
+            // Constrained tier: resolve the rules to inline styles author-side. A freshly styled
+            // node is in no interaction state yet, so resolve at the default (all-false) states.
+            Cascade::Lite => self.apply_node(node, classes, ElementStates::default()),
             // Capable tier: carry the class NAMES to the host for a real cascade.
             Cascade::Capable => {
                 let em = self.app.emitter();
@@ -341,11 +361,13 @@ impl Ui {
         self.styled.borrow_mut().push((node, classes));
     }
 
-    /// Resolve `classes` (with the node's recorded identity) at the given `hovered` state
+    /// Resolve `classes` (with the node's recorded identity) at the given dynamic [`ElementStates`]
     /// through the lite [`Stylesheet`] and replay the resulting inline-style ops onto
     /// `node`. The identity (type-name + id, and the id exposed as an `[id]` attribute) is what
     /// makes type/id/compound and `[id…]` attribute selectors take effect on the in-process tier;
-    /// for a purely class-based sheet it folds back to the legacy class-only result.
+    /// for a purely class-based sheet it folds back to the legacy class-only result. `states`
+    /// drives the interaction-state pseudos (`:hover`/`:focus`/`:active`) so a stateful rule applies
+    /// exactly when the node is in that state.
     ///
     /// **Known limitation:** `Ui` records each node's own identity but not the parent/child tree
     /// relationship (it forwards `mount` straight to the emitter and never retains the edges), so
@@ -360,7 +382,7 @@ impl Ui {
     /// pseudo-classes (`:not`/`:is`/`:where`) over type/id/class/`[id…]` DO work in-process, since
     /// they only inspect the node's own identity. Attribute selectors are limited to `[id…]` (the
     /// only recorded attribute).
-    fn apply_node(&self, node: NodeId, classes: &[&str], hovered: bool) {
+    fn apply_node(&self, node: NodeId, classes: &[&str], states: ElementStates) {
         let ident = self
             .identity
             .borrow()
@@ -373,10 +395,24 @@ impl Ui {
         let attrs: Vec<(&str, &str)> = id.map(|v| ("id", v)).into_iter().collect();
         // No sibling-position context is retained in-process, so the target keeps the default
         // `StructInfo::UNKNOWN`: structural pseudos are a no-op here (see the doc above), while
-        // type/id/class/attr and the functional `:not`/`:is`/`:where` pseudos resolve normally.
+        // type/id/class/attr and the functional `:not`/`:is`/`:where` pseudos resolve normally. The
+        // dynamic-state pseudos resolve against `states` (which the caller computes from the node's
+        // current hover/focus/active membership).
         let target = canopy_style_css::MatchTarget::new(type_name, id, classes).with_attrs(&attrs);
-        for (prop, value) in self.css.borrow().resolve_for(&target, hovered) {
+        for (prop, value) in self.css.borrow().resolve_for(&target, states) {
             self.app.style(node, prop, &value);
+        }
+    }
+
+    /// The current combined [`ElementStates`] for `node`: each flag is set iff `node` is the node
+    /// recorded in that interaction state. Lets [`set_hover`](Ui::set_hover) /
+    /// [`set_focus`](Ui::set_focus) / [`set_active`](Ui::set_active) re-resolve a node with ALL of
+    /// its live states, so toggling one state never drops another's styling.
+    fn states_for(&self, node: NodeId) -> ElementStates {
+        ElementStates {
+            hover: *self.hovered.borrow() == Some(node),
+            focus: *self.focused.borrow() == Some(node),
+            active: *self.active.borrow() == Some(node),
         }
     }
 
@@ -522,11 +558,38 @@ impl Ui {
         }
     }
 
-    /// Re-resolve `node`'s identity + classes with the given `hovered` state and emit the
-    /// resulting inline-style ops (the host applies the batch and redraws). Does
-    /// nothing if `node` was not styled through this `Ui`. Resolves through the full
-    /// selector model so a `:hover` rule on a type/id/compound selector restyles too.
+    /// Record `node` as the hovered node (or clear hover, with `hovered == false`) and re-resolve it
+    /// through the full selector model, emitting the resulting inline-style ops (the host applies the
+    /// batch and redraws). Does nothing if `node` was not styled through this `Ui`. The node is
+    /// re-resolved with its FULL [`ElementStates`], so a node that is also focused/active keeps those
+    /// rules — a `:hover` rule on a type/id/compound selector restyles too.
     pub fn set_hover(&self, node: NodeId, hovered: bool) {
+        *self.hovered.borrow_mut() = hovered.then_some(node);
+        self.restyle(node);
+    }
+
+    /// Record `node` as the focused node (or clear focus, with `focused == false`) and re-resolve it,
+    /// emitting the resulting inline-style ops. The `:focus` counterpart of [`set_hover`](Ui::set_hover):
+    /// does nothing if `node` was not styled through this `Ui`, and re-resolves with the node's full
+    /// [`ElementStates`] so any concurrent hover/active styling is preserved.
+    pub fn set_focus(&self, node: NodeId, focused: bool) {
+        *self.focused.borrow_mut() = focused.then_some(node);
+        self.restyle(node);
+    }
+
+    /// Record `node` as the active (pressed) node (or clear, with `active == false`) and re-resolve
+    /// it, emitting the resulting inline-style ops. The `:active` counterpart of
+    /// [`set_hover`](Ui::set_hover) / [`set_focus`](Ui::set_focus).
+    pub fn set_active(&self, node: NodeId, active: bool) {
+        *self.active.borrow_mut() = active.then_some(node);
+        self.restyle(node);
+    }
+
+    /// Re-resolve a previously-styled `node` at its current combined [`ElementStates`] and emit the
+    /// inline-style ops. A no-op if `node` was never styled through [`class`](Ui::class). Shared by
+    /// the [`set_hover`](Ui::set_hover) / [`set_focus`](Ui::set_focus) / [`set_active`](Ui::set_active)
+    /// state setters.
+    fn restyle(&self, node: NodeId) {
         let classes = self
             .styled
             .borrow()
@@ -534,26 +597,30 @@ impl Ui {
             .find(|(id, _)| *id == node)
             .map(|(_, classes)| *classes);
         if let Some(classes) = classes {
-            self.apply_node(node, classes, hovered);
+            self.apply_node(node, classes, self.states_for(node));
         }
     }
 
     /// Hot-reload: parse `src` as the new stylesheet, replay **every** styled node's
     /// classes through it (re-resolving the node named by `hovered` *with* its `:hover`
     /// rules so a live hover survives the reload), swap it in, and return the number of
-    /// nodes restyled.
+    /// nodes restyled. The `hovered` argument records the live hover so it persists across the
+    /// reload; any node already focused/active (via [`set_focus`](Ui::set_focus) /
+    /// [`set_active`](Ui::set_active)) keeps that state too.
     ///
     /// This only emits ops on the inner `App`; the host takes [`take_batch`](Ui::take_batch)
     /// and applies it to its [`Dom`], so a malformed reload is rejected at the
     /// capability boundary rather than corrupting the tree.
     pub fn reload_css(&self, src: &str, hovered: Option<NodeId>) -> usize {
-        // Swap the freshly parsed sheet in first, then replay every styled node through the
-        // full selector model (`apply_node` borrows `self.css`), so type/id/compound rules in
-        // the edited sheet take effect on reload exactly as they did on the initial apply.
+        // Record the live hover so it survives the reload, then swap the freshly parsed sheet in and
+        // replay every styled node through the full selector model (`apply_node` borrows `self.css`),
+        // so type/id/compound rules in the edited sheet take effect on reload exactly as on the
+        // initial apply — each node re-resolved at its full current ElementStates.
+        *self.hovered.borrow_mut() = hovered;
         *self.css.borrow_mut() = canopy_style_css::parse(src);
         let nodes: Vec<(NodeId, Classes)> = self.styled.borrow().clone();
         for (node, classes) in &nodes {
-            self.apply_node(*node, classes, hovered == Some(*node));
+            self.apply_node(*node, classes, self.states_for(*node));
         }
         nodes.len()
     }
@@ -1016,6 +1083,121 @@ mod tests {
         ui.set_hover(btn, true);
         dom.apply(&ui.take_batch(1)).unwrap();
         assert_eq!(dom.style(btn, BG), Some("#585b70"), "hover lightens");
+    }
+
+    // --- Wave 3c: :focus / :active in-process ------------------------------
+
+    /// A sheet exercising all three dynamic interaction states on `.btn`.
+    const STATE_CSS: &str = "
+        .btn { background: #313244 }
+        .btn:hover  { background: #585b70 }
+        .btn:focus  { background: #89b4fa }
+        .btn:active { background: #f38ba8 }
+    ";
+
+    #[test]
+    fn set_focus_restyles_in_process() {
+        // `.btn:focus` must restyle the in-process node when focus is set, and revert when cleared.
+        let ui = Ui::with_css(STATE_CSS);
+        let btn = ui.button("ok");
+        ui.class(btn, &["btn"]);
+        ui.mount_root(btn);
+        let mut dom = mount(&ui);
+        assert_eq!(dom.style(btn, BG), Some("#313244"), "base background");
+
+        ui.set_focus(btn, true);
+        dom.apply(&ui.take_batch(1)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#89b4fa"),
+            ".btn:focus restyles the focused node in-process"
+        );
+
+        ui.set_focus(btn, false);
+        dom.apply(&ui.take_batch(2)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#313244"),
+            "clearing focus reverts to the base"
+        );
+    }
+
+    #[test]
+    fn set_active_restyles_in_process() {
+        let ui = Ui::with_css(STATE_CSS);
+        let btn = ui.button("ok");
+        ui.class(btn, &["btn"]);
+        ui.mount_root(btn);
+        let mut dom = mount(&ui);
+
+        ui.set_active(btn, true);
+        dom.apply(&ui.take_batch(1)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#f38ba8"),
+            ".btn:active restyles the active node in-process"
+        );
+        ui.set_active(btn, false);
+        dom.apply(&ui.take_batch(2)).unwrap();
+        assert_eq!(dom.style(btn, BG), Some("#313244"), "active reverts");
+    }
+
+    #[test]
+    fn focus_and_hover_compose_and_neither_clobbers_the_other() {
+        // A node can be hovered AND focused at once. `.btn:hover` and `.btn:focus` have equal
+        // specificity (both class+state = (0,2,0)), so source order breaks the tie: `:focus` is
+        // LATER than `:hover` in STATE_CSS, so focus wins while both are set. The point of the test
+        // is that clearing focus falls back to the still-set HOVER color (NOT the base), proving the
+        // state setters re-resolve a node with its FULL ElementStates rather than clobbering.
+        let ui = Ui::with_css(STATE_CSS);
+        let btn = ui.button("ok");
+        ui.class(btn, &["btn"]);
+        ui.mount_root(btn);
+        let mut dom = mount(&ui);
+
+        ui.set_hover(btn, true);
+        dom.apply(&ui.take_batch(1)).unwrap();
+        assert_eq!(dom.style(btn, BG), Some("#585b70"), "hover only");
+
+        // Focus on top of hover: the later `:focus` rule wins the source-order tie, hover still set.
+        ui.set_focus(btn, true);
+        dom.apply(&ui.take_batch(2)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#89b4fa"),
+            ":focus wins over :hover (later in source) while both are set"
+        );
+
+        // Drop focus: falls back to the hover color, not the base — hover was never clobbered.
+        ui.set_focus(btn, false);
+        dom.apply(&ui.take_batch(3)).unwrap();
+        assert_eq!(
+            dom.style(btn, BG),
+            Some("#585b70"),
+            "losing focus falls back to the still-set hover state"
+        );
+    }
+
+    #[test]
+    fn state_setters_are_a_no_op_for_an_unstyled_node() {
+        // A node never passed through `class()` is not in the registry, so the state setters emit
+        // nothing for it (no panic, no stray ops).
+        let ui = Ui::with_css(STATE_CSS);
+        let btn = ui.button("ok");
+        ui.class(btn, &["btn"]);
+        let bare = ui.button("bare"); // never styled
+        ui.mount_root(btn);
+        ui.mount(btn, bare);
+        let mut dom = mount(&ui);
+
+        ui.set_focus(bare, true);
+        ui.set_active(bare, true);
+        dom.apply(&ui.take_batch(1)).unwrap();
+        assert_eq!(
+            dom.style(bare, BG),
+            None,
+            "an unstyled node gets no styling from the state setters"
+        );
     }
 
     #[test]
