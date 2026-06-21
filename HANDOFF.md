@@ -15,10 +15,8 @@ CSS-styled GUI to pixels on bare-metal aarch64 with no OS.
 
 ## The repo
 
-- **Working checkout (source of truth):** `the repository root`
-- **Repository (declared):** https://github.com/eckeltdev/canopy
-  *(No git remote is configured yet — the local checkout is canonical; nothing is pushed.)*
-- Branch: `master`. Git identity is pinned to `eckeltdev` (local config).
+- **Clone:** `git clone https://github.com/eckeltdev/canopy.git`, then work from the repo root.
+- Branch: `master`.
 - First read: [`README.md`](README.md) — overview, architecture, crate map, build commands.
 
 ## Set up the skill (do this first)
@@ -31,7 +29,7 @@ the library on any target. Claude Code auto-discovers skills under `.claude/skil
   invoke it explicitly as `/canopy`).
 - **Working from elsewhere:** copy it user-level so it's available everywhere —
   ```sh
-  cp -r the repository root/.claude/skills/canopy ~/.claude/skills/
+  cp -r .claude/skills/canopy ~/.claude/skills/   # run from the repo root
   ```
 
 The skill is a 5-part reference:
@@ -76,7 +74,7 @@ The skill is a 5-part reference:
 ## First moves
 
 ```sh
-cd the repository root
+git clone https://github.com/eckeltdev/canopy.git && cd canopy
 # 1. Read the overview + the skill entry point:
 #    README.md  and  .claude/skills/canopy/SKILL.md
 # 2. Sanity build/test (avoid a bare --workspace on old stable):

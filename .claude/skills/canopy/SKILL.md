@@ -15,7 +15,8 @@ Canopy is a **typed, capability-based, web-like native UI runtime with no JavaSc
 runtime**. You author a UI tree + CSS-like styles; the app reaches the UI only through a
 validated **op-stream** of opaque node handles. The core is `no_std` + `alloc`, so the
 same UI code runs on the desktop (GPU) and all the way down to bare metal (software
-rasterizer). Repo root: `the repository root`.
+rasterizer). All paths in this skill are relative to the repository root (a clone of
+`https://github.com/eckeltdev/canopy`).
 
 ## The one mental model
 
