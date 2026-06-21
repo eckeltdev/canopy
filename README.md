@@ -12,8 +12,10 @@ DOM-access boundary *is* the plugin-permission boundary. A guest can mutate exac
 nodes it was handed and nothing else.
 
 The result is a lightweight Electron/Tauri alternative whose core is `no_std` + `alloc`,
-so the same UI code embeds all the way down toward bare metal: rich GPU rendering on the
-desktop today, with a clean seam to a software rasterizer for constrained targets.
+so the same UI runs from rich GPU rendering on the desktop down to a software rasterizer on
+bare metal. There are **two authoring front-ends over one op-stream** — a Rust `rsx!` macro
+and a freestanding **C++ DSL** — and the lite path already renders a CSS-styled GUI to
+RGBA8 pixels on a bare-metal aarch64 target with no OS (via the [`frt`](runtime/frt) runtime).
 
 ![The Canopy welcome app — logo, heading, a reactive counter card, and footer pills](docs/welcome.png)
 
@@ -118,14 +120,24 @@ Rust's wrapper is the `rsx!` macro plus the `canopy-ui` `Ui` context.
   The **capable** tier swaps in real Servo Stylo
   ([`canopy-style-stylo`](crates/canopy-style-stylo/src/lib.rs)) for browser-grade CSS on
   the desktop — same authoring, the host picks the tier. The flagship example styles
-  entirely from a real `styles.css` file, hot-reloadable on save. Agents: see the
-  [`canopy` skill](.claude/skills/canopy/SKILL.md) for using the library on any target.
+  entirely from a real `styles.css` file, hot-reloadable on save.
 
 - **Real layout and text.** Layout is the actual [Taffy](https://github.com/DioxusLabs/taffy)
-  flexbox engine ([`canopy-layout-taffy`](crates/canopy-layout-taffy/src/lib.rs)); text is
-  sharp, antialiased glyphs shaped with cosmic-text + swash
+  flexbox **and grid** engine ([`canopy-layout-taffy`](crates/canopy-layout-taffy/src/lib.rs));
+  text is sharp, antialiased glyphs shaped with cosmic-text + swash
   ([`canopy-text-parley`](crates/canopy-text-parley/src/lib.rs)), with a GPU path via wgpu
   ([`canopy-render-vello`](crates/canopy-render-vello/src/lib.rs)).
+
+- **A second front-end: freestanding C++** ([`bindings/canopy_cpp`](bindings/canopy_cpp)).
+  The same op-stream is also authored from a header-only C++ value DSL
+  (`div`/`row`/`button`/`text`/`cls`/`id`/`on_click`) that emits **byte-identical** ops — pinned
+  by a cross-producer parity test. It links the `canopy-abi` engine staticlib and runs
+  **freestanding** on the [`frt`](runtime/frt) runtime — a generic bare-metal C++ runtime that
+  routes `std` allocation through an installable `platform_ops` backend. The
+  [`gui_css`](bindings/canopy_cpp/examples/gui_css/main.cpp) example styles an identity-only
+  tree with a CSS string and renders it to RGBA8 pixels — the whole engine running with no OS.
+  The host can't tell which front-end produced a batch. Agents: see the
+  [`canopy` skill](.claude/skills/canopy/SKILL.md) for using the library on any target.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how `rsx!` lowers to ops, how the
 capability boundary is enforced, and how the rendering tiers stack up.
@@ -139,6 +151,15 @@ wire format. A transport carries those bytes to a host, which decodes them into 
 tree ([`canopy-dom`](crates/canopy-dom/src/lib.rs)), **validating every node handle as it
 goes** — a forged or unowned handle is rejected at the boundary. The host then lays the
 tree out, builds a renderer-agnostic `DisplayList`, and rasterizes it.
+
+The `DisplayList` is renderer-agnostic on purpose: internally the same one drives both a CPU
+software rasterizer and a wgpu GPU renderer, and it is **exported across the C ABI**
+([`canopy_host_build_display_list`](crates/canopy-abi/include/canopy.h); wire format in
+[`canopy_displaylist.h`](crates/canopy-abi/include/canopy_displaylist.h)) so a non-Rust
+consumer can decode the geometry — rects, borders, gradients, shadows, text runs, a clip
+stack — and drive its **own** GPU / 2D-accelerator pipeline instead of taking the
+software-rasterized pixels. A freestanding C++ visitor decoder ships at
+[`display_list.hpp`](bindings/canopy_cpp/include/canopy_cpp/display_list.hpp).
 
 Two things make this a security boundary, not just an indirection:
 
@@ -190,7 +211,7 @@ host-side backends are leaf `std` crates that can pull in real engines.
 | [`canopy-view`](crates/canopy-view) | The `App` that ties signals to the op-stream emitter so a changed value emits one targeted op. |
 | [`canopy-dom`](crates/canopy-dom) | Host-side retained tree + `OpSink`: decodes the op-stream into a node arena and enforces handle ownership. |
 | [`canopy-paint`](crates/canopy-paint) | Scene builder: walks the host `Dom` into a renderer-agnostic `DisplayList`. |
-| [`canopy-style-css`](crates/canopy-style-css) | CSS-lite: parses class rules (`.name { prop: value }`) into resolved declarations. A documented subset. |
+| [`canopy-style-css`](crates/canopy-style-css) | The lite CSS engine: full selector model (type/id/class/compound + combinators + attribute + pseudo-classes), specificity, inheritance, `var()`/`calc()`, `@media`, flexbox + grid, gradients/shadows/AA/clipping. Coverage map: [FEATURES.md](crates/canopy-style-css/FEATURES.md). |
 | [`canopy-layout-taffy`](crates/canopy-layout-taffy) | Layout via the real Taffy flexbox engine; emits the same `DisplayList` + `LayoutResult` shape. |
 | [`canopy-render-soft`](crates/canopy-render-soft) | A CPU rasterizer that paints a `DisplayList` into an RGBA buffer — the bare-metal/RPi `Renderer`. |
 | [`canopy-text-baked`](crates/canopy-text-baked) | An 8×8 monospace bitmap glyph atlas for constrained / bare-metal renderers. Zero deps. |
@@ -211,7 +232,7 @@ host-side backends are leaf `std` crates that can pull in real engines.
 | [`canopy-transport-component`](crates/canopy-transport-component) | Untrusted-**component** transport: a real Component Model guest (from `wit/canopy.wit`) granted exactly `host.apply`. |
 | [`canopy-plugin-panel`](crates/canopy-plugin-panel) | Composites a plugin's own retained tree into a sub-region of a host frame buffer — the plugin can never reference host nodes. |
 | [`canopy-a11y`](crates/canopy-a11y) | Accessibility bridge: walks a `canopy-dom` tree into an AccessKit tree so Canopy UIs are screen-reader navigable. |
-| [`canopy-abi`](crates/canopy-abi) | The stable C ABI over the op-stream — the cross-language embedding seam (the one crate allowed `unsafe`). |
+| [`canopy-abi`](crates/canopy-abi) | The stable C ABI over the op-stream — the cross-language embedding seam (the one crate allowed `unsafe`). Also exports the `DisplayList` as a wire format for bring-your-own-renderer. |
 | [`canopy-hotreload`](crates/canopy-hotreload) | Dev-time hot reload: a debounced filesystem watcher + re-apply glue that pushes a rebuilt op-batch onto a live `Dom`. |
 | [`canopy-cli`](crates/canopy-cli) | The `canopy` developer command: `canopy new` (scaffold) and `canopy build` (wrap `cargo build`). |
 | [`canopy-rsx`](crates/canopy-rsx) | The first-party Rust authoring macro: the JSX-like `rsx!` that lowers an HTML-style tree to `canopy-ui::Ui` calls. |
@@ -228,21 +249,29 @@ Canopy is honest about where it runs today versus where the architecture *lets* 
 - **Minimal-Linux SBC (Raspberry Pi) — medium-term.** A minimal embedded Linux appliance,
   keeping the GPU (e.g. via DRM-KMS). The desktop engines (Vello/wgpu, cosmic-text, Taffy,
   Wasmtime) are designed to come along.
-- **True bare metal — a parked research track.** The `no_std` seam keeps this *reachable*,
-  not done: the guest-side core builds for `thumbv7em-none-eabi`. Vello/wgpu, cosmic-text,
-  and Wasmtime are desktop/SBC-only; a microcontroller would instead get the software
-  rasterizer ([`canopy-render-soft`](crates/canopy-render-soft)), the baked 8×8 font
-  ([`canopy-text-baked`](crates/canopy-text-baked)), and a reduced style model. The seam is
-  what makes that a backend swap rather than a rewrite.
+- **Bare metal — the freestanding path renders to pixels today.** The `no_std` guest core
+  builds for bare-metal targets (CI guards it on `aarch64-unknown-none`), and the C++
+  front-end runs the *whole* engine freestanding on the [`frt`](runtime/frt) runtime: the
+  [`gui_css`](bindings/canopy_cpp/examples/gui_css/main.cpp) example renders a CSS-styled GUI
+  to an RGBA8 framebuffer with no OS. The
+  [M5 std-on-freestanding audit](runtime/frt/docs/m5-nm-audit.md) is **GO** — the engine drags
+  no exception unwinder, no RTTI, and no global-constructor startup on `aarch64-none` (an
+  on-device ELF re-run is the one remaining check). The constrained tier paints with the
+  software rasterizer ([`canopy-render-soft`](crates/canopy-render-soft)) and the baked 8×8
+  font ([`canopy-text-baked`](crates/canopy-text-baked)) — but the **style model is the full
+  lite CSS engine**, not a reduced one, and a board with a GPU can instead decode the exported
+  `DisplayList` and drive its own pipeline. Vello/wgpu, cosmic-text, and Wasmtime stay
+  desktop/SBC-only; the seam makes the renderer a backend swap, not a rewrite.
 
 ---
 
 ## Status
 
-- **27 workspace crates**, **199 tests** passing.
+- **27 workspace crates** (plus 2 standalone: `canopy-style-stylo`, `canopy-wpt`), **600+
+  tests** passing across the Rust workspace and the C++ binding.
 - **clippy `-D warnings` clean**, rustfmt clean.
-- The **`no_std` seam is enforced in CI** — the 15 core crates are built for a bare-metal
-  target so the instant one pulls in `std`, CI goes red.
+- The **`no_std` seam is enforced in CI** — the 16 core crates are built for a bare-metal
+  target (`aarch64-unknown-none`) so the instant one pulls in `std`, CI goes red.
 - Stands on the shoulders of mature crates: [Taffy](https://github.com/DioxusLabs/taffy)
   (layout), cosmic-text / swash (text), [wgpu](https://github.com/gfx-rs/wgpu) (GPU),
   [Wasmtime](https://github.com/bytecodealliance/wasmtime) (sandbox),
@@ -254,22 +283,28 @@ Canopy is honest about where it runs today versus where the architecture *lets* 
 
 ## Build & test
 
-Canopy builds on **nightly**. The lockfile is pinned on purpose — **do not run
-`cargo update`** (it pulls a transitive crate that needs a newer rustc and breaks the
-build).
+Canopy pins the **stable** toolchain ([`rust-toolchain.toml`](rust-toolchain.toml)). The
+full workspace needs a recent stable — **rustc ≥ 1.87**, the MSRV the GPU crates (wgpu/naga)
+set — which is what CI uses. The lockfile is pinned on purpose: **do not run `cargo update`**.
 
 ```sh
-cargo +nightly test --workspace
-cargo +nightly clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 
-# Prove the guest-side core is std-free (any installed bare-metal target works):
-rustup target add thumbv7em-none-eabi
-cargo +nightly build -p canopy-core --target thumbv7em-none-eabi
+# Prove the guest-side core is std-free (CI builds it for a bare-metal target):
+rustup target add aarch64-unknown-none
+cargo build -p canopy-core --target aarch64-unknown-none
+
+# The freestanding C++ binding: build the engine staticlib, then build the C++ with CMake.
+cargo build -p canopy-abi                                              # -> target/debug/libcanopy_abi.a
+cmake -S bindings/canopy_cpp -B bindings/canopy_cpp/build
+cmake --build bindings/canopy_cpp/build                               # runs the C++ + frt suite
 ```
 
-The windowed examples (`examples/lite/welcome` and friends) pull `winit`/`softbuffer`
-and are deliberately **excluded** from the core workspace; build them from their own
-directories.
+`canopy-style-stylo` (the capable-tier Stylo engine) and `canopy-wpt` are **excluded**
+standalone crates with their own lockfiles — they pull Stylo's large nightly tree, so build
+them from their own directories on nightly. The windowed examples (`examples/lite/welcome`
+and friends) pull `winit`/`softbuffer` and likewise build from their own directories.
 
 ## License
 
