@@ -746,7 +746,7 @@ fn readme(name: &str) -> String {
     format!(
         "# {name}\n\
          \n\
-         A [Canopy](https://github.com/iivillian/canopy) app, scaffolded by `canopy new`.\n\
+         A [Canopy](https://github.com/eckeltdev/canopy) app, scaffolded by `canopy new`.\n\
          \n\
          Canopy is a JS-runtime-free, web-like native UI runtime. This starter is a\n\
          windowed **welcome screen** — the Canopy logo (rounded leaf shapes), a heading\n\
