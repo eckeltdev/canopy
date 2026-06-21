@@ -143,6 +143,18 @@ include-directories = ["include", "../../crates/canopy-abi/include"]
 compile-features = ["cxx_std_23"]
 link-options = ["-L../../../target/debug", "-lcanopy_abi"]
 
+# Display-list DECODER test: builds a styled tree (gradient/shadow/border/radius + text) through the
+# real engine, serializes it with canopy_host_build_display_list (the two-call sizing contract), and
+# decodes the wire bytes with the header-only visitor decoder (include/canopy_cpp/display_list.hpp),
+# asserting each rich primitive was visited and that a truncated buffer is rejected. Same link/host
+# shape as the reactive test (needs `cargo build -p canopy-abi` first).
+[target.canopy_cpp_display_list_test]
+type = "executable"
+sources = ["tests/display_list_test.cpp", "src/host.cpp", "src/build_context.cpp", "src/reactive.cpp"]
+include-directories = ["include", "../../crates/canopy-abi/include"]
+compile-features = ["cxx_std_23"]
+link-options = ["-L../../../target/debug", "-lcanopy_abi"]
+
 # "A basic app styled with CSS, freestanding": the DSL authors a tree carrying ONLY class names
 # (no inline styles); host::set_stylesheet hands the engine a CSS-lite stylesheet; the host
 # cascades classes -> styles and renders to a PPM. Proves the host-side class cascade end to end.

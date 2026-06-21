@@ -3,7 +3,8 @@
 Authoritative headers (read these for exact contracts):
 - `crates/canopy-abi/include/canopy.h` — the C ABI (functions).
 - `crates/canopy-abi/include/canopy_protocol.h` — the op-stream wire format (ops, ids).
-- `bindings/canopy_cpp/include/canopy_cpp/host.hpp` + `dsl.hpp` — the C++ wrapper + DSL.
+- `crates/canopy-abi/include/canopy_displaylist.h` — the display-list wire format (the "bring your own renderer" output; see `hardware.md` Path E).
+- `bindings/canopy_cpp/include/canopy_cpp/host.hpp` + `dsl.hpp` + `display_list.hpp` — the C++ wrapper, DSL, and the visitor decoder for the display-list stream.
 - `crates/canopy-ui/src/lib.rs` — the Rust `Ui` surface (see `authoring.md`).
 
 ## The C ABI (`canopy.h`)
@@ -25,6 +26,11 @@ int32_t canopy_host_resize(CanopyHost *host, float width, float height);        
 // Render to RGBA8. Two-call sizing: pass cap=0/out=NULL to get *out_len = w*h*4, then call again.
 int32_t canopy_host_render_rgba(const CanopyHost *host, uint32_t width, uint32_t height,
                                 uint8_t *out, size_t cap, size_t *out_len);       // dims capped at 8192
+
+// Serialize the laid-out scene to the DISPLAY-LIST wire format (geometry, not pixels) so a
+// consumer can drive its OWN renderer. Same two-call sizing; format in canopy_displaylist.h.
+int32_t canopy_host_build_display_list(const CanopyHost *host, uint32_t width, uint32_t height,
+                                       uint8_t *out, size_t cap, size_t *out_len);
 
 int32_t canopy_host_hover(CanopyHost *host, float x, float y);                    // update :hover node
 int32_t canopy_host_pointer(CanopyHost *host, float x, float y, uint8_t button, uint16_t event); // hit-test + queue event

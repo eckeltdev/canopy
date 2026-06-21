@@ -56,6 +56,11 @@ bare-metal MMIO framebuffer):
 
 There is no GPU dependency on this path — it is pure CPU, `no_std`-safe.
 
+**Want hardware-accelerated rendering instead of CPU pixels?** Canopy is renderer-agnostic:
+`canopy_host_build_display_list` (C ABI) / `CanopyHost::build_display_list` (Rust) hands you
+the *geometry* (a serialized `DisplayList` — rects, borders, gradients, shadows, text, clips)
+to feed your own GPU / 2D-accelerator pipeline. See `hardware.md` **Path E**.
+
 ## Canonical minimal app (Rust desktop)
 
 ```rust

@@ -70,6 +70,25 @@ target_include_directories(canopy_cpp_css_example PRIVATE "../../crates/canopy-a
 target_compile_features(canopy_cpp_css_example PRIVATE cxx_std_23)
 target_link_options(canopy_cpp_css_example PRIVATE "-L../../../target/debug" -lcanopy_abi)
 
+# Target: canopy_cpp_display_list_test
+add_executable(canopy_cpp_display_list_test)
+target_sources(
+	canopy_cpp_display_list_test
+	PRIVATE
+	"src/build_context.cpp"
+	"src/host.cpp"
+	"src/reactive.cpp"
+	"tests/display_list_test.cpp"
+)
+target_include_directories(
+	canopy_cpp_display_list_test
+	PRIVATE
+	"../../crates/canopy-abi/include"
+	include
+)
+target_compile_features(canopy_cpp_display_list_test PRIVATE cxx_std_23)
+target_link_options(canopy_cpp_display_list_test PRIVATE "-L../../../target/debug" -lcanopy_abi)
+
 # Target: canopy_cpp_dsl_test
 add_executable(canopy_cpp_dsl_test)
 target_sources(canopy_cpp_dsl_test PRIVATE "tests/dsl_test.cpp")

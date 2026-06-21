@@ -98,6 +98,60 @@ Link the staticlib and call the C ABI in `crates/canopy-abi/include/canopy.h` di
 (see `api.md`). The op-stream wire format is `crates/canopy-abi/include/canopy_protocol.h`.
 The pixel contract is identical: `canopy_host_render_rgba` → blit.
 
+## Path E — drive your OWN GPU / 2D-accelerator renderer (don't take CPU pixels)
+
+`render_rgba` hands you *software-rasterized* pixels. If your board has a GPU (e.g. a Mali
+via OpenGL ES / Vulkan) or a 2D blitter (e.g. Rockchip RGA), you usually want the
+*geometry*, not pixels, so you can rasterize on the accelerator. Canopy is renderer-agnostic
+by design — internally the same `DisplayList` already drives both a CPU rasterizer and a
+wgpu GPU renderer — and that seam is now **exported across the C ABI**:
+
+```c
+// Two-call sizing like render_rgba; the byte length depends on the scene.
+size_t need = 0;
+canopy_host_build_display_list(host, w, h, NULL, 0, &need);   // size
+uint8_t *buf = malloc(need);
+canopy_host_build_display_list(host, w, h, buf, need, &need); // fill
+```
+
+`buf` is a flat **display-list stream** — the dual of the op-stream — carrying the geometric
+primitives (filled/rounded rects, borders, linear gradients, shadows, baked-font/shaped text
+runs, and `push_clip`/`pop_clip`). Format: `crates/canopy-abi/include/canopy_displaylist.h`
+(parity-pinned to the Rust serializer). Decode it and issue your own draw calls.
+
+**C++ consumers get a ready decoder:** `bindings/canopy_cpp/include/canopy_cpp/display_list.hpp`
+is a header-only, freestanding-safe (no exceptions/RTTI/heap), zero-allocation **visitor**
+decoder:
+
+```cpp
+#include "canopy_cpp/display_list.hpp"
+struct my_gpu_sink {  // your renderer — implement the primitives you support
+    void rect(canopy::dl::dl_rect r, canopy::dl::dl_color c, float radius) { /* GPU quad */ }
+    void border(canopy::dl::dl_rect r, canopy::dl::dl_color c, float width, float radius) {}
+    void gradient(canopy::dl::dl_rect r, std::uint8_t dir,
+                  const canopy::dl::dl_gradient_stop* stops, std::size_t n) {}
+    void shadow(canopy::dl::dl_rect r, canopy::dl::dl_color c, float blur, canopy::dl::dl_point off) {}
+    void text(canopy::dl::dl_point origin, canopy::dl::dl_color c, float size,
+              float box_w, float align, const char* utf8, std::size_t len) {}
+    void glyphs(canopy::dl::dl_color c, const canopy::dl::dl_glyph* g, std::size_t n) {}
+    void push_clip(canopy::dl::dl_rect r, float radius) {}
+    void pop_clip() {}
+};
+my_gpu_sink sink;
+canopy::dl::decode_display_list(buf, need, sink);  // streams items in paint order
+```
+
+**Division of labor:** Canopy gives you the laid-out geometry; the GPU pipeline is *your*
+code (your shaders, your atlas, your command buffers). A renderer that doesn't implement a
+primitive just leaves that sink method empty — exactly how the Rust renderers degrade. The
+one non-trivial part is **text**: the lite/device tier emits `text(...)` baked-font runs (you
+rasterize/atlas the glyphs); the capable tier emits pre-shaped `glyphs(...)`. `canopy-render-vello`
+is the reference for a GPU glyph atlas.
+
+This is the right path for true per-primitive HW acceleration. (The shallower option — take
+`render_rgba`'s CPU frame and GPU/RGA-blit/scale/format-convert it to scanout — also works
+and needs no decoder, but the rasterization stays on the CPU.)
+
 ---
 
 ## Practical notes
