@@ -273,8 +273,10 @@ version = "0.0.0"
 name = "canopy-style-css"
 version = "0.0.0"
 dependencies = [
+ "canopy-dom",
  "canopy-paint",
  "canopy-protocol",
+ "canopy-traits",
  "canopy-view",
 ]
 
@@ -304,6 +306,7 @@ version = "0.0.0"
 dependencies = [
  "canopy-dom",
  "canopy-layout-taffy",
+ "canopy-paint",
  "canopy-protocol",
  "canopy-rsx",
  "canopy-signals",
@@ -673,6 +676,12 @@ dependencies = [
  "r-efi",
  "wasip2",
 ]
+
+[[package]]
+name = "grid"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
 name = "hashbrown"
@@ -1726,6 +1735,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfde4e2f8595f222ceaae1fb16b4963952e9b33e358869dc4cd6316b0e0790cd"
 dependencies = [
  "arrayvec",
+ "grid",
  "serde",
  "slotmap",
 ]
