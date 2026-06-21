@@ -11,51 +11,58 @@
 // "A basic app, styled with CSS, as a freestanding lib." The UI STRUCTURE is authored in C++ on
 // the frt runtime with the DSL — but it carries only IDENTITY (id(...) / cls(...)), no inline
 // styles. All styling lives in a CSS-lite stylesheet handed to the engine via host::set_stylesheet;
-// the host runs the real lite selector cascade (type / id / class / compound, with specificity) and
-// folds the matched declarations onto each node before laying out + software-rasterizing to pixels.
-// The retained tree stays identity-only (the cascade is non-destructive). Build the engine
+// the host runs the real lite cascade (selectors + specificity + inheritance + custom properties)
+// and folds the matched declarations onto each node before laying out + software-rasterizing to
+// pixels. The retained tree stays identity-only (the cascade is non-destructive). Build the engine
 // staticlib first: `cargo build -p canopy-abi`. Writes canopy_cpp_css.ppm +
 // canopy_cpp_css_hover.ppm.
 namespace {
 
     constexpr std::uint32_t view_w = 480;
-    constexpr std::uint32_t view_h = 320;
+    constexpr std::uint32_t view_h = 360;
 
-    // The stylesheet exercises the full lite selector engine. Every box's geometry AND color comes
-    // from here — the C++ below sets no inline styles, only ids and classes. `color` inherits to
-    // text. Note the selector variety (type / id / class / compound + :hover) and the three color
-    // spellings the engine normalizes to #rrggbb: a named keyword, `#rgb`, and `rgb(r, g, b)`.
+    // The stylesheet exercises the FULL lite CSS engine, all from this string — the C++ below sets
+    // no inline styles, only ids and classes. It showcases: custom properties (`--accent`) reused
+    // via var() and inherited down the tree; a `linear-gradient` background; a soft `box-shadow`; a
+    // real CSS `grid` for the button row; `font-size`/`font-weight`/`text-align` (inherited to the
+    // text); per-side `margin`; an `outline`; named/#hex/rgba() colors; and the selector variety
+    // (type / id / class / compound + :hover) resolved with specificity and anti-aliased corners.
     constexpr const char* stylesheet =
-        // Type selector: EVERY <button> shares geometry, a 2px border, and flex-grow — no class
-        // needed. `flex-grow` lets the two buttons split the row; `border-*` is a new lite prop.
-        "button { height: 56; radius: 10; flex-grow: 1; color: black;"
-        "         border-width: 2; border-color: #222 }"
-        // Id selectors (authored with id(...)) for the singleton frame + card. `navy` is a named
-        // color; `rgb(49, 50, 68)` and `margin` (centring the card in the frame's padding) are new.
-        "#screen { width: 480; height: 320; background: navy; padding: 32; direction: column }"
-        "#card   { width: 400; height: 240; margin: 8; background: rgb(49, 50, 68); radius: 16;"
-        "          padding: 24; direction: column; gap: 12; color: #cdd6f4 }"
-        // Class selectors for the layout rows; `min-width` is a new sizing prop.
-        ".bar    { width: 352; height: 56; direction: row; gap: 16 }"
-        ".status { width: 352; height: 44; background: #45475a; radius: 8; padding: 14;"
-        "          color: #a6e3a1; min-width: 320 }"
-        // Compound selectors: a rule that fires only when the node is a <button> AND carries the
-        // class. Specificity (type+class=11) beats the bare `button` rule, so these win the color.
-        "button.primary       { background: #89b4fa }"
-        "button.primary:hover { background: #b4caff }" // lighter on hover (pointer over the button)
-        "button.danger        { background: #f38ba8 }"
-        "button.danger:hover  { background: #f8b0c4 }";
+        // Design tokens: custom properties declared on the frame inherit to every descendant, then
+        // get pulled in with var(). Change one value here and the whole UI re-themes.
+        "#screen { --accent: #89b4fa; --danger: #f38ba8; --text: #cdd6f4;"
+        "          width: 480; height: 360; padding: 32; direction: column;"
+        "          align: center; justify: center;"
+        "          background-image: linear-gradient(to bottom, #1e1e2e, #11111b) }"
+        // The card: a shadowed, rounded panel. box-shadow + var() + gap.
+        "#card { width: 400; background: #313244; radius: 16; padding: 24; direction: column;"
+        "        gap: 16; color: var(--text); box-shadow: 0 10 28 #00000088 }"
+        // Inherited text traits: font-size/weight/align flow down to the text node inside.
+        ".title { font-size: 26; font-weight: bold; text-align: center }"
+        // A real CSS GRID: two equal columns for the action buttons.
+        ".actions { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14 }"
+        // Type selector: every <button> shares geometry + a translucent border (rgba -> #rrggbbaa).
+        "button { height: 48; radius: 10; color: #11111b; border-width: 2;"
+        "         border-color: rgba(0, 0, 0, 0.25); text-align: center }"
+        // Compound + var(): variant color from a token; :hover lightens (anti-aliased, end to end).
+        "button.primary       { background: var(--accent) }"
+        "button.primary:hover { background: #b4caff }"
+        "button.danger        { background: var(--danger) }"
+        "button.danger:hover  { background: #f8b0c4 }"
+        // Status bar: a top margin (per-side shorthand) and an outline ring tinted by the token.
+        ".status { background: #45475a; radius: 8; padding: 12; color: #a6e3a1; text-align: center;"
+        "          margin: 6 0 0 0; outline-width: 2; outline-color: var(--accent);"
+        "          outline-offset: 3 }";
 
-    // Author the tree with identity only — ids on the singletons, classes on the rest, no inline
-    // styles. The buttons carry ONLY their variant class; the shared `button` type rule does the
-    // rest. Buttons auto-center their labels.
+    // Author the tree with identity only — ids on the singletons, classes on the rest. The two
+    // buttons sit in a CSS grid; everything else is flex. No inline styles anywhere.
     void build_app(canopy::build_context& ctx) {
         using namespace canopy; // DSL factories — a .cpp, not a header
-        mount(ctx,
-              div(id("screen"), div(id("card"), text("Canopy - styled with CSS"),
-                                    div(cls("bar"), button(cls("primary"), on_click([] {}), "Run"),
-                                        button(cls("danger"), on_click([] {}), "Stop")),
-                                    div(cls("status"), text("status: ready")))));
+        mount(ctx, div(id("screen"),
+                       div(id("card"), div(cls("title"), text("Canopy")),
+                           div(cls("actions"), button(cls("primary"), on_click([] {}), "Open"),
+                               button(cls("danger"), on_click([] {}), "Close")),
+                           div(cls("status"), text("grid - gradient - shadow - var()")))));
     }
 
     // Encode a row-major RGBA8 framebuffer as a binary PPM (P6); the alpha byte is dropped.
@@ -80,10 +87,10 @@ int main() {
     canopy::host engine;
     engine.set_stylesheet(stylesheet);
     engine.apply(ctx.take_batch(0));
-    engine.resize(static_cast<float>(view_w),
-                  static_cast<float>(view_h)); // viewport for hover hit-test
+    engine.resize(static_cast<float>(view_w), static_cast<float>(view_h)); // viewport for hover
 
-    // 3. Render: the host runs the selector cascade, lays out, and rasterizes to RGBA8.
+    // 3. Render: the host runs the cascade (selectors, inheritance, var(), grid), lays out, and
+    //    rasterizes to RGBA8.
     const std::vector<std::uint8_t> base = engine.render_rgba(view_w, view_h);
     if (base.empty()) {
         std::cerr << "render failed (empty framebuffer)\n";
@@ -91,13 +98,13 @@ int main() {
     }
     write_ppm("canopy_cpp_css.ppm", base);
 
-    // 4. Move the pointer over the "Run" button (its center) and re-render: the
-    //    `button.primary:hover` rule lightens it. Proves `:hover` end to end.
-    engine.hover(148.0F, 124.0F);
+    // 4. Move the pointer over the "Open" button and re-render: the `button.primary:hover` rule
+    //    lightens it. Proves :hover end to end on the gradient/grid/shadow scene.
+    engine.hover(148.0F, 172.0F);
     write_ppm("canopy_cpp_css_hover.ppm", engine.render_rgba(view_w, view_h));
 
     std::cout << "canopy C++ (identity only) + CSS stylesheet -> canopy_cpp_css.ppm"
-              << " + canopy_cpp_css_hover.ppm (Run hovered) (" << engine.node_count()
+              << " + canopy_cpp_css_hover.ppm (Open hovered) (" << engine.node_count()
               << " nodes)\n";
     return 0;
 }

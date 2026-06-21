@@ -91,7 +91,20 @@
 //! `font-size`/`font-weight`/`line-height`/`text-decoration`, the `outline`
 //! shorthand + `outline-width`/`-color`/`-offset`, `box-shadow`,
 //! `background-image`, `opacity`, `direction`, `align`, `justify`, `text-align`,
-//! and the `translate-x`/`translate-y` offsets.
+//! and the `translate-x`/`translate-y` offsets. **CSS Grid** is supported:
+//! `display: grid`, `grid-template-columns`/`-rows` (tracks `<px>`/`<n>fr`/`<%>`/
+//! `auto`/`minmax(a,b)`, with `repeat(n, …)` expanded), `grid-column`/`grid-row`
+//! placement (`<start>/<end>`, `span <n>`, line index), `grid-auto-flow`, and
+//! `justify-items`.
+//!
+//! **Custom properties + value functions.** A `--name` declaration is a custom
+//! property (kept verbatim); it inherits down the tree (applied by the host
+//! cascade, see [`Stylesheet::resolve_custom_for`]). [`resolve_value`]
+//! then resolves a normal value against a [`ResolveCtx`]: it substitutes
+//! `var(--name[, fallback])`, resolves the relative units `rem`/`em`/`vw`/`vh` to
+//! px (against a root/element font size and the viewport), and evaluates
+//! `calc()`/`min()`/`max()`/`clamp()` over absolute lengths. `%` is left verbatim
+//! for the layout engine to resolve; a `%` inside `calc()` is not yet supported.
 //!
 //! **Shorthand + per-side expansion** happens at parse time: `margin: 8 16`
 //! expands to the four `margin-*` longhands per the CSS 1/2/3/4-value rules
@@ -128,9 +141,14 @@
 //!   at-rule (`@font-face`, …) is skipped — a `@media` whose condition cannot be parsed has its
 //!   whole block dropped. There is still no support for `@import`, `@keyframes`, media *types*
 //!   (`screen`/`print`), `not`/`only`, or range syntax (`width >= 600px`).
-//! - The cascade matches each node against its own identity; there is no inheritance
-//!   here (the host folds matched rules in as inline styles, and author inline styles
-//!   win, mirroring CSS specificity where inline beats a selector).
+//! - This crate matches each node against its own identity and resolves that node's
+//!   values; **tree inheritance** (of `color`/font traits/`visibility` and of custom
+//!   properties) is applied by the host cascade (`canopy-abi`), which threads parent
+//!   values down and folds matched rules in as inline styles — author inline styles
+//!   win, mirroring CSS specificity where inline beats a selector. Combinators,
+//!   structural pseudo-classes, and custom-property inheritance therefore need the
+//!   host's tree context; the in-process `canopy-ui` path, which retains no tree
+//!   edges, supports the own-identity subset (documented on its methods).
 //! - Unknown properties are silently ignored (skipped, never an error), as is any
 //!   malformed fragment, so a partial stylesheet still yields the rules it could
 //!   parse.
