@@ -77,6 +77,8 @@ use canopy_style_css::{
 };
 use canopy_traits::{Color, HostError, OpSink, Point, Renderer, Size};
 
+pub mod displaylist;
+
 /// Hard cap on a single [`canopy_host_apply`] batch, in bytes.
 ///
 /// A caller-supplied `len` larger than this is rejected with
@@ -366,6 +368,23 @@ impl CanopyHost {
         // on the impossible error path keep the clear-filled frame rather than panic.
         let _ = renderer.render(&scene);
         renderer.buffer().data().to_vec()
+    }
+
+    /// Build the laid-out scene at `width`×`height` and serialize it to the **display-list wire
+    /// format** (see [`displaylist`]) — the renderer-agnostic geometric primitives, NOT pixels.
+    /// This is the "bring your own renderer" path: a consumer decodes the bytes and drives its own
+    /// GPU / 2D-accelerator pipeline off the rects/borders/gradients/shadows/text/clips, instead of
+    /// taking [`render_rgba`](Self::render_rgba)'s software-rasterized framebuffer.
+    #[must_use]
+    pub fn build_display_list(&self, width: u32, height: u32) -> Vec<u8> {
+        let viewport = Size {
+            w: width as f32,
+            h: height as f32,
+        };
+        let styled = self.styled_dom();
+        let dom = styled.as_ref().unwrap_or(&self.dom);
+        let (scene, _layout) = canopy_layout_taffy::layout(dom, viewport);
+        displaylist::serialize(&scene, width, height)
     }
 
     /// Drain the queued events into `out` as one `BeginBatch … DispatchEvent* … EndBatch`
@@ -1071,6 +1090,60 @@ pub unsafe extern "C" fn canopy_host_render_rgba(
     // SAFETY: `out` is non-null and points to `cap >= needed` writable bytes per contract;
     // `rgba` is a fresh owned buffer of exactly `needed` bytes, so the regions don't overlap.
     unsafe { core::ptr::copy_nonoverlapping(rgba.as_ptr(), out, needed) };
+    CANOPY_OK
+}
+
+/// Build the laid-out scene and serialize it to the **display-list wire format** — the geometric
+/// primitives a consumer feeds its own GPU / 2D-accelerator renderer, instead of taking
+/// [`canopy_host_render_rgba`]'s software-rasterized pixels. The format is documented for non-Rust
+/// authors in `canopy_displaylist.h`.
+///
+/// Two-call sizing (same contract as the other read-back fns): the byte length depends on the
+/// scene, so call once with `cap == 0` (or `out == NULL`) to receive the needed length in
+/// `*out_len`, allocate, then call again with a buffer of at least that size. (Each call rebuilds
+/// the scene; to avoid the double build, pass a generously-sized buffer once.)
+///
+/// Returns [`CANOPY_OK`]; [`CANOPY_ERR_NULL_HOST`]; [`CANOPY_ERR_NULL_DATA`] (null `out_len`, or
+/// null `out` with `cap > 0`); or [`CANOPY_ERR_TOO_LARGE`] (the buffer is short — `*out_len` holds
+/// the needed size, nothing written — or a dimension is zero or exceeds [`MAX_RENDER_DIM`]).
+///
+/// # Safety
+///
+/// `host` must be null or a live pointer from [`canopy_host_new`]; `out_len` must be a writable
+/// `usize`; if `cap > 0`, `out` must point to `cap` writable bytes valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn canopy_host_build_display_list(
+    host: *const CanopyHost,
+    width: u32,
+    height: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if host.is_null() {
+        return CANOPY_ERR_NULL_HOST;
+    }
+    if out_len.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    }
+    if width == 0 || height == 0 || width > MAX_RENDER_DIM || height > MAX_RENDER_DIM {
+        return CANOPY_ERR_TOO_LARGE;
+    }
+    // SAFETY: `host` is non-null and a live pointer from `canopy_host_new`; shared ref only.
+    let host = unsafe { &*host };
+    let bytes = host.build_display_list(width, height);
+    let needed = bytes.len();
+    // SAFETY: `out_len` checked non-null above; per contract it is a valid writable usize.
+    unsafe { *out_len = needed };
+    if needed > cap {
+        return CANOPY_ERR_TOO_LARGE; // needed size reported in *out_len; nothing written
+    }
+    if out.is_null() {
+        return CANOPY_ERR_NULL_DATA;
+    }
+    // SAFETY: `out` points to `cap >= needed` writable bytes per contract; `bytes` is a fresh owned
+    // buffer of exactly `needed` bytes, so the regions don't overlap.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, needed) };
     CANOPY_OK
 }
 
@@ -2055,6 +2128,102 @@ mod tests {
         assert!(bb > rb, "bottom of the ramp is blue-dominant (B>R)");
         assert!(rt > rb, "red fades from top to bottom");
         assert!(bb > bt, "blue grows from top to bottom");
+    }
+
+    #[test]
+    fn display_list_wire_round_trips_a_rich_scene() {
+        use crate::displaylist;
+        use canopy_traits::{DisplayItem, DisplayList};
+        // A box exercising every rich primitive: rounded bg, border, gradient, shadow, and a text
+        // child. Build the display-list stream, decode it, and prove serialize is the exact inverse
+        // of deserialize — and that the rich geometry (not just rects) crossed the wire.
+        let mut e = Emitter::new();
+        let bx = e.create_element(ElementTag::new(1));
+        e.append(ROOT, bx);
+        e.set_attribute(bx, AttrId::ID, "g");
+        let label = e.create_text("hi");
+        e.append(bx, label);
+        let mut host = CanopyHost::new();
+        assert_eq!(host.apply_bytes(&e.take_batch(0)), CANOPY_OK);
+        host.set_stylesheet(
+            "#g { width: 80; height: 40; background: #112233; radius: 6; border-width: 2; \
+                  border-color: #ff8800; background-image: linear-gradient(to bottom, red, blue); \
+                  box-shadow: 0 4 8 #00000080; color: #ffffff }",
+        );
+
+        let bytes = host.build_display_list(80, 40);
+        let scene = displaylist::deserialize(&bytes).expect("decodes");
+        assert_eq!(scene.version, displaylist::DL_VERSION);
+        assert_eq!((scene.width, scene.height), (80, 40));
+
+        // Re-encoding the decoded items reproduces the bytes exactly (serialize ∘ deserialize = id).
+        let reencoded = displaylist::serialize(
+            &DisplayList {
+                items: scene.items.clone(),
+            },
+            scene.width,
+            scene.height,
+        );
+        assert_eq!(reencoded, bytes, "the codec round-trips byte-for-byte");
+
+        // The rich primitives actually crossed the wire (not degraded to plain rects).
+        let has = |f: fn(&DisplayItem) -> bool| scene.items.iter().any(f);
+        assert!(
+            has(|i| matches!(i, DisplayItem::Gradient { .. })),
+            "gradient"
+        );
+        assert!(has(|i| matches!(i, DisplayItem::Shadow { .. })), "shadow");
+        assert!(has(|i| matches!(i, DisplayItem::Border { .. })), "border");
+        assert!(has(|i| matches!(i, DisplayItem::Text { .. })), "text");
+    }
+
+    #[test]
+    fn build_display_list_extern_honors_the_needed_size_contract() {
+        let mut e = Emitter::new();
+        let bx = e.create_element(ElementTag::new(1));
+        e.append(ROOT, bx);
+        let host = canopy_host_new();
+        // SAFETY: live pointer from canopy_host_new.
+        unsafe {
+            assert_eq!(
+                canopy_host_apply(host, e.take_batch(0).as_ptr(), 0),
+                CANOPY_OK
+            )
+        };
+        let batch = {
+            let mut e2 = Emitter::new();
+            let b = e2.create_element(ElementTag::new(1));
+            e2.append(ROOT, b);
+            e2.take_batch(0)
+        };
+        // SAFETY: live pointer; batch is a valid readable slice.
+        unsafe { canopy_host_apply(host, batch.as_ptr(), batch.len()) };
+
+        // Sizing call: cap = 0 reports the needed length and writes nothing.
+        let mut needed: usize = 0;
+        // SAFETY: host live; out null with cap 0 is the documented sizing form; out_len writable.
+        let rc = unsafe {
+            canopy_host_build_display_list(host, 60, 40, core::ptr::null_mut(), 0, &mut needed)
+        };
+        assert_eq!(rc, CANOPY_ERR_TOO_LARGE);
+        assert!(needed >= 14, "at least the frame header is needed");
+
+        // Real call with a big-enough buffer succeeds and fills exactly `needed` bytes.
+        let mut buf = vec![0u8; needed];
+        let mut written: usize = 0;
+        // SAFETY: host live; buf has `needed` writable bytes; out_len writable.
+        let rc = unsafe {
+            canopy_host_build_display_list(host, 60, 40, buf.as_mut_ptr(), buf.len(), &mut written)
+        };
+        assert_eq!(rc, CANOPY_OK);
+        assert_eq!(written, needed);
+        assert!(
+            crate::displaylist::deserialize(&buf).is_some(),
+            "the C-ABI bytes decode"
+        );
+
+        // SAFETY: host is the live pointer; freed exactly once.
+        unsafe { canopy_host_free(host) };
     }
 
     /// Read a node's resolved value for `p` out of a styled (cascaded) clone.

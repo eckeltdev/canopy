@@ -147,6 +147,26 @@ int32_t canopy_host_render_rgba(const CanopyHost *host, uint32_t width, uint32_t
                                 uint8_t *out, size_t cap, size_t *out_len);
 
 /*
+ * Build `host`'s laid-out scene and serialize it to the DISPLAY-LIST WIRE FORMAT (the dual of the
+ * op-stream): the renderer-agnostic geometric primitives — filled/rounded rects, borders, linear
+ * gradients, shadows, text runs, and the clip stack — a consumer decodes to drive its OWN GPU /
+ * 2D-accelerator renderer, instead of taking canopy_host_render_rgba's software-rasterized pixels.
+ * The byte format is documented in canopy_displaylist.h.
+ *
+ * Same needed-size contract as canopy_host_render_rgba, but the length depends on the scene: pass
+ * cap = 0 (or NULL `out`) to receive the needed length in *out_len (CANOPY_ERR_TOO_LARGE, nothing
+ * written), allocate, then call again. (Each call rebuilds the scene; pass a generous buffer once
+ * to avoid the double build.) Returns CANOPY_OK; CANOPY_ERR_TOO_LARGE (short buffer, or a dimension
+ * zero or > 8192); CANOPY_ERR_NULL_HOST; or CANOPY_ERR_NULL_DATA (null `out_len`, or null `out`
+ * with cap > 0).
+ *
+ * Precondition: `out_len` is a writable size_t, and when cap > 0, `out` points to `cap` writable
+ * bytes valid for the call.
+ */
+int32_t canopy_host_build_display_list(const CanopyHost *host, uint32_t width, uint32_t height,
+                                       uint8_t *out, size_t cap, size_t *out_len);
+
+/*
  * Install a CSS-lite class stylesheet on `host`: `len` UTF-8 bytes of `.class { prop: value }`
  * rules. Subsequent canopy_host_render_rgba / canopy_host_pointer cascade each node's classes
  * through it (the guest just emits SetClass via the op-stream; the host expands the CSS), with
