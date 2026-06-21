@@ -109,11 +109,17 @@ Rust's wrapper is the `rsx!` macro plus the `canopy-ui` `Ui` context.
   bindings that read it, emitting **one targeted `SetText` op per change** — never a tree
   diff.
 
-- **CSS-lite styling** ([`canopy-style-css`](crates/canopy-style-css/src/lib.rs)). A
-  documented subset — class rules (`.name { prop: value }`), `:hover` state, and
-  properties like `background`, `color`, `padding`, `border-radius`, and `direction`. No
-  cascade, no selectors beyond a single class. The flagship example styles entirely from a
-  real `styles.css` file with `:hover` and `border-radius`, hot-reloadable on save.
+- **CSS styling, two tiers** ([`canopy-style-css`](crates/canopy-style-css/src/lib.rs)).
+  The `no_std` **lite** engine is a real CSS subset: type/id/class/compound selectors with
+  combinators, attribute and structural/functional/state pseudo-classes, correct
+  specificity and inheritance, custom properties + `var()`/`calc()`, `@media`, flexbox **and
+  CSS grid**, gradients, shadows, anti-aliased corners, and `overflow` clipping — the full
+  coverage map is [`crates/canopy-style-css/FEATURES.md`](crates/canopy-style-css/FEATURES.md).
+  The **capable** tier swaps in real Servo Stylo
+  ([`canopy-style-stylo`](crates/canopy-style-stylo/src/lib.rs)) for browser-grade CSS on
+  the desktop — same authoring, the host picks the tier. The flagship example styles
+  entirely from a real `styles.css` file, hot-reloadable on save. Agents: see the
+  [`canopy` skill](.claude/skills/canopy/SKILL.md) for using the library on any target.
 
 - **Real layout and text.** Layout is the actual [Taffy](https://github.com/DioxusLabs/taffy)
   flexbox engine ([`canopy-layout-taffy`](crates/canopy-layout-taffy/src/lib.rs)); text is
